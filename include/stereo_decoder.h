@@ -34,6 +34,9 @@ private:
     bool m_forceStereo;
     bool m_forceMono;
     float m_pilotMagnitude;
+    float m_pilotBandMagnitude;
+    float m_mpxMagnitude;
+    float m_stereoBlend;
     int m_pilotLevelTenthsKHz;
     float m_pilotI;
     float m_pilotQ;

@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 #include "rtl_tcp_client.h"
 #include "fm_demod.h"
@@ -118,30 +119,78 @@ int main(int argc, char* argv[]) {
     std::atomic<bool> pendingGain(false);
     std::atomic<bool> pendingAGC(false);
 
-    auto applyRtlGainAndAgc = [&]() {
-        if (!rtlConnected) {
-            return;
-        }
+    auto formatCustomGain = [&](int custom) -> std::string {
+        const int rf = ((custom / 10) % 10) ? 1 : 0;
+        const int ifv = (custom % 10) ? 1 : 0;
+        char buffer[3];
+        std::snprintf(buffer, sizeof(buffer), "%d%d", rf, ifv);
+        return std::string(buffer);
+    };
 
+    auto isImsAgcEnabled = [&]() -> bool {
+        if (gain >= 0) {
+            // CLI manual override keeps tuner in manual gain mode.
+            return false;
+        }
+        const int custom = requestedCustomGain.load();
+        const bool ims = (custom % 10) != 0;
+        return ims;
+    };
+
+    auto calculateAppliedGainDb = [&]() -> int {
         // TEF-like AGC threshold profile approximation on RTL-SDR.
         static constexpr int kAgcToGainDb[4] = {44, 36, 30, 24}; // highest..low
         const int agcMode = std::clamp(requestedAGCMode.load(), 0, 3);
 
         int custom = requestedCustomGain.load();
         const bool ceq = ((custom / 10) % 10) != 0;
-        const bool ims = (custom % 10) != 0;
-
-        int gainDb = kAgcToGainDb[agcMode] + (ceq ? 4 : 0) + (ims ? 2 : 0);
+        int gainDb = kAgcToGainDb[agcMode] + (ceq ? 4 : 0);
         if (gain >= 0) {
             // CLI manual override for debugging.
             gainDb = gain;
         }
-        gainDb = std::clamp(gainDb, 0, 49);
+        return std::clamp(gainDb, 0, 49);
+    };
 
-        // Keep RTL in manual gain for TEF-style predictable threshold behavior.
-        rtlClient.setGainMode(true);
-        rtlClient.setAGC(false);
-        rtlClient.setGain(static_cast<uint32_t>(gainDb * 10));
+    auto applyRtlGainAndAgc = [&](const char* reason) {
+        if (!rtlConnected) {
+            return;
+        }
+        const int agcMode = std::clamp(requestedAGCMode.load(), 0, 3);
+        const int custom = requestedCustomGain.load();
+        const int rf = ((custom / 10) % 10) ? 1 : 0;
+        const int ifv = (custom % 10) ? 1 : 0;
+        const bool imsAgc = isImsAgcEnabled();
+        const int gainDb = calculateAppliedGainDb();
+
+        bool okGainMode = false;
+        bool okAgc = false;
+        bool okGain = true;
+
+        if (imsAgc) {
+            // IMS bit maps to RTL automatic gain behavior.
+            okGainMode = rtlClient.setGainMode(false);
+            okAgc = rtlClient.setAGC(true);
+        } else {
+            okGainMode = rtlClient.setGainMode(true);
+            okAgc = rtlClient.setAGC(false);
+            okGain = rtlClient.setGain(static_cast<uint32_t>(gainDb * 10));
+        }
+
+        std::cout << "[RTL] " << reason
+                  << " A" << agcMode
+                  << " G" << formatCustomGain(custom)
+                  << " (rf=" << rf << ",if=" << ifv << ")"
+                  << " -> mode=" << (imsAgc ? "auto" : "manual")
+                  << " tuner_gain=" << gainDb << " dB"
+                  << " manual=" << (imsAgc ? 0 : 1)
+                  << " rtl_agc=" << (imsAgc ? 1 : 0) << "\n";
+        if (!okGainMode || !okAgc || !okGain) {
+            std::cerr << "[RTL] warning: gain/apply command failed"
+                      << " setGainMode=" << (okGainMode ? 1 : 0)
+                      << " setAGC=" << (okAgc ? 1 : 0)
+                      << " setGain=" << (okGain ? 1 : 0) << "\n";
+        }
     };
 
     auto connectTuner = [&]() {
@@ -154,7 +203,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "Applying TEF AGC mode " << requestedAGCMode.load()
                           << " and custom gain flags G" << requestedCustomGain.load() << "...\n";
                 rtlConnected = true;
-                applyRtlGainAndAgc();
+                applyRtlGainAndAgc("connect/apply");
             } else {
                 std::cerr << "Warning: Failed to connect to rtl_tcp server\n";
             }
@@ -173,6 +222,7 @@ int main(int argc, char* argv[]) {
     StereoDecoder stereo(INPUT_RATE, OUTPUT_RATE);
     int appliedDeemphasis = requestedDeemphasis.load();
     bool appliedForceMono = requestedForceMono.load();
+    bool appliedEffectiveForceMono = appliedForceMono;
     float rfLevelFiltered = 0.0f;
     bool rfLevelInitialized = false;
     if (appliedDeemphasis == 0) {
@@ -182,7 +232,7 @@ int main(int argc, char* argv[]) {
     } else {
         stereo.setDeemphasis(0);
     }
-    stereo.setForceMono(appliedForceMono);
+    stereo.setForceMono(appliedEffectiveForceMono);
 
     AudioOutput audioOut;
     std::cerr << "Initializing audio output..." << std::endl;
@@ -214,10 +264,14 @@ int main(int argc, char* argv[]) {
         const int rf = ((newGain / 10) % 10) ? 1 : 0;
         const int ifv = (newGain % 10) ? 1 : 0;
         requestedCustomGain = rf * 10 + ifv;
+        std::cout << "[XDR] G" << formatCustomGain(newGain)
+                  << " received -> rf=" << rf << " if=" << ifv << "\n";
         pendingGain = true;
     });
     xdrServer.setAGCCallback([&](int agcMode) {
-        requestedAGCMode = std::clamp(agcMode, 0, 3);
+        const int clipped = std::clamp(agcMode, 0, 3);
+        requestedAGCMode = clipped;
+        std::cout << "[XDR] A" << clipped << " received\n";
         pendingAGC = true;
     });
     xdrServer.setModeCallback([&](int mode) {
@@ -263,11 +317,15 @@ int main(int argc, char* argv[]) {
 
         if (rtlConnected && pendingFrequency.exchange(false)) {
             rtlClient.setFrequency(requestedFrequencyHz.load());
+            // Clear pilot/stereo state on retune to avoid carrying lock across stations.
+            stereo.reset();
         }
         const bool gainChanged = pendingGain.exchange(false);
         const bool agcChanged = pendingAGC.exchange(false);
         if (rtlConnected && (gainChanged || agcChanged)) {
-            applyRtlGainAndAgc();
+            applyRtlGainAndAgc((gainChanged && agcChanged) ? "runtime/update(A+G)"
+                                                           : (agcChanged ? "runtime/update(A)"
+                                                                         : "runtime/update(G)"));
         }
 
         int targetDeemphasis = requestedDeemphasis.load();
@@ -284,7 +342,6 @@ int main(int argc, char* argv[]) {
 
         bool targetForceMono = requestedForceMono.load();
         if (targetForceMono != appliedForceMono) {
-            stereo.setForceMono(targetForceMono);
             appliedForceMono = targetForceMono;
         }
 
@@ -303,17 +360,25 @@ int main(int argc, char* argv[]) {
         }
         const double avgPower = (samples > 0) ? (powerSum / static_cast<double>(samples)) : 0.0;
         const double dbfs = 10.0 * std::log10(avgPower + 1e-12);
-        const float rfLevel = std::clamp(static_cast<float>(dbfs + 90.0), 0.0f, 90.0f);
+        // Compensate by configured RTL gain so RF level is less "always high".
+        const double gainCompDb = isImsAgcEnabled() ? 0.0 : static_cast<double>(calculateAppliedGainDb());
+        const double compensatedDbfs = dbfs - gainCompDb;
+        const float rfLevel = std::clamp(static_cast<float>((compensatedDbfs + 72.0) * 1.8), 0.0f, 90.0f);
         if (!rfLevelInitialized) {
             rfLevelFiltered = rfLevel;
             rfLevelInitialized = true;
         } else {
             rfLevelFiltered = rfLevelFiltered * 0.85f + rfLevel * 0.15f;
         }
+        const bool effectiveForceMono = targetForceMono;
+        if (effectiveForceMono != appliedEffectiveForceMono) {
+            stereo.setForceMono(effectiveForceMono);
+            appliedEffectiveForceMono = effectiveForceMono;
+        }
 
         demod.processNoDownsample(iqBuffer, demodBuffer, samples);
         const size_t outSamples = stereo.processAudio(demodBuffer, audioLeft, audioRight, samples);
-        xdrServer.updateSignal(rfLevelFiltered, stereo.isStereo(), requestedForceMono.load(), -1, -1);
+        xdrServer.updateSignal(rfLevelFiltered, stereo.isStereo(), effectiveForceMono, -1, -1);
         xdrServer.updatePilot(stereo.getPilotLevelTenthsKHz());
 
         // Keep small headroom to reduce hard clipping distortion at high modulation.
