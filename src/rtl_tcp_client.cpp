@@ -9,8 +9,6 @@
 #include <thread>
 #include <mutex>
 
-#define RTL_TCP_SYNC_BYTE 0xAA
-
 RTLTCPClient::RTLTCPClient(const std::string& host, uint16_t port)
     : m_host(host)
     , m_port(port)
@@ -55,8 +53,7 @@ bool RTLTCPClient::connect() {
     }
 
     uint8_t header[12];
-    ssize_t n = recv(m_socket, header, 12, MSG_PEEK);
-    if (n > 0) {
+    if (readResponse(header, sizeof(header))) {
         m_connected = true;
         return true;
     }
@@ -75,23 +72,36 @@ void RTLTCPClient::disconnect() {
     m_connected = false;
 }
 
-bool RTLTCPClient::sendCommand(uint8_t cmd, const uint8_t* data, size_t len) {
+bool RTLTCPClient::sendAll(const uint8_t* data, size_t len) {
     if (!m_connected || m_socket < 0) {
         return false;
     }
 
-    uint8_t buffer[64];
-    buffer[0] = cmd;
-    if (data && len > 0) {
-        memcpy(&buffer[1], data, len);
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(m_socket, data + sent, len - sent, 0);
+        if (n <= 0) {
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool RTLTCPClient::sendCommand(uint8_t cmd, uint32_t param) {
+    if (!m_connected || m_socket < 0) {
+        return false;
     }
 
-    ssize_t sent = send(m_socket, buffer, 1 + len, 0);
-    return sent == (ssize_t)(1 + len);
+    uint8_t buffer[5];
+    buffer[0] = cmd;
+    uint32_t networkOrder = htonl(param);
+    memcpy(&buffer[1], &networkOrder, sizeof(networkOrder));
+    return sendAll(buffer, sizeof(buffer));
 }
 
 bool RTLTCPClient::readResponse(uint8_t* buffer, size_t len) {
-    if (!m_connected || m_socket < 0) {
+    if (m_socket < 0) {
         return false;
     }
 
@@ -126,11 +136,7 @@ size_t RTLTCPClient::readIQ(uint8_t* buffer, size_t maxSamples) {
 }
 
 bool RTLTCPClient::setFrequency(uint32_t freqHz) {
-    uint32_t networkOrder = htonl(freqHz);
-    uint8_t data[4];
-    memcpy(data, &networkOrder, 4);
-
-    if (sendCommand(0x01, data, 4)) {
+    if (sendCommand(0x01, freqHz)) {
         m_frequency = freqHz;
         return true;
     }
@@ -138,26 +144,21 @@ bool RTLTCPClient::setFrequency(uint32_t freqHz) {
 }
 
 bool RTLTCPClient::setSampleRate(uint32_t rate) {
-    uint32_t networkOrder = htonl(rate);
-    uint8_t data[4];
-    memcpy(data, &networkOrder, 4);
-
-    if (sendCommand(0x02, data, 4)) {
+    if (sendCommand(0x02, rate)) {
         m_sampleRate = rate;
         return true;
     }
     return false;
 }
 
+bool RTLTCPClient::setGainMode(bool manual) {
+    return sendCommand(0x03, manual ? 1u : 0u);
+}
+
 bool RTLTCPClient::setGain(uint32_t gain) {
-    uint32_t networkOrder = htonl(gain);
-    uint8_t data[4];
-    memcpy(data, &networkOrder, 4);
-    return sendCommand(0x04, data, 4);
+    return sendCommand(0x04, gain);
 }
 
 bool RTLTCPClient::setAGC(bool enable) {
-    uint8_t data[1];
-    data[0] = enable ? 1 : 0;
-    return sendCommand(0x08, data, 1);
+    return sendCommand(0x08, enable ? 1u : 0u);
 }

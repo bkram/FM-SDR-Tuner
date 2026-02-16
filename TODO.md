@@ -7,47 +7,79 @@ Self-contained FM radio that connects to rtl_tcp server, demodulates WBFM in ste
 
 ```
 +---------------------+     +----------------------+     +-------------------+
-| rtl_tcp server     |     | FM Tuner SDR        |     | Control Clients   |
-| (external RTL-SDR) |---->| (this application)  |<----|                   |
+| Control Clients    |---->| FM Tuner SDR        |     | rtl_tcp server   |
+|                    |     | (this application)  |<----| (external)       |
 +---------------------+     +----------------------+     +-------------------+
-                                   |                             |
-                                   ▼                             ▼
-                            +-------------+            +--------------------+
-                            | RTL-TCP     |            | XDR Server (7373) |
-                            | Client      |            +--------------------+
-                            +-------------+            +-------+------------+
-                                   |                        |            |
-                                   ▼                        ▼            ▼
-                            +-------------+            XDR-GTK      FM-DX-Tuner
-                            | FM Demod   |            (SHA1 auth)   (x protocol)
-                            | (SDR++)    |
-                            +-------------+
-                                   |
-                                   ▼
-                            +-------------+
-                            | Stereo      |
-                            | Decoder     |
-                            +-------------+
-                                   |
-                                   ▼
-                            +-------------+
-                            | Audio       |
-                            | Output      |
-                            | (PortAudio) |
-                            +-------------+
-                                   |
-                                   ▼
-                            +-------------+
-                            | WAV File   |
-                            +-------------+
+                                    |                             |
+                                    ▼                             ▼
+                          +------------------+        +-------------+
+                          | XDR Server      |        | RTL-TCP    |
+                          | Port 7373       |        | Client     |
+                          +------------------+        +-------------+
+                                    |                             |
+                         +----------+----------+                 |
+                         |                     |                 |
+                         ▼                     ▼                 ▼
+                   +---------+          +---------+       +-------------+
+                   | XDR-GTK |          |FM-DX-   |       | FM Demod    |
+                   |(SHA1 auth)         |Tuner   |       |(SDR++)     |
+                   +---------+          +---------+       +-------------+
+                                                       |
+                                                       ▼
+                                               +-------------+
+                                               | Stereo      |
+                                               | Decoder     |
+                                               +-------------+
+                                                       |
+                                                       ▼
+                                               +-------------+
+                                               | Audio       |
+                                               | Output      |
+                                               |(PortAudio) |
+                                               +-------------+
+                                                       |
+                                                       ▼
+                                               +-------------+
+                                               | WAV File   |
+                                               +-------------+
 ```
 
-### Protocol Support
+### Startup Flow
 
-| Client | Protocol | Port | Auth |
-|--------|----------|------|------|
-| XDR-GTK | xdrd (salt + SHA1) | 7373 | Password |
-| FM-DX-Tuner | FM-DX (x command) | 7373 | None |
+```
+1. Client connects to port 7373
+2. Server sends 16-char salt (XDR) or expects "x" (FM-DX)
+3. Client authenticates:
+   - XDR: sends SHA1(salt + password)
+   - FM-DX: sends "x", server responds "1"
+4. Client sends "x" to start tuner (FM-DX) or just starts sending commands (XDR)
+5. fmtuner-sdr connects to rtl_tcp
+6. Audio streaming begins
+7. Client sends "X" to stop tuner (FM-DX)
+8. fmtuner-sdr disconnects from rtl_tcp
+```
+
+### Protocol Details
+
+| Client | Protocol | Start | Stop | Auth | Commands |
+|--------|----------|-------|------|------|----------|
+| XDR-GTK | xdrd | any command | disconnect | SHA1(salt+pass) | T, V, G, A, S |
+| FM-DX-Tuner | FM-DX | send "x" | send "X" | none | T, Y, A, I |
+
+### Commands
+
+**XDR Protocol:**
+- `T<freq>` - Tune frequency in Hz
+- `V<volume>` - Volume 0-100
+- `G<gain>` - Gain
+- `A<0|1>` - AGC on/off
+- `S` - Get status
+
+**FM-DX Protocol:**
+- `T<freq>` - Tune frequency in Hz  
+- `Y<volume>` - Volume -100 to 100
+- `A<0|1>` - AGC on/off
+- `I` - Get status
 
 ### Components
 

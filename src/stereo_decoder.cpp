@@ -7,6 +7,7 @@ StereoDecoder::StereoDecoder(int sampleRate)
     : m_sampleRate(sampleRate)
     , m_stereoDetected(false)
     , m_forceStereo(false)
+    , m_forceMono(false)
     , m_pilotPhase(0)
     , m_pilotFreq(2.0f * 3.14159f * 19000.0f / sampleRate)
     , m_pilotAlpha(0.01f)
@@ -31,6 +32,10 @@ void StereoDecoder::reset() {
 
 void StereoDecoder::setForceStereo(bool force) {
     m_forceStereo = force;
+}
+
+void StereoDecoder::setForceMono(bool force) {
+    m_forceMono = force;
 }
 
 bool StereoDecoder::detectPilotPLL(const float* audio, size_t len) {
@@ -87,6 +92,14 @@ void StereoDecoder::decodeStereo(const float* mono, float* left, float* right, s
 }
 
 void StereoDecoder::process(const float* mono, float* left, float* right, size_t numSamples) {
+    if (m_forceMono) {
+        for (size_t i = 0; i < numSamples; i++) {
+            left[i] = mono[i];
+            right[i] = mono[i];
+        }
+        return;
+    }
+
     if (!m_forceStereo && !m_stereoDetected) {
         if (detectPilotPLL(mono, numSamples)) {
             m_pilotCount++;

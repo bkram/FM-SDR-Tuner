@@ -14,6 +14,7 @@ public:
     void process(const float* mono, float* left, float* right, size_t numSamples);
     void reset();
     void setForceStereo(bool force);
+    void setForceMono(bool force);
 
     bool isStereo() const { return m_stereoDetected; }
     void setStereo(bool stereo) { m_forceStereo = stereo; }
@@ -25,6 +26,7 @@ private:
     int m_sampleRate;
     bool m_stereoDetected;
     bool m_forceStereo;
+    bool m_forceMono;
 
     float m_pilotPhase;
     float m_pilotFreq;

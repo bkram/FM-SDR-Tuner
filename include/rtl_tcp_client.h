@@ -21,6 +21,7 @@ public:
 
     bool setFrequency(uint32_t freqHz);
     bool setSampleRate(uint32_t rate);
+    bool setGainMode(bool manual);
     bool setGain(uint32_t gain);
     bool setAGC(bool enable);
 
@@ -28,7 +29,8 @@ public:
     uint32_t getSampleRate() const { return m_sampleRate; }
 
 private:
-    bool sendCommand(uint8_t cmd, const uint8_t* data, size_t len);
+    bool sendCommand(uint8_t cmd, uint32_t param);
+    bool sendAll(const uint8_t* data, size_t len);
     bool readResponse(uint8_t* buffer, size_t len);
 
     std::string m_host;
