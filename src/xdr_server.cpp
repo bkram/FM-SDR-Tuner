@@ -252,6 +252,17 @@ void XDRServer::updatePilot(int pilotTenthsKHz) {
     m_pilotTenthsKHz = std::clamp(pilotTenthsKHz, 0, 750);
 }
 
+void XDRServer::updateRDS(uint16_t blockA, uint16_t blockB, uint16_t blockC, uint16_t blockD, uint8_t errors) {
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "R%04X%04X%04X%04X%02X", blockA, blockB, blockC, blockD, errors);
+
+    std::lock_guard<std::mutex> lock(m_rdsMutex);
+    if (m_rdsQueue.size() >= 64) {
+        m_rdsQueue.pop_front();
+    }
+    m_rdsQueue.emplace_back(buffer);
+}
+
 bool XDRServer::start() {
     if (m_running) {
         return false;
@@ -448,6 +459,10 @@ void XDRServer::handleXdrClient(int clientSocket, const char* clientIP) {
     
     m_authenticated = authSuccess || m_guestMode;
     if (m_authenticated) {
+        {
+            std::lock_guard<std::mutex> lock(m_rdsMutex);
+            m_rdsQueue.clear();
+        }
         std::string online = m_guestSession ? "o0,1\n" : "o1,0\n";
         send(clientSocket, online.c_str(), online.length(), 0);
 
@@ -465,6 +480,21 @@ void XDRServer::handleXdrClient(int clientSocket, const char* clientIP) {
         ssize_t n = recv(clientSocket, cmdBuffer, sizeof(cmdBuffer) - 1, 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::string rdsLine;
+                {
+                    std::lock_guard<std::mutex> lock(m_rdsMutex);
+                    if (!m_rdsQueue.empty()) {
+                        rdsLine = m_rdsQueue.front();
+                        m_rdsQueue.pop_front();
+                    }
+                }
+                if (!rdsLine.empty()) {
+                    rdsLine += "\n";
+                    if (send(clientSocket, rdsLine.c_str(), rdsLine.length(), 0) <= 0) {
+                        break;
+                    }
+                }
+
                 int intervalMs = m_samplingInterval.load();
                 if (intervalMs <= 0) {
                     intervalMs = 66;

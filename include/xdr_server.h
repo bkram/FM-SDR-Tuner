@@ -9,6 +9,7 @@
 #include <thread>
 #include <mutex>
 #include <chrono>
+#include <deque>
 
 class XDRServer {
 public:
@@ -36,6 +37,7 @@ public:
     void stop();
     void updateSignal(float level, bool stereo, bool forcedMono, int cci = -1, int aci = -1);
     void updatePilot(int pilotTenthsKHz);
+    void updateRDS(uint16_t blockA, uint16_t blockB, uint16_t blockC, uint16_t blockD, uint8_t errors);
 
     void setFrequencyCallback(FrequencyCallback cb);
     void setVolumeCallback(VolumeCallback cb);
@@ -115,6 +117,8 @@ private:
     std::atomic<int> m_cci;
     std::atomic<int> m_aci;
     std::atomic<int> m_pilotTenthsKHz;
+    std::deque<std::string> m_rdsQueue;
+    std::mutex m_rdsMutex;
 
     IntCallback m_modeCallback;
     FrequencyCallback m_freqCallback;

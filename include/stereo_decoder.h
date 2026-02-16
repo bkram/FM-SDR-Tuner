@@ -48,14 +48,19 @@ private:
     int m_pilotLossCount;
 
     std::vector<float> m_pilotTaps;
+    std::vector<float> m_pilotTapsRev;
     std::vector<float> m_pilotHistory;
     size_t m_pilotHistPos;
 
     std::vector<float> m_audioTaps;
+    std::vector<float> m_audioTapsRev;
     std::vector<float> m_leftHistory;
     std::vector<float> m_rightHistory;
     size_t m_leftHistPos;
     size_t m_rightHistPos;
+    bool m_useNeon;
+    bool m_useSse2;
+    bool m_useAvx2;
 
     std::vector<float> m_delayLine;
     size_t m_delayPos;

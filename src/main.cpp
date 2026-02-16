@@ -6,11 +6,19 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <vector>
+#include <chrono>
 
 #include "rtl_tcp_client.h"
 #include "fm_demod.h"
 #include "stereo_decoder.h"
 #include "af_post_processor.h"
+#include "cpu_features.h"
+#include "rds_decoder.h"
 #include "xdr_server.h"
 #include "audio_output.h"
 
@@ -36,6 +44,9 @@ void printUsage(const char* prog) {
 int main(int argc, char* argv[]) {
     constexpr int INPUT_RATE = 256000;
     constexpr int OUTPUT_RATE = 32000;
+
+    const CPUFeatures cpu = detectCPUFeatures();
+    std::cout << "[CPU] " << cpu.summary() << "\n";
 
     std::string tcpHost = "localhost";
     uint16_t tcpPort = 1234;
@@ -302,6 +313,67 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to start XDR server\n";
     }
 
+    std::atomic<bool> rdsStop(false);
+    std::atomic<bool> rdsReset(false);
+    std::mutex rdsQueueMutex;
+    std::condition_variable rdsQueueCv;
+    std::deque<std::vector<float>> rdsQueue;
+    constexpr size_t RDS_QUEUE_LIMIT = 32;
+
+    auto queueRdsBlock = [&](const float* samples, size_t count) {
+        if (!samples || count == 0) {
+            return;
+        }
+
+        std::vector<float> block(count);
+        std::memcpy(block.data(), samples, count * sizeof(float));
+
+        {
+            std::lock_guard<std::mutex> lock(rdsQueueMutex);
+            if (rdsQueue.size() >= RDS_QUEUE_LIMIT) {
+                // Keep continuity for decoder lock; drop newest block under overload.
+                return;
+            }
+            rdsQueue.emplace_back(std::move(block));
+        }
+        rdsQueueCv.notify_one();
+    };
+
+    std::thread rdsThread([&]() {
+        RDSDecoder rds(INPUT_RATE);
+        while (!rdsStop.load()) {
+            std::vector<float> block;
+            bool doReset = false;
+
+            {
+                std::unique_lock<std::mutex> lock(rdsQueueMutex);
+                rdsQueueCv.wait_for(lock, std::chrono::milliseconds(50), [&]() {
+                    return rdsStop.load() || rdsReset.load() || !rdsQueue.empty();
+                });
+
+                if (rdsStop.load()) {
+                    break;
+                }
+
+                doReset = rdsReset.exchange(false);
+                if (!rdsQueue.empty()) {
+                    block = std::move(rdsQueue.front());
+                    rdsQueue.pop_front();
+                }
+            }
+
+            if (doReset) {
+                rds.reset();
+            }
+
+            if (!block.empty()) {
+                rds.process(block.data(), block.size(), [&](const RDSGroup& group) {
+                    xdrServer.updateRDS(group.blockA, group.blockB, group.blockC, group.blockD, group.errors);
+                });
+            }
+        }
+    });
+
     std::cout << "Waiting for client connection on port 7373...\n";
     std::cout << "Press Ctrl+C to stop.\n";
 
@@ -324,6 +396,12 @@ int main(int argc, char* argv[]) {
             // Clear pilot/stereo state on retune to avoid carrying lock across stations.
             stereo.reset();
             afPost.reset();
+            rdsReset = true;
+            {
+                std::lock_guard<std::mutex> lock(rdsQueueMutex);
+                rdsQueue.clear();
+            }
+            rdsQueueCv.notify_one();
         }
         const bool gainChanged = pendingGain.exchange(false);
         const bool agcChanged = pendingAGC.exchange(false);
@@ -382,6 +460,7 @@ int main(int argc, char* argv[]) {
         }
 
         demod.processNoDownsample(iqBuffer, demodBuffer, samples);
+        queueRdsBlock(demodBuffer, samples);
         const size_t stereoSamples = stereo.processAudio(demodBuffer, stereoLeft, stereoRight, samples);
         const size_t outSamples = afPost.process(stereoLeft, stereoRight, stereoSamples, audioLeft, audioRight, BUF_SAMPLES);
         xdrServer.updateSignal(rfLevelFiltered, stereo.isStereo(), effectiveForceMono, -1, -1);
@@ -405,6 +484,12 @@ int main(int argc, char* argv[]) {
     delete[] stereoRight;
     delete[] audioLeft;
     delete[] audioRight;
+
+    rdsStop = true;
+    rdsQueueCv.notify_all();
+    if (rdsThread.joinable()) {
+        rdsThread.join();
+    }
 
     audioOut.shutdown();
     xdrServer.stop();

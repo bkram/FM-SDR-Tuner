@@ -16,6 +16,8 @@ set(SOURCES
     src/fm_demod.cpp
     src/stereo_decoder.cpp
     src/af_post_processor.cpp
+    src/cpu_features.cpp
+    src/rds_decoder.cpp
     src/xdr_server.cpp
     src/audio_output.cpp
     src/main.cpp
