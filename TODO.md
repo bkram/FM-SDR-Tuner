@@ -6,23 +6,59 @@ Self-contained FM radio that connects to rtl_tcp server, demodulates WBFM in ste
 ## Architecture
 
 ```
-rtl_tcp server (external) 
-         │
-         ▼
-RTL-TCP Client (from SDR++)
-         │
-         ▼
-FM Demod (from SDR++ Quadrature)
-         │
-         ▼
-Stereo Decoder (from SDR++ PLL + BroadcastFM)
-         │
-         ▼
-Audio Output (CoreAudio + WAV)
-         │
-         ▼
-XDR Server (controls frequency)
++---------------------+     +----------------------+     +-------------------+
+| rtl_tcp server     |     | FM Tuner SDR        |     | Control Clients   |
+| (external RTL-SDR) |---->| (this application)  |<----|                   |
++---------------------+     +----------------------+     +-------------------+
+                                   |                             |
+                                   ▼                             ▼
+                            +-------------+            +--------------------+
+                            | RTL-TCP     |            | XDR Server (7373) |
+                            | Client      |            +--------------------+
+                            +-------------+            +-------+------------+
+                                   |                        |            |
+                                   ▼                        ▼            ▼
+                            +-------------+            XDR-GTK      FM-DX-Tuner
+                            | FM Demod   |            (SHA1 auth)   (x protocol)
+                            | (SDR++)    |
+                            +-------------+
+                                   |
+                                   ▼
+                            +-------------+
+                            | Stereo      |
+                            | Decoder     |
+                            +-------------+
+                                   |
+                                   ▼
+                            +-------------+
+                            | Audio       |
+                            | Output      |
+                            | (PortAudio) |
+                            +-------------+
+                                   |
+                                   ▼
+                            +-------------+
+                            | WAV File   |
+                            +-------------+
 ```
+
+### Protocol Support
+
+| Client | Protocol | Port | Auth |
+|--------|----------|------|------|
+| XDR-GTK | xdrd (salt + SHA1) | 7373 | Password |
+| FM-DX-Tuner | FM-DX (x command) | 7373 | None |
+
+### Components
+
+| Component | Source | Description |
+|-----------|--------|-------------|
+| RTL-TCP Client | SDR++ | Connect to rtl_tcp server |
+| FM Demod | SDR++ Quadrature | Phase difference demod |
+| Stereo Decoder | SDR++ PLL | 19kHz pilot detection |
+| Audio Output | PortAudio | Cross-platform audio |
+| XDR Server | Original xdrd | Protocol compatibility |
+| FM-DX Server | FM-DX-Tuner | Protocol compatibility |
 
 ## CODE SOURCE: SDR++ ONLY
 

@@ -8,6 +8,9 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 
 find_package(OpenSSL REQUIRED)
 
+set(PORTAUDIO_INCLUDE "/opt/homebrew/Cellar/portaudio/19.7.0/include")
+set(PORTAUDIO_LIB "/opt/homebrew/Cellar/portaudio/19.7.0/lib")
+
 set(SOURCES
     src/rtl_tcp_client.cpp
     src/fm_demod.cpp
@@ -19,12 +22,12 @@ set(SOURCES
 
 add_executable(fmtuner-sdr ${SOURCES})
 
-target_include_directories(fmtuner-sdr PRIVATE ${CMAKE_SOURCE_DIR}/include /opt/homebrew/Cellar/openssl@3/3.6.1/include)
+target_include_directories(fmtuner-sdr PRIVATE 
+    ${CMAKE_SOURCE_DIR}/include 
+    /opt/homebrew/Cellar/openssl@3/3.6.1/include
+    ${PORTAUDIO_INCLUDE}
+)
 
-target_link_libraries(fmtuner-sdr pthread ${OPENSSL_CRYPTO_LIBRARY} ${OPENSSL_SSL_LIBRARY} ${COREAUDIO} ${AUDIOTOOLBOX})
-
-if(APPLE)
-    target_link_libraries(fmtuner-sdr "-framework CoreAudio" "-framework AudioToolbox")
-endif()
+target_link_libraries(fmtuner-sdr pthread ${OPENSSL_CRYPTO_LIBRARY} ${OPENSSL_SSL_LIBRARY} ${PORTAUDIO_LIB}/libportaudio.dylib)
 
 install(TARGETS fmtuner-sdr DESTINATION bin)

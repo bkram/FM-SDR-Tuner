@@ -43,7 +43,10 @@ public:
 
 private:
     void handleClient(int clientSocket);
+    void handleFmdxClient(int clientSocket);
+    void handleXdrClient(int clientSocket);
     std::string processCommand(const std::string& cmd);
+    std::string processFmdxCommand(const std::string& cmd);
     std::string generateSalt();
     std::string computeSHA1(const std::string& salt, const std::string& password);
     bool authenticate(const std::string& salt, const std::string& passwordHash);

@@ -149,6 +149,63 @@ void XDRServer::stop() {
 }
 
 void XDRServer::handleClient(int clientSocket) {
+    char buffer[256];
+    memset(buffer, 0, sizeof(buffer));
+    ssize_t n = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+    
+    if (n <= 0) {
+        return;
+    }
+    
+    buffer[n] = '\0';
+    std::string firstMsg = buffer;
+    if (!firstMsg.empty() && firstMsg.back() == '\n') {
+        firstMsg.pop_back();
+    }
+    if (!firstMsg.empty() && firstMsg.back() == '\r') {
+        firstMsg.pop_back();
+    }
+    
+    bool isFmdxProtocol = (firstMsg == "x");
+    
+    if (isFmdxProtocol) {
+        send(clientSocket, "1\n", 2, 0);
+        handleFmdxClient(clientSocket);
+    } else {
+        handleXdrClient(clientSocket);
+    }
+}
+
+void XDRServer::handleFmdxClient(int clientSocket) {
+    char cmdBuffer[256];
+    std::string command;
+
+    while (true) {
+        ssize_t n = recv(clientSocket, cmdBuffer, sizeof(cmdBuffer) - 1, 0);
+        if (n <= 0) {
+            break;
+        }
+
+        cmdBuffer[n] = '\0';
+        command += cmdBuffer;
+
+        size_t pos;
+        while ((pos = command.find('\n')) != std::string::npos) {
+            std::string line = command.substr(0, pos);
+            command = command.substr(pos + 1);
+
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+
+            std::string response = processFmdxCommand(line);
+            response += "\n";
+            send(clientSocket, response.c_str(), response.length(), 0);
+        }
+    }
+}
+
+void XDRServer::handleXdrClient(int clientSocket) {
     std::string salt = generateSalt();
     
     std::string msg = salt + "\n";
@@ -328,4 +385,76 @@ void XDRServer::setGainCallback(GainCallback cb) {
 void XDRServer::setAGCCallback(AGCCallback cb) {
     std::lock_guard<std::mutex> lock(m_callbackMutex);
     m_agcCallback = cb;
+}
+
+std::string XDRServer::processFmdxCommand(const std::string& cmd) {
+    if (cmd.empty()) {
+        return "";
+    }
+
+    char command = cmd[0];
+    std::string arg = cmd.length() > 1 ? cmd.substr(1) : "";
+
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+
+    switch (command) {
+        case 'T': {
+            if (arg.empty()) {
+                return "ER";
+            }
+            try {
+                uint32_t freq = std::stoul(arg);
+                m_frequency = freq;
+                if (m_freqCallback) {
+                    m_freqCallback(freq);
+                }
+                return "OK";
+            } catch (...) {
+                return "ER";
+            }
+        }
+
+        case 'Y': {
+            if (arg.empty()) {
+                return "ER";
+            }
+            try {
+                int vol = std::stoi(arg);
+                if (vol < -100) vol = -100;
+                if (vol > 100) vol = 100;
+                m_volume = vol;
+                if (m_volCallback) {
+                    m_volCallback(vol);
+                }
+                return "OK";
+            } catch (...) {
+                return "ER";
+            }
+        }
+
+        case 'A': {
+            if (arg.empty()) {
+                return "ER";
+            }
+            try {
+                int agc = std::stoi(arg);
+                m_agc = (agc != 0);
+                if (m_agcCallback) {
+                    m_agcCallback(m_agc);
+                }
+                return "OK";
+            } catch (...) {
+                return "ER";
+            }
+        }
+
+        case 'I': {
+            std::ostringstream oss;
+            oss << "F=" << m_frequency;
+            return oss.str();
+        }
+
+        default:
+            return "ER";
+    }
 }

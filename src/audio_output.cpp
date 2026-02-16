@@ -1,8 +1,7 @@
 #include "audio_output.h"
+#include <iostream>
 #include <cmath>
 #include <cstring>
-#include <iostream>
-#include <algorithm>
 
 AudioOutput::AudioOutput()
     : m_enableSpeaker(false)
@@ -12,10 +11,10 @@ AudioOutput::AudioOutput()
     , m_writeIndex(0)
     , m_readIndex(0)
 #ifdef __APPLE__
-    , m_audioQueue(nullptr)
+    , m_paStream(nullptr)
 #endif
 {
-    m_circularBuffer.resize(CIRCULAR_BUFFER_FRAMES * CHANNELS, 0.0f);
+    m_circularBuffer.resize(65536 * 2);
 }
 
 AudioOutput::~AudioOutput() {
@@ -35,8 +34,28 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile) {
 
 #ifdef __APPLE__
     if (enableSpeaker) {
-        if (!initAudioQueue()) {
-            std::cerr << "Warning: Failed to initialize audio queue" << std::endl;
+        PaError err = Pa_Initialize();
+        if (err != paNoError) {
+            std::cerr << "PortAudio init failed: " << Pa_GetErrorText(err) << std::endl;
+        } else {
+            PaStreamParameters outputParams;
+            outputParams.device = Pa_GetDefaultOutputDevice();
+            outputParams.channelCount = CHANNELS;
+            outputParams.sampleFormat = paFloat32;
+            outputParams.suggestedLatency = Pa_GetDeviceInfo(outputParams.device)->defaultLowOutputLatency;
+            outputParams.hostApiSpecificStreamInfo = nullptr;
+
+            err = Pa_OpenStream(&m_paStream, nullptr, &outputParams, SAMPLE_RATE, FRAMES_PER_BUFFER, paClipOff, nullptr, nullptr);
+            if (err != paNoError) {
+                std::cerr << "PortAudio open failed: " << Pa_GetErrorText(err) << std::endl;
+            } else {
+                err = Pa_StartStream(m_paStream);
+                if (err != paNoError) {
+                    std::cerr << "PortAudio start failed: " << Pa_GetErrorText(err) << std::endl;
+                } else {
+                    std::cerr << "PortAudio started successfully" << std::endl;
+                }
+            }
         }
     }
 #endif
@@ -49,7 +68,12 @@ void AudioOutput::shutdown() {
     m_running = false;
 
 #ifdef __APPLE__
-    stopAudioQueue();
+    if (m_paStream) {
+        Pa_StopStream(m_paStream);
+        Pa_CloseStream(m_paStream);
+        m_paStream = nullptr;
+    }
+    Pa_Terminate();
 #endif
 
     closeWAV();
@@ -133,103 +157,23 @@ bool AudioOutput::write(const float* left, const float* right, size_t numSamples
     }
 
 #ifdef __APPLE__
-    if (m_enableSpeaker && m_audioQueue) {
-        for (size_t i = 0; i < numSamples; i++) {
-            int writeIdx = m_writeIndex.fetch_add(1);
-            int bufIdx = writeIdx % CIRCULAR_BUFFER_FRAMES;
-            if (writeIdx >= CIRCULAR_BUFFER_FRAMES) {
-                m_writeIndex.fetch_sub(CIRCULAR_BUFFER_FRAMES);
+    if (m_enableSpeaker && m_paStream) {
+        float buffer[FRAMES_PER_BUFFER * CHANNELS];
+        size_t toWrite = numSamples;
+        size_t written = 0;
+        
+        while (toWrite > 0) {
+            size_t chunk = std::min(toWrite, (size_t)FRAMES_PER_BUFFER);
+            for (size_t i = 0; i < chunk; i++) {
+                buffer[i * 2] = left[written + i];
+                buffer[i * 2 + 1] = right[written + i];
             }
-            m_circularBuffer[bufIdx * CHANNELS] = left[i];
-            m_circularBuffer[bufIdx * CHANNELS + 1] = right[i];
+            Pa_WriteStream(m_paStream, buffer, chunk);
+            written += chunk;
+            toWrite -= chunk;
         }
     }
 #endif
 
     return true;
 }
-
-#ifdef __APPLE__
-
-void AudioOutput::audioQueueCallback(void* inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer) {
-    AudioOutput* audio = (AudioOutput*)inUserData;
-    
-    float* outSamples = (float*)inBuffer->mAudioData;
-    
-    int rawWriteIdx = audio->m_writeIndex.load();
-    int writeIdx;
-    if (rawWriteIdx >= CIRCULAR_BUFFER_FRAMES) {
-        writeIdx = rawWriteIdx % CIRCULAR_BUFFER_FRAMES;
-    } else {
-        writeIdx = rawWriteIdx;
-    }
-    int readIdx = audio->m_readIndex.load();
-    
-    int available = (writeIdx >= readIdx) ? 
-        (writeIdx - readIdx) : 
-        (CIRCULAR_BUFFER_FRAMES - readIdx + writeIdx);
-    
-    int framesToRead = std::min(QUEUE_BUFFER_FRAMES, available);
-    
-    for (int i = 0; i < framesToRead * CHANNELS; i++) {
-        outSamples[i] = audio->m_circularBuffer[readIdx * CHANNELS + i];
-    }
-    
-    for (int i = framesToRead * CHANNELS; i < QUEUE_BUFFER_FRAMES * CHANNELS; i++) {
-        outSamples[i] = 0.0f;
-    }
-    
-    readIdx += framesToRead;
-    if (readIdx >= CIRCULAR_BUFFER_FRAMES) readIdx -= CIRCULAR_BUFFER_FRAMES;
-    audio->m_readIndex.store(readIdx);
-    
-    inBuffer->mAudioDataByteSize = QUEUE_BUFFER_FRAMES * CHANNELS * sizeof(float);
-    AudioQueueEnqueueBuffer(audio->m_audioQueue, inBuffer, 0, nullptr);
-}
-
-bool AudioOutput::initAudioQueue() {
-    AudioStreamBasicDescription format = {0};
-    format.mSampleRate = SAMPLE_RATE;
-    format.mFormatID = kAudioFormatLinearPCM;
-    format.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-    format.mBytesPerPacket = CHANNELS * sizeof(float);
-    format.mFramesPerPacket = 1;
-    format.mBytesPerFrame = CHANNELS * sizeof(float);
-    format.mChannelsPerFrame = CHANNELS;
-    format.mBitsPerChannel = 32;
-
-    OSStatus status = AudioQueueNewOutput(&format, audioQueueCallback, this, nullptr, nullptr, 0, &m_audioQueue);
-    if (status != noErr) {
-        std::cerr << "AudioQueueNewOutput failed: " << status << std::endl;
-        return false;
-    }
-
-    UInt32 bufferSize = QUEUE_BUFFER_FRAMES * CHANNELS * sizeof(float);
-    for (int i = 0; i < NUM_QUEUE_BUFFERS; i++) {
-        status = AudioQueueAllocateBuffer(m_audioQueue, bufferSize, &m_buffers[i]);
-        if (status != noErr) {
-            std::cerr << "AudioQueueAllocateBuffer failed: " << status << std::endl;
-            return false;
-        }
-        audioQueueCallback(this, m_audioQueue, m_buffers[i]);
-    }
-
-    status = AudioQueueStart(m_audioQueue, nullptr);
-    if (status != noErr) {
-        std::cerr << "AudioQueueStart failed: " << status << std::endl;
-        return false;
-    }
-    
-    std::cerr << "AudioQueue started successfully" << std::endl;
-    return true;
-}
-
-void AudioOutput::stopAudioQueue() {
-    if (m_audioQueue) {
-        AudioQueueStop(m_audioQueue, true);
-        AudioQueueDispose(m_audioQueue, true);
-        m_audioQueue = nullptr;
-    }
-}
-
-#endif
