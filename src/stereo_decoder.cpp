@@ -20,8 +20,6 @@ constexpr float kPllLockHoldHz = 220.0f;
 
 StereoDecoder::StereoDecoder(int inputRate, int outputRate)
     : m_inputRate(inputRate)
-    , m_outputRate(outputRate)
-    , m_downsampleFactor(std::max(1, inputRate / outputRate))
     , m_stereoDetected(false)
     , m_forceStereo(false)
     , m_forceMono(false)
@@ -44,11 +42,7 @@ StereoDecoder::StereoDecoder(int inputRate, int outputRate)
     , m_leftHistPos(0)
     , m_rightHistPos(0)
     , m_delayPos(0)
-    , m_delaySamples(0)
-    , m_decimPhase(0)
-    , m_deemphAlpha(1.0f)
-    , m_deemphStateLeft(0.0f)
-    , m_deemphStateRight(0.0f) {
+    , m_delaySamples(0) {
     m_pilotTaps = designBandPass(18750.0, 19250.0, 3000.0);
     m_pilotHistory.assign(m_pilotTaps.size(), 0.0f);
     m_audioTaps = designLowPass(15000.0, 4000.0);
@@ -58,8 +52,7 @@ StereoDecoder::StereoDecoder(int inputRate, int outputRate)
     // Match SDR++ broadcast_fm delay around pilot filter latency.
     m_delaySamples = static_cast<int>((m_pilotTaps.size() > 0) ? ((m_pilotTaps.size() - 1) / 2 + 1) : 0);
     m_delayLine.assign(static_cast<size_t>(std::max(1, m_delaySamples + 1)), 0.0f);
-
-    setDeemphasis(75);
+    (void)outputRate;
 }
 
 StereoDecoder::~StereoDecoder() = default;
@@ -81,9 +74,6 @@ void StereoDecoder::reset() {
     m_leftHistPos = 0;
     m_rightHistPos = 0;
     m_delayPos = 0;
-    m_decimPhase = 0;
-    m_deemphStateLeft = 0.0f;
-    m_deemphStateRight = 0.0f;
     std::fill(m_pilotHistory.begin(), m_pilotHistory.end(), 0.0f);
     std::fill(m_leftHistory.begin(), m_leftHistory.end(), 0.0f);
     std::fill(m_rightHistory.begin(), m_rightHistory.end(), 0.0f);
@@ -96,16 +86,6 @@ void StereoDecoder::setForceStereo(bool force) {
 
 void StereoDecoder::setForceMono(bool force) {
     m_forceMono = force;
-}
-
-void StereoDecoder::setDeemphasis(int tau_us) {
-    if (tau_us <= 0) {
-        m_deemphAlpha = 1.0f;
-        return;
-    }
-    const float tau = static_cast<float>(tau_us) * 1e-6f;
-    const float dt = 1.0f / static_cast<float>(m_outputRate);
-    m_deemphAlpha = dt / (tau + dt);
 }
 
 size_t StereoDecoder::processAudio(const float* mono, float* left, float* right, size_t numSamples) {
@@ -181,10 +161,22 @@ size_t StereoDecoder::processAudio(const float* mono, float* left, float* right,
         m_delayLine[m_delayPos] = mpx;
         m_delayPos = (m_delayPos + 1) % m_delayLine.size();
 
-        // MPX mono carries (L+R), so normalize by 2 to match stereo loudness.
+        // SDR++-style L-R recovery:
+        // 1) take delayed MPX as complex (real, imag=0),
+        // 2) multiply by conjugated PLL output twice (38 kHz downconversion),
+        // 3) take real part and apply 2x gain.
         const float monoNorm = delayedMpx * kMatrixScale;
-        const float subcarrier = std::cos(2.0f * m_pllPhase);
-        const float lr = 2.0f * delayedMpx * subcarrier;
+        const float pllRe = std::cos(m_pllPhase);
+        const float pllIm = std::sin(m_pllPhase);
+        float lmrRe = delayedMpx;
+        float lmrIm = 0.0f;
+        for (int k = 0; k < 2; k++) {
+            const float nextRe = (lmrRe * pllRe) + (lmrIm * pllIm);
+            const float nextIm = (lmrIm * pllRe) - (lmrRe * pllIm);
+            lmrRe = nextRe;
+            lmrIm = nextIm;
+        }
+        const float lr = 2.0f * lmrRe;
         const float stereoLeft = (delayedMpx + lr) * kMatrixScale;
         const float stereoRight = (delayedMpx - lr) * kMatrixScale;
 
@@ -197,17 +189,8 @@ size_t StereoDecoder::processAudio(const float* mono, float* left, float* right,
         const float leftFilt = filterSample(leftRaw, m_audioTaps, m_leftHistory, m_leftHistPos);
         const float rightFilt = filterSample(rightRaw, m_audioTaps, m_rightHistory, m_rightHistPos);
 
-        m_decimPhase++;
-        if (m_decimPhase < m_downsampleFactor) {
-            continue;
-        }
-        m_decimPhase = 0;
-
-        // SDR++ applies deemphasis after AF resampling.
-        m_deemphStateLeft = (m_deemphAlpha * leftFilt) + ((1.0f - m_deemphAlpha) * m_deemphStateLeft);
-        m_deemphStateRight = (m_deemphAlpha * rightFilt) + ((1.0f - m_deemphAlpha) * m_deemphStateRight);
-        left[outCount] = std::clamp(m_deemphStateLeft, -1.0f, 1.0f);
-        right[outCount] = std::clamp(m_deemphStateRight, -1.0f, 1.0f);
+        left[outCount] = std::clamp(leftFilt, -1.0f, 1.0f);
+        right[outCount] = std::clamp(rightFilt, -1.0f, 1.0f);
         outCount++;
     }
 

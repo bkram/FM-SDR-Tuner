@@ -15,6 +15,7 @@ set(SOURCES
     src/rtl_tcp_client.cpp
     src/fm_demod.cpp
     src/stereo_decoder.cpp
+    src/af_post_processor.cpp
     src/xdr_server.cpp
     src/audio_output.cpp
     src/main.cpp

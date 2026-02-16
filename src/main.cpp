@@ -10,6 +10,7 @@
 #include "rtl_tcp_client.h"
 #include "fm_demod.h"
 #include "stereo_decoder.h"
+#include "af_post_processor.h"
 #include "xdr_server.h"
 #include "audio_output.h"
 
@@ -220,17 +221,18 @@ int main(int argc, char* argv[]) {
 
     FMDemod demod(INPUT_RATE, OUTPUT_RATE);
     StereoDecoder stereo(INPUT_RATE, OUTPUT_RATE);
+    AFPostProcessor afPost(INPUT_RATE, OUTPUT_RATE);
     int appliedDeemphasis = requestedDeemphasis.load();
     bool appliedForceMono = requestedForceMono.load();
     bool appliedEffectiveForceMono = appliedForceMono;
     float rfLevelFiltered = 0.0f;
     bool rfLevelInitialized = false;
     if (appliedDeemphasis == 0) {
-        stereo.setDeemphasis(50);
+        afPost.setDeemphasis(50);
     } else if (appliedDeemphasis == 1) {
-        stereo.setDeemphasis(75);
+        afPost.setDeemphasis(75);
     } else {
-        stereo.setDeemphasis(0);
+        afPost.setDeemphasis(0);
     }
     stereo.setForceMono(appliedEffectiveForceMono);
 
@@ -306,6 +308,8 @@ int main(int argc, char* argv[]) {
     const size_t BUF_SAMPLES = 8192;
     uint8_t* iqBuffer = new uint8_t[BUF_SAMPLES * 2];
     float* demodBuffer = new float[BUF_SAMPLES];
+    float* stereoLeft = new float[BUF_SAMPLES];
+    float* stereoRight = new float[BUF_SAMPLES];
     float* audioLeft = new float[BUF_SAMPLES];
     float* audioRight = new float[BUF_SAMPLES];
 
@@ -319,6 +323,7 @@ int main(int argc, char* argv[]) {
             rtlClient.setFrequency(requestedFrequencyHz.load());
             // Clear pilot/stereo state on retune to avoid carrying lock across stations.
             stereo.reset();
+            afPost.reset();
         }
         const bool gainChanged = pendingGain.exchange(false);
         const bool agcChanged = pendingAGC.exchange(false);
@@ -331,11 +336,11 @@ int main(int argc, char* argv[]) {
         int targetDeemphasis = requestedDeemphasis.load();
         if (targetDeemphasis != appliedDeemphasis) {
             if (targetDeemphasis == 0) {
-                stereo.setDeemphasis(50);
+                afPost.setDeemphasis(50);
             } else if (targetDeemphasis == 1) {
-                stereo.setDeemphasis(75);
+                afPost.setDeemphasis(75);
             } else {
-                stereo.setDeemphasis(0);
+                afPost.setDeemphasis(0);
             }
             appliedDeemphasis = targetDeemphasis;
         }
@@ -377,7 +382,8 @@ int main(int argc, char* argv[]) {
         }
 
         demod.processNoDownsample(iqBuffer, demodBuffer, samples);
-        const size_t outSamples = stereo.processAudio(demodBuffer, audioLeft, audioRight, samples);
+        const size_t stereoSamples = stereo.processAudio(demodBuffer, stereoLeft, stereoRight, samples);
+        const size_t outSamples = afPost.process(stereoLeft, stereoRight, stereoSamples, audioLeft, audioRight, BUF_SAMPLES);
         xdrServer.updateSignal(rfLevelFiltered, stereo.isStereo(), effectiveForceMono, -1, -1);
         xdrServer.updatePilot(stereo.getPilotLevelTenthsKHz());
 
@@ -395,6 +401,8 @@ int main(int argc, char* argv[]) {
 
     delete[] iqBuffer;
     delete[] demodBuffer;
+    delete[] stereoLeft;
+    delete[] stereoRight;
     delete[] audioLeft;
     delete[] audioRight;
 

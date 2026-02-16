@@ -16,7 +16,6 @@ public:
     void reset();
     void setForceStereo(bool force);
     void setForceMono(bool force);
-    void setDeemphasis(int tau_us);
     int getPilotLevelTenthsKHz() const { return m_pilotLevelTenthsKHz; }
 
     bool isStereo() const { return m_stereoDetected; }
@@ -28,8 +27,6 @@ private:
     float windowNuttall(int n, int count) const;
 
     int m_inputRate;
-    int m_outputRate;
-    int m_downsampleFactor;
     bool m_stereoDetected;
     bool m_forceStereo;
     bool m_forceMono;
@@ -63,11 +60,6 @@ private:
     std::vector<float> m_delayLine;
     size_t m_delayPos;
     int m_delaySamples;
-
-    int m_decimPhase;
-    float m_deemphAlpha;
-    float m_deemphStateLeft;
-    float m_deemphStateRight;
 };
 
 #endif
