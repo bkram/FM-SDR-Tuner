@@ -1,0 +1,11 @@
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.wav
+*.log
+__pycache__/
+.pytest_cache/
+*.egg-info/
+research/
