@@ -39,6 +39,7 @@ private:
 
     std::vector<float> m_audioTaps;
     std::vector<float> m_audioHistory;
+    std::vector<float> m_demodScratch;
     size_t m_audioHistPos;
     int m_decimPhase;
 };

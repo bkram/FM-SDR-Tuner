@@ -14,6 +14,7 @@
 #include <chrono>
 #include <sstream>
 #include <iomanip>
+#include <array>
 
 #include "rtl_tcp_client.h"
 #include "fm_demod.h"
@@ -26,6 +27,26 @@
 #include "config.h"
 
 static std::atomic<bool> g_running(true);
+
+namespace {
+double computeNormalizedIqPowerSum(const uint8_t* iq, size_t samples) {
+    static const std::array<float, 256> kNormSqLut = []() {
+        std::array<float, 256> lut{};
+        for (int v = 0; v < 256; v++) {
+            const float norm = (static_cast<float>(v) - 127.5f) / 127.5f;
+            lut[static_cast<size_t>(v)] = norm * norm;
+        }
+        return lut;
+    }();
+
+    const size_t count = samples * 2;
+    double powerSum = 0.0;
+    for (size_t i = 0; i < count; i++) {
+        powerSum += kNormSqLut[iq[i]];
+    }
+    return powerSum;
+}
+}  // namespace
 
 void signalHandler(int) {
     g_running = false;
@@ -598,12 +619,7 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                double powerSum = 0.0;
-                for (size_t i = 0; i < samples; i++) {
-                    const double iNorm = (static_cast<int>(iqBuffer[i * 2]) - 127.5) / 127.5;
-                    const double qNorm = (static_cast<int>(iqBuffer[i * 2 + 1]) - 127.5) / 127.5;
-                    powerSum += iNorm * iNorm + qNorm * qNorm;
-                }
+                const double powerSum = computeNormalizedIqPowerSum(iqBuffer, samples);
                 const double avgPower = powerSum / static_cast<double>(samples);
                 const double dbfs = 10.0 * std::log10(avgPower + 1e-12);
                 const double gainCompDb = isImsAgcEnabled() ? 0.0 : static_cast<double>(calculateAppliedGainDb());
@@ -660,12 +676,7 @@ int main(int argc, char* argv[]) {
         consecutiveReadFailures = 0;
 
         // RF-domain strength estimate from raw IQ power before demodulation.
-        double powerSum = 0.0;
-        for (size_t i = 0; i < samples; i++) {
-            const double iNorm = (static_cast<int>(iqBuffer[i * 2]) - 127.5) / 127.5;
-            const double qNorm = (static_cast<int>(iqBuffer[i * 2 + 1]) - 127.5) / 127.5;
-            powerSum += iNorm * iNorm + qNorm * qNorm;
-        }
+        const double powerSum = computeNormalizedIqPowerSum(iqBuffer, samples);
         const double avgPower = (samples > 0) ? (powerSum / static_cast<double>(samples)) : 0.0;
         const double dbfs = 10.0 * std::log10(avgPower + 1e-12);
         // Compensate by configured RTL gain so RF level is less "always high".
