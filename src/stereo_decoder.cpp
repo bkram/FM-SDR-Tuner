@@ -246,7 +246,10 @@ size_t StereoDecoder::processAudio(const float* mono, float* left, float* right,
 
         const float delayedMpx = m_delayLine[m_delayPos];
         m_delayLine[m_delayPos] = mpx;
-        m_delayPos = (m_delayPos + 1) % m_delayLine.size();
+        m_delayPos++;
+        if (m_delayPos >= m_delayLine.size()) {
+            m_delayPos = 0;
+        }
 
         // SDR++-style L-R recovery:
         // 1) take delayed MPX as complex (real, imag=0),
@@ -255,15 +258,8 @@ size_t StereoDecoder::processAudio(const float* mono, float* left, float* right,
         const float monoNorm = delayedMpx * kMatrixScale;
         const float pllRe = std::cos(m_pllPhase);
         const float pllIm = std::sin(m_pllPhase);
-        float lmrRe = delayedMpx;
-        float lmrIm = 0.0f;
-        for (int k = 0; k < 2; k++) {
-            const float nextRe = (lmrRe * pllRe) + (lmrIm * pllIm);
-            const float nextIm = (lmrIm * pllRe) - (lmrRe * pllIm);
-            lmrRe = nextRe;
-            lmrIm = nextIm;
-        }
-        const float lr = 2.0f * lmrRe;
+        const float cos2 = (pllRe * pllRe) - (pllIm * pllIm);
+        const float lr = 2.0f * delayedMpx * cos2;
         const float stereoLeft = (delayedMpx + lr) * kMatrixScale;
         const float stereoRight = (delayedMpx - lr) * kMatrixScale;
 
@@ -330,7 +326,10 @@ float StereoDecoder::filterSample(float input, const std::vector<float>& taps, s
     const size_t tapCount = taps.size();
     history[pos] = input;
     history[pos + tapCount] = input;
-    pos = (pos + 1) % tapCount;
+    pos++;
+    if (pos >= tapCount) {
+        pos = 0;
+    }
 
     const float* x = &history[pos];
     const float* h = taps.data();

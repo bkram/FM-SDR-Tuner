@@ -7,6 +7,11 @@
 
 class FMDemod {
 public:
+    enum class DemodMode {
+        Fast = 0,
+        Exact = 1
+    };
+
     FMDemod(int inputRate, int outputRate);
     ~FMDemod();
 
@@ -19,6 +24,8 @@ public:
     void setDeviation(double deviation);
     void setBandwidthMode(int mode);
     void setBandwidthHz(int bwHz);
+    void setDemodMode(DemodMode mode);
+    DemodMode getDemodMode() const { return m_demodMode; }
 
 private:
     void demodulate(const uint8_t* iq, float* audio, size_t len);
@@ -29,7 +36,12 @@ private:
     int m_outputRate;
     int m_downsampleFactor;
 
+    DemodMode m_demodMode;
     float m_lastPhase;
+    bool m_haveLastPhase;
+    float m_prevI;
+    float m_prevQ;
+    bool m_havePrevIQ;
     double m_deviation;
     double m_invDeviation;
 

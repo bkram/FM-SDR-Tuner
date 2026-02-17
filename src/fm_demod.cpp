@@ -1,4 +1,5 @@
 #include "fm_demod.h"
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -17,6 +18,23 @@ const std::array<float, 256>& iqNormLut() {
         std::array<float, 256> out{};
         for (int v = 0; v < 256; v++) {
             out[static_cast<size_t>(v)] = (static_cast<float>(v) - 127.5f) / 127.5f;
+        }
+        return out;
+    }();
+    return lut;
+}
+
+const std::array<float, 256 * 256>& iqInvPowerLut() {
+    static const std::array<float, 256 * 256> lut = []() {
+        constexpr float kEps = 1e-12f;
+        std::array<float, 256 * 256> out{};
+        for (int i = 0; i < 256; i++) {
+            const float iNorm = (static_cast<float>(i) - 127.5f) / 127.5f;
+            for (int q = 0; q < 256; q++) {
+                const float qNorm = (static_cast<float>(q) - 127.5f) / 127.5f;
+                const float denom = (iNorm * iNorm) + (qNorm * qNorm) + kEps;
+                out[static_cast<size_t>((i << 8) | q)] = 1.0f / denom;
+            }
         }
         return out;
     }();
@@ -95,7 +113,12 @@ FMDemod::FMDemod(int inputRate, int outputRate)
     : m_inputRate(inputRate)
     , m_outputRate(outputRate)
     , m_downsampleFactor(std::max(1, inputRate / outputRate))
-    , m_lastPhase(0)
+    , m_demodMode(DemodMode::Fast)
+    , m_lastPhase(0.0f)
+    , m_haveLastPhase(false)
+    , m_prevI(0.0f)
+    , m_prevQ(0.0f)
+    , m_havePrevIQ(false)
     , m_deviation(75000.0)
     , m_invDeviation(0.0)
     , m_deemphAlpha(1.0f)
@@ -127,6 +150,10 @@ void FMDemod::setDeviation(double deviation) {
 
 void FMDemod::reset() {
     m_lastPhase = 0.0f;
+    m_haveLastPhase = false;
+    m_prevI = 0.0f;
+    m_prevQ = 0.0f;
+    m_havePrevIQ = false;
     m_deemphasisState = 0.0f;
     m_audioHistPos = 0;
     m_decimPhase = 0;
@@ -228,33 +255,86 @@ void FMDemod::setBandwidthHz(int bwHz) {
     rebuildAudioFilter(cutoffHz);
 }
 
+void FMDemod::setDemodMode(DemodMode mode) {
+    if (m_demodMode == mode) {
+        return;
+    }
+    m_demodMode = mode;
+    m_lastPhase = 0.0f;
+    m_haveLastPhase = false;
+    m_prevI = 0.0f;
+    m_prevQ = 0.0f;
+    m_havePrevIQ = false;
+}
+
 void FMDemod::demodulate(const uint8_t* iq, float* audio, size_t len) {
     constexpr float kPi = 3.14159265358979323846f;
     constexpr float kTwoPi = 6.28318530717958647692f;
     const auto& kIqNorm = iqNormLut();
-    float lastPhase = m_lastPhase;
+    const auto& kInvPower = iqInvPowerLut();
     const uint8_t* iqPtr = iq;
 
+    if (m_demodMode == DemodMode::Fast) {
+        float prevI = m_prevI;
+        float prevQ = m_prevQ;
+        bool havePrev = m_havePrevIQ;
+        for (size_t i = 0; i < len; i++) {
+            // rtl_tcp provides unsigned 8-bit IQ centered at 127.5.
+            const uint8_t iRaw = iqPtr[0];
+            const uint8_t qRaw = iqPtr[1];
+            const float i_val = kIqNorm[iRaw];
+            const float q_val = kIqNorm[qRaw];
+            iqPtr += 2;
+
+            if (!havePrev) {
+                audio[i] = 0.0f;
+                prevI = i_val;
+                prevQ = q_val;
+                havePrev = true;
+                continue;
+            }
+
+            // Fast quadrature FM discriminator (avoids atan2 in the hot loop).
+            const float dI = i_val - prevI;
+            const float dQ = q_val - prevQ;
+            const float invPower = kInvPower[static_cast<size_t>((static_cast<uint16_t>(iRaw) << 8) | qRaw)];
+            const float delta = ((i_val * dQ) - (q_val * dI)) * invPower;
+            audio[i] = delta * m_invDeviation;
+            prevI = i_val;
+            prevQ = q_val;
+        }
+        m_prevI = prevI;
+        m_prevQ = prevQ;
+        m_havePrevIQ = havePrev;
+        return;
+    }
+
+    float lastPhase = m_lastPhase;
+    bool havePhase = m_haveLastPhase;
     for (size_t i = 0; i < len; i++) {
-        // rtl_tcp provides unsigned 8-bit IQ centered at 127.5.
         const float i_val = kIqNorm[iqPtr[0]];
         const float q_val = kIqNorm[iqPtr[1]];
         iqPtr += 2;
 
         const float phase = std::atan2f(q_val, i_val);
-        float delta = phase - lastPhase;
+        if (!havePhase) {
+            audio[i] = 0.0f;
+            lastPhase = phase;
+            havePhase = true;
+            continue;
+        }
 
+        float delta = phase - lastPhase;
         if (delta > kPi) {
             delta -= kTwoPi;
         } else if (delta <= -kPi) {
             delta += kTwoPi;
         }
-
         audio[i] = delta * m_invDeviation;
         lastPhase = phase;
     }
-
     m_lastPhase = lastPhase;
+    m_haveLastPhase = havePhase;
 }
 
 size_t FMDemod::downsampleAudio(const float* demod, float* audio, size_t numSamples) {

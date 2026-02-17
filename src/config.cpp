@@ -164,6 +164,11 @@ bool Config::loadFromFile(const std::string& filename) {
                 if (parseBool(value, parsed)) {
                     processing.allow_client_gain_override = parsed;
                 }
+            } else if (key == "demodulator") {
+                const std::string parsed = toLower(trim(value));
+                if (parsed == "fast" || parsed == "exact") {
+                    processing.demodulator = parsed;
+                }
             } else if (key == "stereo") {
                 bool parsed = false;
                 if (parseBool(value, parsed)) {

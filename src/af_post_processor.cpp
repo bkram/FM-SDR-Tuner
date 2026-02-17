@@ -108,6 +108,8 @@ AFPostProcessor::AFPostProcessor(int inputRate, int outputRate)
     m_useAvx2 = cpu.avx2 && cpu.fma;
     designPolyphaseKernel();
     reset();
+    m_leftBuffer.reserve(65536);
+    m_rightBuffer.reserve(65536);
     setDeemphasis(75);
 }
 
@@ -202,10 +204,8 @@ size_t AFPostProcessor::process(const float* inLeft,
     }
 
     const size_t oldSize = m_leftBuffer.size();
-    m_leftBuffer.resize(oldSize + inSamples);
-    m_rightBuffer.resize(oldSize + inSamples);
-    std::memcpy(m_leftBuffer.data() + oldSize, inLeft, inSamples * sizeof(float));
-    std::memcpy(m_rightBuffer.data() + oldSize, inRight, inSamples * sizeof(float));
+    m_leftBuffer.insert(m_leftBuffer.end(), inLeft, inLeft + inSamples);
+    m_rightBuffer.insert(m_rightBuffer.end(), inRight, inRight + inSamples);
 
     size_t outCount = 0;
     size_t available = m_leftBuffer.size() - m_bufferStart;

@@ -1,6 +1,7 @@
 #include <iostream>
 #include <csignal>
 #include <atomic>
+#include <cctype>
 #include <cstring>
 #include <getopt.h>
 #include <algorithm>
@@ -107,6 +108,7 @@ int main(int argc, char* argv[]) {
     }
     if (verboseLogging) {
         std::cout << "[Config] audio.device='" << config.audio.device << "'\n";
+        std::cout << "[Config] processing.demodulator='" << config.processing.demodulator << "'\n";
     }
     if (config.audio.output_rate != OUTPUT_RATE ||
         config.audio.buffer_size != AudioOutput::FRAMES_PER_BUFFER) {
@@ -311,6 +313,17 @@ int main(int argc, char* argv[]) {
     };
 
     FMDemod demod(INPUT_RATE, OUTPUT_RATE);
+    {
+        std::string demodMode = config.processing.demodulator;
+        std::transform(demodMode.begin(), demodMode.end(), demodMode.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (demodMode == "exact") {
+            demod.setDemodMode(FMDemod::DemodMode::Exact);
+        } else {
+            demod.setDemodMode(FMDemod::DemodMode::Fast);
+        }
+    }
     StereoDecoder stereo(INPUT_RATE, OUTPUT_RATE);
     AFPostProcessor afPost(INPUT_RATE, OUTPUT_RATE);
     int appliedBandwidthHz = requestedBandwidthHz.load();
