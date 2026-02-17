@@ -31,7 +31,7 @@ struct Config {
     struct ProcessingSection {
         int agc_mode = 2;
         bool allow_client_gain_override = true;
-        std::string demodulator = "fast";
+        std::string demodulator = "exact";
         bool stereo = true;
         bool rds = true;
     } processing;

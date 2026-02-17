@@ -40,10 +40,18 @@ double computeNormalizedIqPowerSum(const uint8_t* iq, size_t samples) {
         return lut;
     }();
 
+    const float* lut = kNormSqLut.data();
     const size_t count = samples * 2;
     double powerSum = 0.0;
-    for (size_t i = 0; i < count; i++) {
-        powerSum += kNormSqLut[iq[i]];
+    size_t i = 0;
+    for (; i + 4 <= count; i += 4) {
+        powerSum += lut[iq[i]];
+        powerSum += lut[iq[i + 1]];
+        powerSum += lut[iq[i + 2]];
+        powerSum += lut[iq[i + 3]];
+    }
+    for (; i < count; i++) {
+        powerSum += lut[iq[i]];
     }
     return powerSum;
 }
@@ -330,6 +338,11 @@ int main(int argc, char* argv[]) {
     int appliedDeemphasis = requestedDeemphasis.load();
     bool appliedForceMono = requestedForceMono.load();
     bool appliedEffectiveForceMono = appliedForceMono;
+    float dcBlockStateL = 0.0f;
+    float dcBlockStateR = 0.0f;
+    float dcBlockPrevInL = 0.0f;
+    float dcBlockPrevInR = 0.0f;
+    constexpr float kDcBlockR = 0.996f;
     float rfLevelFiltered = 0.0f;
     bool rfLevelInitialized = false;
     if (appliedDeemphasis == 0) {
@@ -456,16 +469,16 @@ int main(int argc, char* argv[]) {
             return;
         }
 
-        std::vector<float> block(count);
-        std::memcpy(block.data(), samples, count * sizeof(float));
-
         {
             std::lock_guard<std::mutex> lock(rdsQueueMutex);
             if (rdsQueue.size() >= RDS_QUEUE_LIMIT) {
                 // Keep continuity for decoder lock; drop newest block under overload.
                 return;
             }
-            rdsQueue.emplace_back(std::move(block));
+            rdsQueue.emplace_back();
+            std::vector<float>& block = rdsQueue.back();
+            block.resize(count);
+            std::memcpy(block.data(), samples, count * sizeof(float));
         }
         rdsQueueCv.notify_one();
     };
@@ -718,8 +731,16 @@ int main(int argc, char* argv[]) {
         // Keep small headroom to reduce hard clipping distortion at high modulation.
         const float volumeScale = (requestedVolume.load() / 100.0f) * 0.85f;
         for (size_t i = 0; i < outSamples; i++) {
-            audioLeft[i] = std::clamp(audioLeft[i] * volumeScale, -1.0f, 1.0f);
-            audioRight[i] = std::clamp(audioRight[i] * volumeScale, -1.0f, 1.0f);
+            // 1st-order DC blocker / subsonic HPF to preserve headroom and avoid bassy clipping artifacts.
+            const float inL = audioLeft[i];
+            const float inR = audioRight[i];
+            dcBlockStateL = (inL - dcBlockPrevInL) + (kDcBlockR * dcBlockStateL);
+            dcBlockStateR = (inR - dcBlockPrevInR) + (kDcBlockR * dcBlockStateR);
+            dcBlockPrevInL = inL;
+            dcBlockPrevInR = inR;
+
+            audioLeft[i] = std::clamp(dcBlockStateL * volumeScale, -1.0f, 1.0f);
+            audioRight[i] = std::clamp(dcBlockStateR * volumeScale, -1.0f, 1.0f);
         }
 
         if (outSamples > 0) {

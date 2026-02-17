@@ -204,8 +204,10 @@ size_t AFPostProcessor::process(const float* inLeft,
     }
 
     const size_t oldSize = m_leftBuffer.size();
-    m_leftBuffer.insert(m_leftBuffer.end(), inLeft, inLeft + inSamples);
-    m_rightBuffer.insert(m_rightBuffer.end(), inRight, inRight + inSamples);
+    m_leftBuffer.resize(oldSize + inSamples);
+    m_rightBuffer.resize(oldSize + inSamples);
+    std::memcpy(m_leftBuffer.data() + oldSize, inLeft, inSamples * sizeof(float));
+    std::memcpy(m_rightBuffer.data() + oldSize, inRight, inSamples * sizeof(float));
 
     size_t outCount = 0;
     size_t available = m_leftBuffer.size() - m_bufferStart;
@@ -230,8 +232,8 @@ size_t AFPostProcessor::process(const float* inLeft,
             right = m_deemphStateRight;
         }
 
-        outLeft[outCount] = std::clamp(left, -1.0f, 1.0f);
-        outRight[outCount] = std::clamp(right, -1.0f, 1.0f);
+        outLeft[outCount] = left;
+        outRight[outCount] = right;
         outCount++;
         m_timeAcc += static_cast<int64_t>(m_downFactor);
     }

@@ -272,8 +272,8 @@ size_t StereoDecoder::processAudio(const float* mono, float* left, float* right,
         const float leftFilt = filterSample(leftRaw, m_audioTapsRev, m_leftHistory, m_leftHistPos);
         const float rightFilt = filterSample(rightRaw, m_audioTapsRev, m_rightHistory, m_rightHistPos);
 
-        left[outCount] = std::clamp(leftFilt, -1.0f, 1.0f);
-        right[outCount] = std::clamp(rightFilt, -1.0f, 1.0f);
+        left[outCount] = leftFilt;
+        right[outCount] = rightFilt;
         outCount++;
     }
 
