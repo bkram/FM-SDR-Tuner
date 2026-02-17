@@ -10,7 +10,7 @@ from typing import Generator, Tuple
 from contextlib import contextmanager
 
 
-FMTUNER_BINARY = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build", "fmtuner-sdr")
+FMTUNER_BINARY = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build", "fm-tuner-sdr")
 
 
 def find_free_port() -> int:
@@ -61,7 +61,7 @@ def rtl_tcp() -> Generator[Tuple[str, int], None, None]:
 @contextmanager
 def fmtuner_process(rtl_host: str, rtl_port: int, frequency: int = 88600, wav_file: str = None):
     if not os.path.exists(FMTUNER_BINARY):
-        pytest.skip(f"fmtuner-sdr binary not found at {FMTUNER_BINARY}")
+        pytest.skip(f"fm-tuner-sdr binary not found at {FMTUNER_BINARY}")
     
     cmd = [FMTUNER_BINARY, "-t", f"{rtl_host}:{rtl_port}", "-f", str(frequency)]
     
@@ -80,7 +80,7 @@ def fmtuner_process(rtl_host: str, rtl_port: int, frequency: int = 88600, wav_fi
     
     if proc.poll() is not None:
         stdout, stderr = proc.communicate()
-        pytest.skip(f"fmtuner-sdr failed to start: {stderr.decode()}")
+        pytest.skip(f"fm-tuner-sdr failed to start: {stderr.decode()}")
     
     try:
         yield proc

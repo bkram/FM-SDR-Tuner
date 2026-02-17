@@ -10,6 +10,7 @@
 #include <mutex>
 #include <chrono>
 #include <deque>
+#include <string>
 
 class XDRServer {
 public:
@@ -20,8 +21,8 @@ public:
     using IntCallback = std::function<void(int value)>;
     using FrequencyCallback = std::function<void(uint32_t freqHz)>;
     using VolumeCallback = std::function<void(int volume)>;
-    using GainCallback = std::function<void(int gain)>;
-    using AGCCallback = std::function<void(int mode)>;
+    using GainCallback = std::function<bool(int gain)>;
+    using AGCCallback = std::function<bool(int mode)>;
     using SamplingCallback = std::function<void(int interval, int detector)>;
     using ForceMonoCallback = std::function<void(bool forceMono)>;
     using StartCallback = std::function<void()>;
@@ -32,6 +33,7 @@ public:
 
     void setPassword(const std::string& password);
     void setGuestMode(bool enabled);
+    void setVerboseLogging(bool enabled);
 
     bool start();
     void stop();
@@ -74,6 +76,19 @@ public:
 
     bool isRunning() const { return m_running; }
 
+    struct ScanConfig {
+        int startKHz = 87500;
+        int stopKHz = 108000;
+        int stepKHz = 100;
+        int bandwidthHz = 0;
+        int antenna = 0;
+        bool continuous = false;
+    };
+
+    bool consumeScanStart(ScanConfig& config);
+    bool consumeScanCancel();
+    void pushScanLine(const std::string& line);
+
 private:
     void handleClient(int clientSocket);
     void handleFmdxClient(int clientSocket);
@@ -95,6 +110,7 @@ private:
     bool m_guestMode;
     bool m_authenticated;
     bool m_guestSession;
+    std::atomic<bool> m_verboseLogging;
 
     std::atomic<int> m_mode;
     std::atomic<uint32_t> m_frequency;
@@ -119,6 +135,16 @@ private:
     std::atomic<int> m_pilotTenthsKHz;
     std::deque<std::string> m_rdsQueue;
     std::mutex m_rdsMutex;
+    std::atomic<int> m_scanStartKHz;
+    std::atomic<int> m_scanStopKHz;
+    std::atomic<int> m_scanStepKHz;
+    std::atomic<int> m_scanBandwidthHz;
+    std::atomic<int> m_scanAntenna;
+    std::atomic<bool> m_scanContinuous;
+    std::atomic<bool> m_scanStartPending;
+    std::atomic<bool> m_scanCancelPending;
+    std::deque<std::string> m_scanQueue;
+    std::mutex m_scanMutex;
 
     IntCallback m_modeCallback;
     FrequencyCallback m_freqCallback;

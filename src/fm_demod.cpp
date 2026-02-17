@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 
 FMDemod::FMDemod(int inputRate, int outputRate)
     : m_inputRate(inputRate)
@@ -12,6 +13,7 @@ FMDemod::FMDemod(int inputRate, int outputRate)
     , m_invDeviation(0.0)
     , m_deemphAlpha(1.0f)
     , m_deemphasisState(0.0f)
+    , m_bandwidthMode(0)
     , m_audioHistPos(0)
     , m_decimPhase(0) {
     initAudioFilter();
@@ -45,8 +47,12 @@ void FMDemod::reset() {
 }
 
 void FMDemod::initAudioFilter() {
+    // Default wide channel filter for MPX path.
+    rebuildAudioFilter(120000.0);
+}
+
+void FMDemod::rebuildAudioFilter(double cutoffHz) {
     // Match SDR++ intent: post-demod low-pass around 15 kHz before AF resampling.
-    constexpr double cutoffHz = 15000.0;
     constexpr double transitionHz = 4000.0;
     int tapCount = static_cast<int>(std::ceil(3.8 * static_cast<double>(m_inputRate) / transitionHz));
     tapCount = std::clamp(tapCount, 63, 1023);
@@ -89,6 +95,48 @@ void FMDemod::initAudioFilter() {
     m_audioHistory.assign(m_audioTaps.size(), 0.0f);
     m_audioHistPos = 0;
     m_decimPhase = 0;
+}
+
+void FMDemod::setBandwidthMode(int mode) {
+    static constexpr int kTefBwHz[] = {
+        311000, 287000, 254000, 236000, 217000, 200000, 184000, 168000,
+        151000, 133000, 114000, 97000, 84000, 72000, 64000, 56000, 0
+    };
+    const int clipped = std::clamp(mode, 0, static_cast<int>(std::size(kTefBwHz) - 1));
+    setBandwidthHz(kTefBwHz[clipped]);
+}
+
+void FMDemod::setBandwidthHz(int bwHz) {
+    // TEF FM W table (Hz) mapped to MPX/channel low-pass cutoffs (Hz)
+    // for the no-downsample (stereo/RDS) path.
+    static constexpr int kTefBwHz[] = {
+        311000, 287000, 254000, 236000, 217000, 200000, 184000, 168000,
+        151000, 133000, 114000, 97000, 84000, 72000, 64000, 56000, 0
+    };
+
+    int selected = static_cast<int>(std::size(kTefBwHz) - 1);
+    if (bwHz > 0) {
+        int minDiff = std::numeric_limits<int>::max();
+        for (int i = 0; i < static_cast<int>(std::size(kTefBwHz)) - 1; i++) {
+            const int diff = std::abs(kTefBwHz[i] - bwHz);
+            if (diff < minDiff) {
+                minDiff = diff;
+                selected = i;
+            }
+        }
+    }
+
+    if (selected == m_bandwidthMode) {
+        return;
+    }
+    m_bandwidthMode = selected;
+    const int selectedBwHz = kTefBwHz[selected];
+    // Approximate channel selectivity from TEF bandwidth to MPX cutoff:
+    // BW/2 in baseband, clamped to preserve pilot/stereo operation.
+    const double cutoffHz = (selectedBwHz > 0)
+                                ? std::clamp(static_cast<double>(selectedBwHz) * 0.5, 30000.0, 120000.0)
+                                : 120000.0;
+    rebuildAudioFilter(cutoffHz);
 }
 
 void FMDemod::demodulate(const uint8_t* iq, float* audio, size_t len) {
@@ -148,5 +196,25 @@ void FMDemod::process(const uint8_t* iq, float* audio, size_t numSamples) {
 }
 
 void FMDemod::processNoDownsample(const uint8_t* iq, float* audio, size_t numSamples) {
-    demodulate(iq, audio, numSamples);
+    if (m_audioTaps.empty() || m_audioHistory.empty()) {
+        demodulate(iq, audio, numSamples);
+        return;
+    }
+
+    std::vector<float> demodulated(numSamples);
+    demodulate(iq, demodulated.data(), numSamples);
+
+    const size_t tapCount = m_audioTaps.size();
+    for (size_t i = 0; i < numSamples; i++) {
+        m_audioHistory[m_audioHistPos] = demodulated[i];
+        m_audioHistPos = (m_audioHistPos + 1) % tapCount;
+
+        float sample = 0.0f;
+        size_t histIndex = m_audioHistPos;
+        for (size_t t = 0; t < tapCount; t++) {
+            histIndex = (histIndex == 0) ? (tapCount - 1) : (histIndex - 1);
+            sample += m_audioTaps[t] * m_audioHistory[histIndex];
+        }
+        audio[i] = sample;
+    }
 }

@@ -7,5 +7,6 @@ build/
 *.log
 __pycache__/
 .pytest_cache/
+.cache/
 *.egg-info/
 research/

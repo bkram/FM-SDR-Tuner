@@ -23,11 +23,11 @@ class TestWAVOutput:
     
     @pytest.fixture(autouse=True)
     def setup_fmtuner(self, tmp_path):
-        binary = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build", "fmtuner-sdr")
+        binary = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build", "fm-tuner-sdr")
         rtl_tcp_path = find_rtl_tcp()
         
         if not os.path.exists(binary):
-            pytest.skip("fmtuner-sdr binary not found")
+            pytest.skip("fm-tuner-sdr binary not found")
         
         if not rtl_tcp_path:
             pytest.skip("rtl_tcp not found in PATH")
@@ -57,7 +57,7 @@ class TestWAVOutput:
         
         if self.fmtuner_proc.poll() is not None:
             stdout, stderr = self.fmtuner_proc.communicate()
-            pytest.skip(f"fmtuner-sdr failed to start: {stderr.decode()}")
+            pytest.skip(f"fm-tuner-sdr failed to start: {stderr.decode()}")
         
         self.fmtuner_proc.terminate()
         try:

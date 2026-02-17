@@ -43,9 +43,9 @@ class TestXDRProtocol:
     
     @pytest.fixture(autouse=True)
     def setup_xdr_server(self):
-        binary = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build", "fmtuner-sdr")
+        binary = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build", "fm-tuner-sdr")
         if not os.path.exists(binary):
-            pytest.skip("fmtuner-sdr binary not found")
+            pytest.skip("fm-tuner-sdr binary not found")
         
         rtl_port = find_free_port()
         
@@ -59,7 +59,7 @@ class TestXDRProtocol:
         
         if self.fmtuner_proc.poll() is not None:
             stdout, stderr = self.fmtuner_proc.communicate()
-            pytest.skip(f"fmtuner-sdr failed to start: {stderr.decode()}")
+            pytest.skip(f"fm-tuner-sdr failed to start: {stderr.decode()}")
         
         yield
         

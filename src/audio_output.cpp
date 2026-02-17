@@ -2,6 +2,100 @@
 #include <iostream>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
+#include <cctype>
+
+#ifdef __APPLE__
+namespace {
+std::string trim(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+        start++;
+    }
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+        end--;
+    }
+    return value.substr(start, end - start);
+}
+
+std::string normalizeSelector(const std::string& rawSelector) {
+    std::string selector = trim(rawSelector);
+    if (selector.size() >= 2) {
+        const char first = selector.front();
+        const char last = selector.back();
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            selector = trim(selector.substr(1, selector.size() - 2));
+        }
+    }
+    return selector;
+}
+
+std::string toLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+bool parseDeviceIndex(const std::string& selector, int& outIndex) {
+    if (selector.empty()) {
+        return false;
+    }
+    for (char c : selector) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    outIndex = std::stoi(selector);
+    return true;
+}
+
+PaDeviceIndex selectOutputDevice(const std::string& selector) {
+    if (selector.empty()) {
+        return Pa_GetDefaultOutputDevice();
+    }
+
+    int requestedIndex = -1;
+    if (parseDeviceIndex(selector, requestedIndex)) {
+        const int deviceCount = Pa_GetDeviceCount();
+        if (requestedIndex >= 0 && requestedIndex < deviceCount) {
+            const PaDeviceInfo* info = Pa_GetDeviceInfo(requestedIndex);
+            if (info && info->maxOutputChannels > 0) {
+                return static_cast<PaDeviceIndex>(requestedIndex);
+            }
+        }
+        return paNoDevice;
+    }
+
+    const std::string needle = toLower(selector);
+    const int deviceCount = Pa_GetDeviceCount();
+    for (int i = 0; i < deviceCount; i++) {
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+        if (!info || info->maxOutputChannels <= 0 || !info->name) {
+            continue;
+        }
+        if (toLower(info->name).find(needle) != std::string::npos) {
+            return static_cast<PaDeviceIndex>(i);
+        }
+    }
+
+    return paNoDevice;
+}
+
+void printOutputDeviceList() {
+    const int deviceCount = Pa_GetDeviceCount();
+    std::cerr << "Available PortAudio output devices:\n";
+    for (int i = 0; i < deviceCount; i++) {
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+        if (!info || info->maxOutputChannels <= 0 || !info->name) {
+            continue;
+        }
+        std::cerr << "  [" << i << "] " << info->name << "\n";
+    }
+}
+}  // namespace
+#endif
 
 AudioOutput::AudioOutput()
     : m_enableSpeaker(false)
@@ -21,7 +115,7 @@ AudioOutput::~AudioOutput() {
     shutdown();
 }
 
-bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile) {
+bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std::string& deviceSelector, bool verboseLogging) {
     m_enableSpeaker = enableSpeaker;
     m_wavFile = wavFile;
 
@@ -34,25 +128,56 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile) {
 
 #ifdef __APPLE__
     if (enableSpeaker) {
+        const std::string normalizedSelector = normalizeSelector(deviceSelector);
+        if (verboseLogging) {
+            std::cerr << "[Audio] device selector raw='" << deviceSelector
+                      << "' normalized='" << normalizedSelector << "'\n";
+        }
         PaError err = Pa_Initialize();
         if (err != paNoError) {
             std::cerr << "PortAudio init failed: " << Pa_GetErrorText(err) << std::endl;
+            return false;
         } else {
             PaStreamParameters outputParams;
-            outputParams.device = Pa_GetDefaultOutputDevice();
+            outputParams.device = selectOutputDevice(normalizedSelector);
+            if (outputParams.device == paNoDevice) {
+                std::cerr << "PortAudio device not found for selector: " << normalizedSelector << std::endl;
+                printOutputDeviceList();
+                Pa_Terminate();
+                return false;
+            }
             outputParams.channelCount = CHANNELS;
             outputParams.sampleFormat = paFloat32;
-            outputParams.suggestedLatency = Pa_GetDeviceInfo(outputParams.device)->defaultLowOutputLatency;
+            const PaDeviceInfo* deviceInfo = Pa_GetDeviceInfo(outputParams.device);
+            if (!deviceInfo) {
+                std::cerr << "PortAudio failed to get device info for selected output device" << std::endl;
+                Pa_Terminate();
+                return false;
+            }
+            outputParams.suggestedLatency = deviceInfo->defaultLowOutputLatency;
             outputParams.hostApiSpecificStreamInfo = nullptr;
+            if (verboseLogging) {
+                if (normalizedSelector.empty()) {
+                    std::cerr << "Using default output device [" << outputParams.device << "]: " << deviceInfo->name << std::endl;
+                } else {
+                    std::cerr << "Using selected output device [" << outputParams.device << "]: " << deviceInfo->name << std::endl;
+                }
+            }
 
             err = Pa_OpenStream(&m_paStream, nullptr, &outputParams, SAMPLE_RATE, FRAMES_PER_BUFFER, paClipOff, nullptr, nullptr);
             if (err != paNoError) {
                 std::cerr << "PortAudio open failed: " << Pa_GetErrorText(err) << std::endl;
+                Pa_Terminate();
+                return false;
             } else {
                 err = Pa_StartStream(m_paStream);
                 if (err != paNoError) {
                     std::cerr << "PortAudio start failed: " << Pa_GetErrorText(err) << std::endl;
-                } else {
+                    Pa_CloseStream(m_paStream);
+                    m_paStream = nullptr;
+                    Pa_Terminate();
+                    return false;
+                } else if (verboseLogging) {
                     std::cerr << "PortAudio started successfully" << std::endl;
                 }
             }

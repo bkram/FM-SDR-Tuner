@@ -17,10 +17,13 @@ public:
 
     void setDeemphasis(int tau_us);
     void setDeviation(double deviation);
+    void setBandwidthMode(int mode);
+    void setBandwidthHz(int bwHz);
 
 private:
     void demodulate(const uint8_t* iq, float* audio, size_t len);
     void initAudioFilter();
+    void rebuildAudioFilter(double cutoffHz);
 
     int m_inputRate;
     int m_outputRate;
@@ -32,6 +35,7 @@ private:
 
     float m_deemphAlpha;
     float m_deemphasisState;
+    int m_bandwidthMode;
 
     std::vector<float> m_audioTaps;
     std::vector<float> m_audioHistory;

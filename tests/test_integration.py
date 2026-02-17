@@ -39,9 +39,9 @@ class TestIntegration:
     
     @pytest.fixture(autouse=True)
     def setup_processes(self, tmp_path):
-        binary = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build", "fmtuner-sdr")
+        binary = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build", "fm-tuner-sdr")
         if not os.path.exists(binary):
-            pytest.skip("fmtuner-sdr binary not found")
+            pytest.skip("fm-tuner-sdr binary not found")
         
         self.binary = binary
         self.tmp_path = tmp_path
@@ -75,7 +75,7 @@ class TestIntegration:
         
         if self.fmtuner_proc.poll() is not None:
             stdout, stderr = self.fmtuner_proc.communicate()
-            pytest.skip(f"fmtuner-sdr failed to start: {stderr.decode()}")
+            pytest.skip(f"fm-tuner-sdr failed to start: {stderr.decode()}")
         
         return self.fmtuner_proc
 

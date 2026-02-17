@@ -120,6 +120,7 @@ XDRServer::XDRServer(uint16_t port)
     , m_guestMode(false)
     , m_authenticated(false)
     , m_guestSession(false)
+    , m_verboseLogging(true)
     , m_mode(0)
     , m_frequency(88500000)
     , m_volume(100)
@@ -141,6 +142,14 @@ XDRServer::XDRServer(uint16_t port)
     , m_cci(-1)
     , m_aci(-1)
     , m_pilotTenthsKHz(0) {
+    m_scanStartKHz = 87500;
+    m_scanStopKHz = 108000;
+    m_scanStepKHz = 100;
+    m_scanBandwidthHz = 0;
+    m_scanAntenna = 0;
+    m_scanContinuous = false;
+    m_scanStartPending = false;
+    m_scanCancelPending = false;
 }
 
 XDRServer::~XDRServer() {
@@ -153,6 +162,10 @@ void XDRServer::setPassword(const std::string& password) {
 
 void XDRServer::setGuestMode(bool enabled) {
     m_guestMode = enabled;
+}
+
+void XDRServer::setVerboseLogging(bool enabled) {
+    m_verboseLogging = enabled;
 }
 
 std::string XDRServer::generateSalt() {
@@ -263,6 +276,34 @@ void XDRServer::updateRDS(uint16_t blockA, uint16_t blockB, uint16_t blockC, uin
     m_rdsQueue.emplace_back(buffer);
 }
 
+bool XDRServer::consumeScanStart(ScanConfig& config) {
+    if (!m_scanStartPending.exchange(false)) {
+        return false;
+    }
+    config.startKHz = m_scanStartKHz.load();
+    config.stopKHz = m_scanStopKHz.load();
+    config.stepKHz = m_scanStepKHz.load();
+    config.bandwidthHz = m_scanBandwidthHz.load();
+    config.antenna = m_scanAntenna.load();
+    config.continuous = m_scanContinuous.load();
+    return true;
+}
+
+bool XDRServer::consumeScanCancel() {
+    return m_scanCancelPending.exchange(false);
+}
+
+void XDRServer::pushScanLine(const std::string& line) {
+    if (line.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_scanMutex);
+    if (m_scanQueue.size() >= 8) {
+        m_scanQueue.pop_front();
+    }
+    m_scanQueue.emplace_back("U" + line);
+}
+
 bool XDRServer::start() {
     if (m_running) {
         return false;
@@ -311,7 +352,9 @@ bool XDRServer::start() {
         }
     });
 
-    std::cout << "XDR server listening on port " << m_port << std::endl;
+    if (m_verboseLogging.load()) {
+        std::cout << "XDR server listening on port " << m_port << std::endl;
+    }
     return true;
 }
 
@@ -352,16 +395,25 @@ void XDRServer::handleClient(int clientSocket) {
         // Consume the initial FM-DX handshake line ("x") before command mode.
         std::string handshake;
         if (!recvLine(clientSocket, handshake, 16) || handshake != "x") {
-            std::cout << "Invalid FM-DX handshake payload" << std::endl;
+            if (m_verboseLogging.load()) {
+                std::cout << "Invalid FM-DX handshake payload" << std::endl;
+            }
+            std::cout << "Client disconnected from " << clientIP << std::endl;
             return;
         }
-        std::cout << "Detected FM-DX protocol handshake" << std::endl;
+        if (m_verboseLogging.load()) {
+            std::cout << "Detected FM-DX protocol handshake" << std::endl;
+        }
         send(clientSocket, "1\n", 2, 0);
         handleFmdxClient(clientSocket);
     } else {
-        std::cout << "Detected XDR protocol handshake" << std::endl;
+        if (m_verboseLogging.load()) {
+            std::cout << "Detected XDR protocol handshake" << std::endl;
+        }
         handleXdrClient(clientSocket, clientIP);
     }
+
+    std::cout << "Client disconnected from " << clientIP << std::endl;
 }
 
 void XDRServer::handleFmdxClient(int clientSocket) {
@@ -415,20 +467,26 @@ void XDRServer::handleFmdxClient(int clientSocket) {
 }
 
 void XDRServer::handleXdrClient(int clientSocket, const char* clientIP) {
-    std::cout << "XDR client authenticating from " << clientIP << std::endl;
+    if (m_verboseLogging.load()) {
+        std::cout << "XDR client authenticating from " << clientIP << std::endl;
+    }
     m_authenticated = false;
     m_guestSession = false;
     
     std::string salt = generateSalt();
     
-    std::cout << "Sending salt: '" << salt << "'" << std::endl;
+    if (m_verboseLogging.load()) {
+        std::cout << "Sending salt: '" << salt << "'" << std::endl;
+    }
     
     std::string msg = salt + "\n";
     send(clientSocket, msg.c_str(), msg.length(), 0);
     
     std::string authMsg;
     if (!recvLine(clientSocket, authMsg, HASH_LENGTH + 2)) {
-        std::cout << "Client disconnected before sending auth hash" << std::endl;
+        if (m_verboseLogging.load()) {
+            std::cout << "Client disconnected before sending auth hash" << std::endl;
+        }
         return;
     }
 
@@ -438,11 +496,15 @@ void XDRServer::handleXdrClient(int clientSocket, const char* clientIP) {
         clientHash = clientHash.substr(1);
     }
     
-    std::cout << "Received auth payload: '" << authMsg << "' -> hash '" << clientHash
-              << "' (length: " << clientHash.length() << ")" << std::endl;
+    if (m_verboseLogging.load()) {
+        std::cout << "Received auth payload: '" << authMsg << "' -> hash '" << clientHash
+                  << "' (length: " << clientHash.length() << ")" << std::endl;
+    }
     
     bool authSuccess = authenticate(salt, clientHash);
-    std::cout << "Authentication " << (authSuccess ? "SUCCESS" : "FAILED") << std::endl;
+    if (m_verboseLogging.load()) {
+        std::cout << "Authentication " << (authSuccess ? "SUCCESS" : "FAILED") << std::endl;
+    }
     
     if (!authSuccess && !m_guestMode) {
         send(clientSocket, "a0\n", 3, 0);
@@ -495,6 +557,21 @@ void XDRServer::handleXdrClient(int clientSocket, const char* clientIP) {
                     }
                 }
 
+                std::string scanLine;
+                {
+                    std::lock_guard<std::mutex> lock(m_scanMutex);
+                    if (!m_scanQueue.empty()) {
+                        scanLine = m_scanQueue.front();
+                        m_scanQueue.pop_front();
+                    }
+                }
+                if (!scanLine.empty()) {
+                    scanLine += "\n";
+                    if (send(clientSocket, scanLine.c_str(), scanLine.length(), 0) <= 0) {
+                        break;
+                    }
+                }
+
                 int intervalMs = m_samplingInterval.load();
                 if (intervalMs <= 0) {
                     intervalMs = 66;
@@ -540,10 +617,12 @@ void XDRServer::handleXdrClient(int clientSocket, const char* clientIP) {
 
     m_authenticated = false;
     m_guestSession = false;
+    m_scanCancelPending = true;
 }
 
 std::string XDRServer::processCommand(const std::string& cmd) {
     if (cmd.empty()) {
+        m_scanCancelPending = true;
         return "";
     }
 
@@ -575,8 +654,45 @@ std::string XDRServer::processCommand(const std::string& cmd) {
             return "a2";
 
         case 'S':
-            // TEF-style protocol uses S* for scan control and quality streaming.
-            // It does not have a legacy one-line status response.
+            // TEF-style scan control:
+            // Sa<start_kHz> Sb<stop_kHz> Sc<step_kHz> Sw<bw_hz> Sz<antenna> S / Sm
+            if (arg.empty()) {
+                m_scanContinuous = false;
+                m_scanStartPending = true;
+                return "";
+            }
+            if (arg == "m") {
+                m_scanContinuous = true;
+                m_scanStartPending = true;
+                return "";
+            }
+            if (arg.size() >= 2) {
+                const char sub = arg[0];
+                int value = 0;
+                if (parseIntValue(arg.substr(1), value)) {
+                    switch (sub) {
+                        case 'a':
+                            m_scanStartKHz = std::clamp(value, 64000, 120000);
+                            break;
+                        case 'b':
+                            m_scanStopKHz = std::clamp(value, 64000, 120000);
+                            break;
+                        case 'c':
+                            m_scanStepKHz = std::clamp(value, 5, 1000);
+                            break;
+                        case 'w':
+                            m_scanBandwidthHz = std::clamp(value, 0, 400000);
+                            break;
+                        case 'z':
+                            m_scanAntenna = std::clamp(value, 0, 9);
+                            break;
+                        case 'f':
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
             return "";
 
         case 'T': {
@@ -625,10 +741,14 @@ std::string XDRServer::processCommand(const std::string& cmd) {
             if (!parseTefCustomValue(arg, gain)) {
                 return "";
             }
-            m_gain = gain;
+            bool accepted = true;
             if (m_gainCallback) {
-                m_gainCallback(gain);
+                accepted = m_gainCallback(gain);
             }
+            if (!accepted) {
+                return formatGain(m_gain);
+            }
+            m_gain = gain;
             return formatGain(gain);
         }
 
@@ -638,10 +758,14 @@ std::string XDRServer::processCommand(const std::string& cmd) {
                 return "";
             }
             agcMode = std::clamp(agcMode, 0, 3);
-            m_agcMode = agcMode;
+            bool accepted = true;
             if (m_agcCallback) {
-                m_agcCallback(agcMode);
+                accepted = m_agcCallback(agcMode);
             }
+            if (!accepted) {
+                return "A" + std::to_string(m_agcMode.load());
+            }
+            m_agcMode = agcMode;
             return "A" + std::to_string(agcMode);
         }
 
@@ -902,10 +1026,14 @@ std::string XDRServer::processFmdxCommand(const std::string& cmd) {
                 return "ER";
             }
             agc = std::clamp(agc, 0, 2);
-            m_agcMode = agc;
+            bool accepted = true;
             if (m_agcCallback) {
-                m_agcCallback(agc);
+                accepted = m_agcCallback(agc);
             }
+            if (!accepted) {
+                return "ER";
+            }
+            m_agcMode = agc;
             return "OK";
         }
 

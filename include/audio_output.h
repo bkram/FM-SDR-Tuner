@@ -21,7 +21,7 @@ public:
     AudioOutput();
     ~AudioOutput();
 
-    bool init(bool enableSpeaker, const std::string& wavFile);
+    bool init(bool enableSpeaker, const std::string& wavFile, const std::string& deviceSelector = "", bool verboseLogging = true);
     void shutdown();
 
     bool write(const float* left, const float* right, size_t numSamples);
