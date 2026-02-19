@@ -361,18 +361,19 @@ void FMDemod::setBandwidthMode(int mode) {
 }
 
 void FMDemod::setBandwidthHz(int bwHz) {
-    // TEF FM W table (Hz) mapped to MPX/channel low-pass cutoffs (Hz)
-    // for the no-downsample (stereo/RDS) path.
-    static constexpr int kTefBwHz[] = {
-        311000, 287000, 254000, 236000, 217000, 200000, 184000, 168000,
-        151000, 133000, 114000, 97000, 84000, 72000, 64000, 56000, 0
+    // XDR-GTK FM bandwidth table (W command, Hz).
+    static constexpr int kXdrFmBwHz[] = {
+        309000, 298000, 281000, 263000, 246000, 229000, 211000, 194000,
+        177000, 159000, 142000, 125000, 108000, 95000, 90000, 83000,
+        73000, 63000, 55000, 48000, 42000, 36000, 32000, 27000,
+        24000, 20000, 17000, 15000, 9000, 0
     };
 
-    int selected = static_cast<int>(std::size(kTefBwHz) - 1);
+    int selected = static_cast<int>(std::size(kXdrFmBwHz) - 1);
     if (bwHz > 0) {
         int minDiff = std::numeric_limits<int>::max();
-        for (int i = 0; i < static_cast<int>(std::size(kTefBwHz)) - 1; i++) {
-            const int diff = std::abs(kTefBwHz[i] - bwHz);
+        for (int i = 0; i < static_cast<int>(std::size(kXdrFmBwHz)) - 1; i++) {
+            const int diff = std::abs(kXdrFmBwHz[i] - bwHz);
             if (diff < minDiff) {
                 minDiff = diff;
                 selected = i;
@@ -384,15 +385,14 @@ void FMDemod::setBandwidthHz(int bwHz) {
         return;
     }
     m_bandwidthMode = selected;
-    const int selectedBwHz = kTefBwHz[selected];
-    // Approximate channel selectivity from TEF bandwidth to MPX cutoff:
-    // Keep enough MPX bandwidth for stereo (38 kHz) and RDS (57 kHz).
+    const int selectedBwHz = kXdrFmBwHz[selected];
+    // Approximate selectivity from frontend bandwidth to MPX/IQ low-pass.
     const double cutoffHz = (selectedBwHz > 0)
-                                ? std::clamp(static_cast<double>(selectedBwHz) * 0.5, 60000.0, 120000.0)
+                                ? std::clamp(static_cast<double>(selectedBwHz) * 0.58, 10000.0, 120000.0)
                                 : 120000.0;
     rebuildAudioFilter(cutoffHz);
     const double iqCutoffHz = (selectedBwHz > 0)
-                                  ? std::clamp(static_cast<double>(selectedBwHz) * 0.45, 90000.0, 120000.0)
+                                  ? std::clamp(static_cast<double>(selectedBwHz) * 0.70, 15000.0, 120000.0)
                                   : 110000.0;
     rebuildIQFilter(iqCutoffHz);
 }

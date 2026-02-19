@@ -18,6 +18,12 @@
 #include <random>
 
 namespace {
+uint64_t steadyNowMs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
+
 void setRecvTimeoutMs(int clientSocket, int timeoutMs) {
     struct timeval tv;
     tv.tv_sec = timeoutMs / 1000;
@@ -191,6 +197,7 @@ XDRServer::XDRServer(uint16_t port)
     m_piErrorBuffer.fill(0);
     m_piLastState = 4;
     m_piLastValue = 0xFFFF;
+    m_lastRdsMs = 0;
 }
 
 XDRServer::~XDRServer() {
@@ -276,8 +283,8 @@ std::string XDRServer::buildXdrStateSnapshot() const {
 std::string XDRServer::buildSignalLine() const {
     const bool forcedMono = m_signalForcedMono.load();
     const bool stereo = m_signalStereo.load();
-    const int cci = std::max(0, m_cci.load());
-    const int aci = std::max(0, m_aci.load());
+    const int cci = m_cci.load();
+    const int aci = m_aci.load();
     const double level = m_signalDeci.load() / 10.0;
 
     char mode = 'm';
@@ -307,6 +314,8 @@ void XDRServer::updatePilot(int pilotTenthsKHz) {
 }
 
 void XDRServer::updateRDS(uint16_t blockA, uint16_t blockB, uint16_t blockC, uint16_t blockD, uint8_t errors) {
+    m_lastRdsMs = steadyNowMs();
+
     char buffer[32];
     std::snprintf(buffer, sizeof(buffer), "R%04X%04X%04X%02X", blockB, blockC, blockD, errors);
     std::string rLine(buffer);
@@ -333,30 +342,23 @@ void XDRServer::updateRDS(uint16_t blockA, uint16_t blockB, uint16_t blockC, uin
     }
 
     const uint8_t piState = evaluatePiState(m_piBuffer, m_piErrorBuffer, m_piFill, blockA);
-    
-    if (piState <= 3) {
-        uint8_t matchCount = 0;
-        for (uint8_t i = 0; i < m_piFill && i < 16; i++) {
-            uint8_t idx = (m_piPos + 64 - i) % 64;
-            if (m_piBuffer[idx] == blockA) {
-                matchCount++;
-            }
-        }
-        
-        if (matchCount >= 2) {
-            char piBuffer[16];
-            std::snprintf(piBuffer, sizeof(piBuffer), "P%04X%.*s", blockA, static_cast<int>(piState), "???");
-            if (m_rdsQueue.size() >= kMaxRdsQueue) {
-                m_rdsQueue.pop_front();
-            }
-            m_rdsQueue.emplace_back(m_rdsNextSeq++, std::string(piBuffer));
-            
-            if (m_rdsQueue.size() >= kMaxRdsQueue) {
-                m_rdsQueue.pop_front();
-            }
-            m_rdsQueue.emplace_back(m_rdsNextSeq++, rLine);
-        }
+
+    char piBuffer[16];
+    std::snprintf(piBuffer,
+                  sizeof(piBuffer),
+                  "P%04X%.*s",
+                  blockA,
+                  static_cast<int>(std::min<uint8_t>(blockAErr, 3)),
+                  "???");
+    if (m_rdsQueue.size() >= kMaxRdsQueue) {
+        m_rdsQueue.pop_front();
     }
+    m_rdsQueue.emplace_back(m_rdsNextSeq++, std::string(piBuffer));
+
+    if (m_rdsQueue.size() >= kMaxRdsQueue) {
+        m_rdsQueue.pop_front();
+    }
+    m_rdsQueue.emplace_back(m_rdsNextSeq++, rLine);
     m_piLastState = piState;
     m_piLastValue = blockA;
 }
@@ -742,6 +744,23 @@ void XDRServer::handleXdrClient(int clientSocket, const char* clientIP) {
                 auto now = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSignal).count();
                 if (elapsed >= intervalMs) {
+                    const uint64_t lastRdsMs = m_lastRdsMs.load(std::memory_order_relaxed);
+                    const uint64_t nowMs = steadyNowMs();
+                    if (lastRdsMs != 0 && nowMs - lastRdsMs <= 1500) {
+                        uint16_t piValue = 0xFFFF;
+                        {
+                            std::lock_guard<std::mutex> lock(m_rdsMutex);
+                            piValue = m_piLastValue;
+                        }
+                        if (piValue != 0xFFFF) {
+                            char piLine[16];
+                            std::snprintf(piLine, sizeof(piLine), "P%04X\n", piValue);
+                            if (send(clientSocket, piLine, std::strlen(piLine), 0) <= 0) {
+                                break;
+                            }
+                        }
+                    }
+
                     std::string signalMsg = buildSignalLine();
                     signalMsg += "\n";
                     if (send(clientSocket, signalMsg.c_str(), signalMsg.length(), 0) <= 0) {

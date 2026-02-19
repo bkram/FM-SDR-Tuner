@@ -152,6 +152,7 @@ private:
     uint8_t m_piPos = 0;
     uint8_t m_piLastState = 4;
     uint16_t m_piLastValue = 0xFFFF;
+    std::atomic<uint64_t> m_lastRdsMs;
     
     std::deque<std::pair<uint64_t, std::string>> m_rdsDataQueue;
     std::mutex m_rdsDataMutex;
