@@ -19,21 +19,25 @@ A cross-platform SDR FM tuner that bridges rtl_tcp hardware to the XDR/FM-DX pro
 - PortAudio
 
 On macOS with Homebrew:
+
 ```bash
 brew install openssl portaudio
 ```
 
 On Windows with vcpkg:
+
 ```bash
 vcpkg install portaudio openssl
 ```
 
 On Linux (Debian/Ubuntu):
+
 ```bash
-sudo apt install libssl-dev libportaudio-dev
+sudo apt install libssl-dev libssl-dev pkg-config portaudio19-dev
 ```
 
 On Linux (Fedora):
+
 ```bash
 sudo dnf install openssl-devel portaudio-devel
 ```
@@ -43,6 +47,7 @@ sudo dnf install openssl-devel portaudio-devel
 ### macOS
 
 Apple Silicon (M1/M2/M3):
+
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_OSX_ARCHITECTURE=arm64
@@ -50,6 +55,7 @@ make
 ```
 
 Intel:
+
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_OSX_ARCHITECTURE=x86_64
@@ -67,6 +73,7 @@ make
 ### Windows
 
 With vcpkg:
+
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
@@ -74,6 +81,7 @@ make
 ```
 
 Or with manual PortAudio:
+
 ```bash
 cmake .. -DPORTAUDIO_INCLUDE_DIR=C:/path/to/portaudio/include -DPORTAUDIO_LIBRARY=C:/path/to/portaudio/lib/portaudio.lib
 ```
@@ -82,6 +90,7 @@ cmake .. -DPORTAUDIO_INCLUDE_DIR=C:/path/to/portaudio/include -DPORTAUDIO_LIBRAR
 
 - AVX2/FMA is enabled automatically on x86 builds when supported by the compiler (`FM_TUNER_ENABLE_X86_AVX2=ON` by default).
 - To disable this behavior:
+
 ```bash
 cmake .. -DFM_TUNER_ENABLE_X86_AVX2=OFF
 ```
@@ -124,16 +133,19 @@ rtl_tcp -p 1234 -f 88600000 -g 20 -s 1020000
 ### Examples
 
 Record to WAV file, for testing:
+
 ```bash
 ./fm-tuner-sdr -t localhost:1234 -f 101100 -w output.wav
 ```
 
 Play on audio device:
+
 ```bash
 ./fm-tuner-sdr -t localhost:1234 -f 101100 -s
 ```
 
 With XDR password protection:
+
 ```bash
 ./fm-tuner-sdr -t localhost:1234 -f 101100 -s -P mypassword
 ```
@@ -141,6 +153,7 @@ With XDR password protection:
 ### INI Configuration
 
 Run with:
+
 ```bash
 ./fm-tuner-sdr -c fm-tuner-sdr.ini -s
 ```
@@ -209,6 +222,7 @@ To pipe audio to other applications (like FM-DX-Webserver), use a virtual audio 
 | Windows | VB-Audio Virtual Cable, Voicemeeter |
 
 On macOS with Homebrew:
+
 ```bash
 brew install blackhole-2ch
 ```
@@ -278,6 +292,7 @@ python3 tools/calibrate_gain.py \
 ```
 
 Outputs:
+
 - JSON report with all tested points and scores.
 - `recommended_sdr.ini` snippet with recommended `rtl_gain_db` for normal runs.
 
@@ -294,6 +309,7 @@ python3 tools/calibrate_gain.py \
 ```
 
 Additional external reference outputs:
+
 - `gain_reference.csv` (`freq_khz,gain_db,source`)
 - `gain_reference.ini` (`[gain_reference]` mapping)
 - `gain_reference.json` (machine-readable mapping with source)
@@ -304,11 +320,11 @@ This project is based on or modeled after the following open source projects:
 
 | Project | Description | Link |
 |---------|-------------|------|
-| SDRPlusPlus | FM demodulation (quadrature), stereo decoder (PLL-based pilot detection), RDS decoding | https://github.com/AlexandreRouma/SDRPlusPlus |
-| XDR-GTK | XDR protocol client implementation, RDS parser | https://github.com/kkonradpl/xdr-gtk |
-| librdsparser | RDS parsing library (submodule of XDR-GTK) | https://github.com/kkonradpl/librdsparser |
-| FM-DX-Tuner | TEF tuner firmware, FM-DX protocol reference | https://github.com/kkonradpl/FM-DX-Tuner |
-| xdrd | Original XDR daemon protocol implementation | https://github.com/kkonradpl/xdrd |
+| SDRPlusPlus | FM demodulation (quadrature), stereo decoder (PLL-based pilot detection), RDS decoding | <https://github.com/AlexandreRouma/SDRPlusPlus> |
+| XDR-GTK | XDR protocol client implementation, RDS parser | <https://github.com/kkonradpl/xdr-gtk> |
+| librdsparser | RDS parsing library (submodule of XDR-GTK) | <https://github.com/kkonradpl/librdsparser> |
+| FM-DX-Tuner | TEF tuner firmware, FM-DX protocol reference | <https://github.com/kkonradpl/FM-DX-Tuner> |
+| xdrd | Original XDR daemon protocol implementation | <https://github.com/kkonradpl/xdrd> |
 
 ## License
 

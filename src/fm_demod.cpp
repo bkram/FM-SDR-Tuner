@@ -155,6 +155,8 @@ FMDemod::FMDemod(int inputRate, int outputRate)
     , m_iqPrevInQ(0.0f)
     , m_iqDcStateI(0.0f)
     , m_iqDcStateQ(0.0f)
+    , m_clipping(false)
+    , m_clippingRatio(0.0f)
     , m_useNeon(false)
     , m_useSse2(false)
     , m_useAvx2(false) {
@@ -205,6 +207,8 @@ void FMDemod::reset() {
     m_iqDcStateQ = 0.0f;
     std::fill(m_iqIHistory.begin(), m_iqIHistory.end(), 0.0f);
     std::fill(m_iqQHistory.begin(), m_iqQHistory.end(), 0.0f);
+    m_clipping = false;
+    m_clippingRatio = 0.0f;
 }
 
 void FMDemod::initAudioFilter() {
@@ -409,7 +413,6 @@ void FMDemod::demodulate(const uint8_t* iq, float* audio, size_t len) {
     constexpr float kPi = 3.14159265358979323846f;
     constexpr float kTwoPi = 6.28318530717958647692f;
     constexpr float kDcBlockR = 0.9995f;
-    constexpr float kEps = 1e-12f;
     const auto& kIqNorm = iqNormLut();
     const uint8_t* iqPtr = iq;
     if (m_iqTaps.empty() || m_iqTapsRev.empty() || m_iqIHistory.empty() || m_iqQHistory.empty()) {
@@ -417,15 +420,25 @@ void FMDemod::demodulate(const uint8_t* iq, float* audio, size_t len) {
     }
     const size_t iqTapCount = m_iqTaps.size();
 
+    size_t clipCount = 0;
+
     if (m_demodMode == DemodMode::Fast) {
         float prevI = m_prevI;
         float prevQ = m_prevQ;
         bool havePrev = m_havePrevIQ;
         for (size_t i = 0; i < len; i++) {
             // rtl_tcp provides unsigned 8-bit IQ centered at 127.5.
-            const float iRaw = kIqNorm[iqPtr[0]];
-            const float qRaw = kIqNorm[iqPtr[1]];
+            const uint8_t iByte = iqPtr[0];
+            const uint8_t qByte = iqPtr[1];
             iqPtr += 2;
+
+            // Detect ADC clipping (values at rails 0 or 255 indicate saturation).
+            if (iByte == 0 || iByte == 255 || qByte == 0 || qByte == 255) {
+                clipCount++;
+            }
+
+            const float iRaw = kIqNorm[iByte];
+            const float qRaw = kIqNorm[qByte];
 
             // Remove ADC DC offset and front-end LO bias from raw IQ.
             const float iDc = (iRaw - m_iqPrevInI) + (kDcBlockR * m_iqDcStateI);
@@ -483,7 +496,8 @@ void FMDemod::demodulate(const uint8_t* iq, float* audio, size_t len) {
             // Fast quadrature FM discriminator (avoids atan2 in the hot loop).
             const float dI = i_val - prevI;
             const float dQ = q_val - prevQ;
-            const float invPower = 1.0f / ((i_val * i_val) + (q_val * q_val) + kEps);
+            const float power = (i_val * i_val) + (q_val * q_val);
+            const float invPower = 1.0f / std::max(power, 1e-6f);
             const float delta = ((i_val * dQ) - (q_val * dI)) * invPower;
             audio[i] = delta * m_invDeviation;
             prevI = i_val;
@@ -492,15 +506,24 @@ void FMDemod::demodulate(const uint8_t* iq, float* audio, size_t len) {
         m_prevI = prevI;
         m_prevQ = prevQ;
         m_havePrevIQ = havePrev;
+        m_clipping = (clipCount > 0);
+        m_clippingRatio = static_cast<float>(clipCount) / static_cast<float>(len);
         return;
     }
 
     float lastPhase = m_lastPhase;
     bool havePhase = m_haveLastPhase;
     for (size_t i = 0; i < len; i++) {
-        const float iRaw = kIqNorm[iqPtr[0]];
-        const float qRaw = kIqNorm[iqPtr[1]];
+        const uint8_t iByte = iqPtr[0];
+        const uint8_t qByte = iqPtr[1];
         iqPtr += 2;
+
+        if (iByte == 0 || iByte == 255 || qByte == 0 || qByte == 255) {
+            clipCount++;
+        }
+
+        const float iRaw = kIqNorm[iByte];
+        const float qRaw = kIqNorm[qByte];
 
         const float iDc = (iRaw - m_iqPrevInI) + (kDcBlockR * m_iqDcStateI);
         const float qDc = (qRaw - m_iqPrevInQ) + (kDcBlockR * m_iqDcStateQ);
@@ -556,7 +579,7 @@ void FMDemod::demodulate(const uint8_t* iq, float* audio, size_t len) {
         float delta = phase - lastPhase;
         if (delta > kPi) {
             delta -= kTwoPi;
-        } else if (delta <= -kPi) {
+        } else if (delta < -kPi) {
             delta += kTwoPi;
         }
         audio[i] = delta * m_invDeviation;
@@ -564,6 +587,9 @@ void FMDemod::demodulate(const uint8_t* iq, float* audio, size_t len) {
     }
     m_lastPhase = lastPhase;
     m_haveLastPhase = havePhase;
+
+    m_clipping = (clipCount > 0);
+    m_clippingRatio = static_cast<float>(clipCount) / static_cast<float>(len);
 }
 
 size_t FMDemod::downsampleAudio(const float* demod, float* audio, size_t numSamples) {

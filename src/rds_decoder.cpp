@@ -353,7 +353,14 @@ void RDSDecoder::processBit(uint8_t bit, const std::function<void(const RDSGroup
     }
 
     if (!known) {
-        type = static_cast<BlockType>((static_cast<int>(m_lastType) + 1) % BLOCK_TYPE_COUNT);
+        static constexpr BlockType kNextType[BLOCK_TYPE_COUNT] = {
+            BLOCK_TYPE_B,   // after A -> B
+            BLOCK_TYPE_C,   // after B -> C (or C')
+            BLOCK_TYPE_D,   // after C -> D
+            BLOCK_TYPE_D,   // after C' -> D
+            BLOCK_TYPE_A    // after D -> A
+        };
+        type = kNextType[static_cast<int>(m_lastType)];
     }
 
     uint8_t errorLevel = 3;

@@ -6,7 +6,31 @@
 #include <cctype>
 #include <chrono>
 
-#ifdef __APPLE__
+#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+namespace {
+bool parseHwDeviceGlobal(const std::string& selector, int& card, int& device) {
+    if (selector.size() < 5 || selector.substr(0, 3) != "hw:") {
+        return false;
+    }
+    size_t comma = selector.find(',', 3);
+    if (comma == std::string::npos) {
+        return false;
+    }
+    std::string cardStr = selector.substr(3, comma - 3);
+    std::string devStr = selector.substr(comma + 1);
+    if (cardStr.empty() || devStr.empty()) {
+        return false;
+    }
+    for (char c : cardStr) { if (c < '0' || c > '9') return false; }
+    for (char c : devStr) { if (c < '0' || c > '9') return false; }
+    card = std::stoi(cardStr);
+    device = std::stoi(devStr);
+    return true;
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
 namespace {
 std::string trim(const std::string& value) {
     size_t start = 0;
@@ -52,6 +76,26 @@ bool parseDeviceIndex(const std::string& selector, int& outIndex) {
     return true;
 }
 
+bool parseHwDevice(const std::string& selector, int& card, int& device) {
+    if (selector.size() < 5 || selector.substr(0, 3) != "hw:") {
+        return false;
+    }
+    size_t comma = selector.find(',', 3);
+    if (comma == std::string::npos) {
+        return false;
+    }
+    std::string cardStr = selector.substr(3, comma - 3);
+    std::string devStr = selector.substr(comma + 1);
+    if (cardStr.empty() || devStr.empty()) {
+        return false;
+    }
+    for (char c : cardStr) { if (c < '0' || c > '9') return false; }
+    for (char c : devStr) { if (c < '0' || c > '9') return false; }
+    card = std::stoi(cardStr);
+    device = std::stoi(devStr);
+    return true;
+}
+
 PaDeviceIndex selectOutputDevice(const std::string& selector) {
     if (selector.empty()) {
         return Pa_GetDefaultOutputDevice();
@@ -64,6 +108,23 @@ PaDeviceIndex selectOutputDevice(const std::string& selector) {
             const PaDeviceInfo* info = Pa_GetDeviceInfo(requestedIndex);
             if (info && info->maxOutputChannels > 0) {
                 return static_cast<PaDeviceIndex>(requestedIndex);
+            }
+        }
+        return paNoDevice;
+    }
+
+    int hwCard = -1, hwDev = -1;
+    if (parseHwDevice(selector, hwCard, hwDev)) {
+        char hwPattern[32];
+        std::snprintf(hwPattern, sizeof(hwPattern), "(hw:%d,%d)", hwCard, hwDev);
+        const int deviceCount = Pa_GetDeviceCount();
+        for (int i = 0; i < deviceCount; i++) {
+            const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+            if (!info || info->maxOutputChannels <= 0 || !info->name) {
+                continue;
+            }
+            if (std::strstr(info->name, hwPattern) != nullptr) {
+                return static_cast<PaDeviceIndex>(i);
             }
         }
         return paNoDevice;
@@ -86,19 +147,272 @@ PaDeviceIndex selectOutputDevice(const std::string& selector) {
 
 void printOutputDeviceList() {
     const int deviceCount = Pa_GetDeviceCount();
-    std::cerr << "Available PortAudio output devices:\n";
+    std::cout << "Available audio output devices:\n";
     for (int i = 0; i < deviceCount; i++) {
         const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
         if (!info || info->maxOutputChannels <= 0 || !info->name) {
             continue;
         }
-        std::cerr << "  [" << i << "] " << info->name << "\n";
+        const char* name = info->name;
+        if (std::strstr(name, "lavrate") != nullptr ||
+            std::strstr(name, "samplerate") != nullptr ||
+            std::strstr(name, "speexrate") != nullptr ||
+            std::strstr(name, "upmix") != nullptr ||
+            std::strstr(name, "vdownmix") != nullptr ||
+            std::strstr(name, "dmix") != nullptr ||
+            std::strstr(name, "oss") != nullptr ||
+            std::strstr(name, "pipewire") != nullptr ||
+            std::strstr(name, "pulse") != nullptr) {
+            continue;
+        }
+        std::cout << "  [" << i << "] " << name;
+        const PaHostApiInfo* api = Pa_GetHostApiInfo(info->hostApi);
+        if (api) {
+            std::cout << " (API: " << api->name << ")";
+        }
+        std::cout << "\n";
     }
 }
 }  // namespace
+
 #endif
 
-#ifdef __APPLE__
+bool AudioOutput::listDevices() {
+#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+    listAlsaDevices();
+#endif
+    PaError err = Pa_Initialize();
+    if (err != paNoError) {
+        std::cerr << "PortAudio init failed: " << Pa_GetErrorText(err) << std::endl;
+        return false;
+    }
+    printOutputDeviceList();
+    Pa_Terminate();
+    return true;
+}
+
+#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+bool AudioOutput::listAlsaDevices() {
+    std::cout << "ALSA hardware devices:\n";
+    int card = -1;
+    while (snd_card_next(&card) >= 0 && card >= 0) {
+        char name[32];
+        std::snprintf(name, sizeof(name), "hw:%d", card);
+        snd_ctl_t* handle = nullptr;
+        if (snd_ctl_open(&handle, name, 0) >= 0) {
+            snd_ctl_card_info_t* info = nullptr;
+            snd_ctl_card_info_alloca(&info);
+            if (snd_ctl_card_info(handle, info) >= 0) {
+                const char* cardName = snd_ctl_card_info_get_name(info);
+                int device = -1;
+                while (snd_ctl_pcm_next_device(handle, &device) >= 0 && device >= 0) {
+                    snd_pcm_info_t* pcminfo = nullptr;
+                    snd_pcm_info_alloca(&pcminfo);
+                    snd_pcm_info_set_device(pcminfo, device);
+                    snd_pcm_info_set_subdevice(pcminfo, 0);
+                    snd_pcm_info_set_stream(pcminfo, SND_PCM_STREAM_PLAYBACK);
+                    if (snd_ctl_pcm_info(handle, pcminfo) >= 0) {
+                        const char* devName = snd_pcm_info_get_name(pcminfo);
+                        std::cout << "  [hw:" << card << "," << device << "] " << cardName << ": " << devName << "\n";
+                    }
+                }
+            }
+            snd_ctl_close(handle);
+        }
+    }
+    return true;
+}
+
+bool AudioOutput::initAlsa(const std::string& deviceName) {
+    std::string alsaDevice = deviceName;
+    int hwCard = -1, hwDev = -1;
+    if (parseHwDeviceGlobal(deviceName, hwCard, hwDev)) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "plughw:%d,%d", hwCard, hwDev);
+        alsaDevice = buf;
+    } else if (deviceName.empty() || deviceName == "default") {
+        alsaDevice = "default";
+    } else if (deviceName.substr(0, 3) == "hw:") {
+        alsaDevice = "plug" + deviceName;
+    }
+
+    if (m_verboseLogging) {
+        std::cerr << "[Audio] opening ALSA device: " << alsaDevice << "\n";
+    }
+
+    int err = snd_pcm_open(&m_alsaPcm, alsaDevice.c_str(), SND_PCM_STREAM_PLAYBACK, 0);
+    if (err < 0) {
+        std::cerr << "[Audio] ALSA snd_pcm_open failed: " << snd_strerror(err) << "\n";
+        return false;
+    }
+
+    snd_pcm_hw_params_t* hwparams = nullptr;
+    snd_pcm_hw_params_alloca(&hwparams);
+    snd_pcm_hw_params_any(m_alsaPcm, hwparams);
+
+    snd_pcm_hw_params_set_access(m_alsaPcm, hwparams, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(m_alsaPcm, hwparams, SND_PCM_FORMAT_S16_LE);
+    snd_pcm_hw_params_set_channels(m_alsaPcm, hwparams, CHANNELS);
+
+    unsigned int rate = SAMPLE_RATE;
+    int dir = 0;
+    err = snd_pcm_hw_params_set_rate_near(m_alsaPcm, hwparams, &rate, &dir);
+    if (err < 0) {
+        std::cerr << "[Audio] ALSA set_rate failed: " << snd_strerror(err) << "\n";
+        snd_pcm_close(m_alsaPcm);
+        m_alsaPcm = nullptr;
+        return false;
+    }
+    
+    if (rate != SAMPLE_RATE && m_verboseLogging) {
+        std::cerr << "[Audio] ALSA rate " << SAMPLE_RATE << " not supported, using " << rate << " (will resample)\n";
+    }
+
+    snd_pcm_uframes_t bufferSize = 16384;
+    snd_pcm_hw_params_set_buffer_size_near(m_alsaPcm, hwparams, &bufferSize);
+
+    snd_pcm_uframes_t periodSize = 2048;
+    snd_pcm_hw_params_set_period_size_near(m_alsaPcm, hwparams, &periodSize, &dir);
+
+    err = snd_pcm_hw_params(m_alsaPcm, hwparams);
+    if (err < 0) {
+        std::cerr << "[Audio] ALSA snd_pcm_hw_params failed: " << snd_strerror(err) << "\n";
+        snd_pcm_close(m_alsaPcm);
+        m_alsaPcm = nullptr;
+        return false;
+    }
+
+    snd_pcm_sw_params_t* swparams = nullptr;
+    snd_pcm_sw_params_alloca(&swparams);
+    snd_pcm_sw_params_current(m_alsaPcm, swparams);
+    snd_pcm_sw_params_set_start_threshold(m_alsaPcm, swparams, bufferSize - periodSize);
+    snd_pcm_sw_params_set_avail_min(m_alsaPcm, swparams, periodSize);
+    snd_pcm_sw_params(m_alsaPcm, swparams);
+
+    snd_pcm_get_params(m_alsaPcm, &bufferSize, &periodSize);
+
+    if (m_verboseLogging) {
+        std::cerr << "[Audio] ALSA initialized: rate=" << rate 
+                  << " buffer=" << bufferSize << " (" << (bufferSize * 1000 / rate) << "ms)"
+                  << " period=" << periodSize << "\n";
+    }
+
+    m_alsaBuffer.reserve(static_cast<size_t>(rate) * 2);
+    m_alsaReadIndex = 0;
+    m_alsaThreadRunning = true;
+    m_alsaOutputThread = std::thread(&AudioOutput::runAlsaOutputThread, this);
+    return true;
+}
+
+void AudioOutput::runAlsaOutputThread() {
+    snd_pcm_uframes_t bufferSize = 0;
+    snd_pcm_uframes_t periodSize = 0;
+    snd_pcm_get_params(m_alsaPcm, &bufferSize, &periodSize);
+    
+    const size_t kWriteFrames = static_cast<size_t>(periodSize);
+    std::vector<int16_t> interleaved(kWriteFrames * CHANNELS, 0);
+
+    for (size_t i = 0; i < 4; i++) {
+        snd_pcm_writei(m_alsaPcm, interleaved.data(), kWriteFrames);
+    }
+
+    float lastL = 0.0f;
+    float lastR = 0.0f;
+
+    while (m_alsaThreadRunning.load()) {
+        size_t samplePairs = 0;
+        {
+            std::unique_lock<std::mutex> lock(m_alsaMutex);
+            m_alsaCv.wait_for(lock, std::chrono::milliseconds(50), [&]() {
+                const size_t available = (m_alsaBuffer.size() > m_alsaReadIndex)
+                    ? (m_alsaBuffer.size() - m_alsaReadIndex)
+                    : 0;
+                return !m_alsaThreadRunning.load() || available >= kWriteFrames * 2;
+            });
+
+            if (!m_alsaThreadRunning.load()) {
+                break;
+            }
+
+            const size_t available = (m_alsaBuffer.size() > m_alsaReadIndex)
+                ? (m_alsaBuffer.size() - m_alsaReadIndex)
+                : 0;
+            samplePairs = std::min(available / 2, kWriteFrames);
+            
+            if (samplePairs > 0) {
+                for (size_t i = 0; i < samplePairs; i++) {
+                    float l = m_alsaBuffer[m_alsaReadIndex + i * 2];
+                    float r = m_alsaBuffer[m_alsaReadIndex + i * 2 + 1];
+                    l = std::clamp(l, -1.0f, 1.0f);
+                    r = std::clamp(r, -1.0f, 1.0f);
+                    interleaved[i * 2] = static_cast<int16_t>(l * 32767.0f);
+                    interleaved[i * 2 + 1] = static_cast<int16_t>(r * 32767.0f);
+                    lastL = l;
+                    lastR = r;
+                }
+                m_alsaReadIndex += samplePairs * 2;
+            }
+
+            if (samplePairs < kWriteFrames) {
+                const size_t missing = kWriteFrames - samplePairs;
+                for (size_t i = 0; i < missing; i++) {
+                    interleaved[(samplePairs + i) * 2] = 0;
+                    interleaved[(samplePairs + i) * 2 + 1] = 0;
+                }
+            }
+
+            const size_t cleanupThreshold = std::max<size_t>(32768, kWriteFrames * 8);
+            if (m_alsaReadIndex > 0 && (m_alsaReadIndex >= cleanupThreshold || (m_alsaReadIndex * 2) >= m_alsaBuffer.size())) {
+                if (m_alsaReadIndex < m_alsaBuffer.size()) {
+                    m_alsaBuffer.erase(m_alsaBuffer.begin(), m_alsaBuffer.begin() + static_cast<std::ptrdiff_t>(m_alsaReadIndex));
+                } else {
+                    m_alsaBuffer.clear();
+                }
+                m_alsaReadIndex = 0;
+            }
+        }
+
+        snd_pcm_sframes_t frames = snd_pcm_writei(m_alsaPcm, interleaved.data(), kWriteFrames);
+        if (frames < 0) {
+            if (frames == -EPIPE) {
+                snd_pcm_prepare(m_alsaPcm);
+                for (int i = 0; i < 2; i++) {
+                    snd_pcm_writei(m_alsaPcm, interleaved.data(), kWriteFrames);
+                }
+                if (m_verboseLogging) {
+                    static std::atomic<uint32_t> underflowCount{0};
+                    const uint32_t count = ++underflowCount;
+                    if (count <= 5 || (count % 50) == 0) {
+                        std::cerr << "[Audio] ALSA underrun (" << count << ")\n";
+                    }
+                }
+            } else if (frames == -EAGAIN) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } else {
+                if (m_verboseLogging) {
+                    std::cerr << "[Audio] ALSA write error: " << snd_strerror(frames) << "\n";
+                }
+                snd_pcm_recover(m_alsaPcm, static_cast<int>(frames), 1);
+            }
+        }
+    }
+}
+
+void AudioOutput::shutdownAlsa() {
+    m_alsaThreadRunning = false;
+    m_alsaCv.notify_all();
+    if (m_alsaOutputThread.joinable()) {
+        m_alsaOutputThread.join();
+    }
+    if (m_alsaPcm) {
+        snd_pcm_drop(m_alsaPcm);
+        snd_pcm_close(m_alsaPcm);
+        m_alsaPcm = nullptr;
+    }
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
 void AudioOutput::runOutputThread() {
     constexpr size_t kBlockSamples = static_cast<size_t>(FRAMES_PER_BUFFER) * CHANNELS;
     std::vector<float> block(kBlockSamples, 0.0f);
@@ -190,11 +504,16 @@ AudioOutput::AudioOutput()
     , m_requestedVolumePercent(100)
     , m_underflowFadeMs(5)
     , m_currentVolumeScale(0.85f)
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
     , m_paStream(nullptr)
     , m_portAudioInitialized(false)
     , m_outputThreadRunning(false)
     , m_outputReadIndex(0)
+#endif
+#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+    , m_alsaPcm(nullptr)
+    , m_alsaThreadRunning(false)
+    , m_alsaReadIndex(0)
 #endif
 {
     m_circularBuffer.resize(65536 * 2);
@@ -216,13 +535,31 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
         }
     }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
     if (enableSpeaker) {
         const std::string normalizedSelector = normalizeSelector(deviceSelector);
         if (verboseLogging) {
             std::cerr << "[Audio] device selector raw='" << deviceSelector
                       << "' normalized='" << normalizedSelector << "'\n";
         }
+
+#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+        bool usePortAudio = (normalizedSelector.size() > 3 && normalizedSelector.substr(0, 3) == "pa:");
+        std::string alsaSelector = normalizedSelector;
+        if (usePortAudio) {
+            alsaSelector = normalizedSelector.substr(3);
+        }
+        
+        if (!usePortAudio) {
+            std::string tryDevice = alsaSelector.empty() ? "default" : alsaSelector;
+            if (initAlsa(tryDevice)) {
+                m_running = true;
+                return true;
+            }
+            std::cerr << "[Audio] ALSA init failed, trying PortAudio...\n";
+        }
+#endif
+
         PaError err = Pa_Initialize();
         if (err != paNoError) {
             std::cerr << "PortAudio init failed: " << Pa_GetErrorText(err) << std::endl;
@@ -307,7 +644,11 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
 void AudioOutput::shutdown() {
     m_running = false;
 
-#ifdef __APPLE__
+#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+    shutdownAlsa();
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
     m_outputThreadRunning = false;
     m_outputCv.notify_all();
     if (m_outputThread.joinable()) {
@@ -439,7 +780,37 @@ bool AudioOutput::write(const float* left, const float* right, size_t numSamples
         writeWAVData(writeLeft, writeRight, numSamples);
     }
 
-#ifdef __APPLE__
+#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+    if (m_enableSpeaker && m_alsaPcm) {
+        std::lock_guard<std::mutex> lock(m_alsaMutex);
+        constexpr size_t kMaxQueuedSamples = static_cast<size_t>(SAMPLE_RATE) * CHANNELS * 2;
+        const size_t queuedSamples = (m_alsaBuffer.size() > m_alsaReadIndex)
+            ? (m_alsaBuffer.size() - m_alsaReadIndex)
+            : 0;
+        const size_t incomingSamples = numSamples * CHANNELS;
+        if (queuedSamples + incomingSamples > kMaxQueuedSamples) {
+            const size_t drop = (queuedSamples + incomingSamples) - kMaxQueuedSamples;
+            m_alsaReadIndex += std::min(drop, queuedSamples);
+            if (m_verboseLogging) {
+                static std::atomic<uint32_t> dropCount{0};
+                const uint32_t count = ++dropCount;
+                if (count <= 5 || (count % 50) == 0) {
+                    std::cerr << "[Audio] ALSA queue overflow (" << count << ")\n";
+                }
+            }
+        }
+
+        const size_t base = m_alsaBuffer.size();
+        m_alsaBuffer.resize(base + incomingSamples);
+        for (size_t i = 0; i < numSamples; i++) {
+            m_alsaBuffer[base + i * 2] = writeLeft[i];
+            m_alsaBuffer[base + i * 2 + 1] = writeRight[i];
+        }
+        m_alsaCv.notify_one();
+    }
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
     if (m_enableSpeaker && m_paStream) {
         std::lock_guard<std::mutex> lock(m_outputMutex);
         constexpr size_t kMaxQueuedSamples = static_cast<size_t>(SAMPLE_RATE) * CHANNELS * 2;

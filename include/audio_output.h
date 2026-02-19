@@ -10,8 +10,13 @@
 #include <mutex>
 #include <condition_variable>
 
-#ifdef __APPLE__
+#if defined(__APPLE__)
 #include <portaudio.h>
+#elif defined(__linux__)
+#include <portaudio.h>
+#if defined(FM_TUNER_HAS_ALSA)
+#include <alsa/asoundlib.h>
+#endif
 #endif
 
 class AudioOutput {
@@ -28,6 +33,7 @@ public:
     void shutdown();
     void setVolumePercent(int volumePercent);
     void setUnderflowFadeMs(int fadeMs);
+    static bool listDevices();
 
     bool write(const float* left, const float* right, size_t numSamples);
     bool isRunning() const { return m_running; }
@@ -38,8 +44,12 @@ private:
     bool writeWAVData(const float* left, const float* right, size_t numSamples);
     void closeWAV();
     void runOutputThread();
+    void runAlsaOutputThread();
+    static bool listAlsaDevices();
+    bool initAlsa(const std::string& deviceName);
+    void shutdownAlsa();
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
     static int paCallback(const void* inputBuffer, void* outputBuffer,
                           unsigned long framesPerBuffer,
                           const PaStreamInfo* timeInfo,
@@ -61,7 +71,7 @@ private:
     std::atomic<int> m_underflowFadeMs;
     float m_currentVolumeScale;
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
     PaStream* m_paStream;
     bool m_portAudioInitialized;
     std::thread m_outputThread;
@@ -70,6 +80,16 @@ private:
     std::condition_variable m_outputCv;
     std::vector<float> m_outputQueue;
     size_t m_outputReadIndex;
+#endif
+
+#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+    snd_pcm_t* m_alsaPcm;
+    std::thread m_alsaOutputThread;
+    std::atomic<bool> m_alsaThreadRunning;
+    std::mutex m_alsaMutex;
+    std::condition_variable m_alsaCv;
+    std::vector<float> m_alsaBuffer;
+    size_t m_alsaReadIndex;
 #endif
 };
 

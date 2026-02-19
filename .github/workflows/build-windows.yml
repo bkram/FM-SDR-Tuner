@@ -1,0 +1,32 @@
+name: Build (Windows)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        choco install cmake pkgconfig
+
+    - name: Build
+      shell: pwsh
+      run: |
+        mkdir build
+        cd build
+        cmake ..
+        make
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fmtuner-sdr-windows
+        path: build/fmtuner-sdr.exe

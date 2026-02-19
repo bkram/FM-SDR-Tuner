@@ -1,0 +1,33 @@
+name: Build (macOS)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        brew install cmake pkg-config libtool
+        brew install --build-from-source osmo-sdr || brew install rtlsdr
+        brew install libusb
+
+    - name: Build
+      run: |
+        mkdir -p build
+        cd build
+        cmake ..
+        make -j$(sysctl -n hw.ncpu)
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fmtuner-sdr-macos
+        path: build/fmtuner-sdr

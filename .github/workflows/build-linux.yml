@@ -1,0 +1,32 @@
+name: Build (Linux)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake pkg-config librtlsdr-dev libusb-1.0-0-dev libpulse-dev libasound2-dev
+
+    - name: Build
+      run: |
+        mkdir -p build
+        cd build
+        cmake ..
+        make -j$(nproc)
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fmtuner-sdr-linux
+        path: build/fmtuner-sdr

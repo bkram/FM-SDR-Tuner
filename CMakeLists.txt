@@ -13,6 +13,26 @@ find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig QUIET)
 
+set(ALSA_FOUND FALSE)
+if(PkgConfig_FOUND)
+    pkg_check_modules(PC_ALSA IMPORTED_TARGET alsa)
+    if(PC_ALSA_FOUND)
+        set(ALSA_FOUND TRUE)
+        set(ALSA_INCLUDE_DIRS ${PC_ALSA_INCLUDE_DIRS})
+        set(ALSA_LIBRARIES ${PC_ALSA_LINK_LIBRARIES})
+        message(STATUS "ALSA found: ${ALSA_LIBRARIES}")
+    endif()
+endif()
+
+if(NOT ALSA_FOUND)
+    find_path(ALSA_INCLUDE_DIRS NAMES alsa/asoundlib.h HINTS /usr/include /usr/local/include)
+    find_library(ALSA_LIBRARIES NAMES asound HINTS /usr/lib /usr/local/lib)
+    if(ALSA_INCLUDE_DIRS AND ALSA_LIBRARIES)
+        set(ALSA_FOUND TRUE)
+        message(STATUS "ALSA found (fallback): ${ALSA_LIBRARIES}")
+    endif()
+endif()
+
 set(PORTAUDIO_INCLUDE_DIR "")
 set(PORTAUDIO_LIBRARY "")
 
@@ -116,6 +136,11 @@ target_link_libraries(fm-tuner-sdr PRIVATE
     OpenSSL::Crypto
     OpenSSL::SSL
 )
+if(ALSA_FOUND)
+    target_include_directories(fm-tuner-sdr PRIVATE ${ALSA_INCLUDE_DIRS})
+    target_link_libraries(fm-tuner-sdr PRIVATE ${ALSA_LIBRARIES})
+    target_compile_definitions(fm-tuner-sdr PRIVATE FM_TUNER_HAS_ALSA=1)
+endif()
 if(TARGET PkgConfig::PC_PORTAUDIO)
     target_link_libraries(fm-tuner-sdr PRIVATE PkgConfig::PC_PORTAUDIO)
 elseif(PORTAUDIO_LIBRARY)

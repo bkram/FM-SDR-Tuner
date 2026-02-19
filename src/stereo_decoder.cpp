@@ -142,7 +142,7 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
     m_useAvx2 = cpu.avx2 && cpu.fma;
 
     // Match SDR++ broadcast_fm delay around pilot filter latency.
-    m_delaySamples = static_cast<int>((m_pilotTaps.size() > 0) ? ((m_pilotTaps.size() - 1) / 2 + 1) : 0);
+    m_delaySamples = static_cast<int>((m_pilotTaps.size() > 0) ? ((m_pilotTaps.size() - 1) / 2) : 0);
     m_delayLine.assign(static_cast<size_t>(std::max(1, m_delaySamples + 1)), 0.0f);
 }
 

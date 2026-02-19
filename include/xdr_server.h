@@ -146,10 +146,15 @@ private:
     std::deque<std::pair<uint64_t, std::string>> m_rdsQueue;
     uint64_t m_rdsNextSeq = 1;
     std::mutex m_rdsMutex;
-    std::array<uint16_t, 64> m_piHistory{};
-    std::array<uint8_t, 64> m_piErrorHistory{};
-    uint8_t m_piHistFill = 0;
-    uint8_t m_piHistPos = 0;
+    std::array<uint16_t, 64> m_piBuffer{};
+    std::array<uint8_t, 8> m_piErrorBuffer{};
+    uint8_t m_piFill = 0;
+    uint8_t m_piPos = 0;
+    uint8_t m_piLastState = 4;
+    uint16_t m_piLastValue = 0xFFFF;
+    
+    std::deque<std::pair<uint64_t, std::string>> m_rdsDataQueue;
+    std::mutex m_rdsDataMutex;
     std::atomic<int> m_scanStartKHz;
     std::atomic<int> m_scanStopKHz;
     std::atomic<int> m_scanStepKHz;

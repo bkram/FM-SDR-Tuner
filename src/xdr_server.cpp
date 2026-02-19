@@ -112,26 +112,27 @@ std::string formatSampling(int interval, int detector) {
     return oss.str();
 }
 
-uint8_t evaluatePiState(const std::array<uint16_t, 64>& piHistory,
-                        const std::array<uint8_t, 64>& piErrorHistory,
+uint8_t evaluatePiState(const std::array<uint16_t, 64>& piBuffer,
+                        const std::array<uint8_t, 8>& piErrorBuffer,
                         uint8_t fill,
                         uint16_t value) {
     uint8_t count = 0;
     uint8_t correctCount = 0;
+
     for (uint8_t i = 0; i < fill; i++) {
-        if (piHistory[i] == value) {
+        if (piBuffer[i] == value) {
             count++;
-            if (piErrorHistory[i] == 0) {
+            if ((piErrorBuffer[i / 8] & (1 << (i % 8))) == 0) {
                 correctCount++;
             }
         }
     }
 
-    if (correctCount >= 2) return 0;               // correct
-    if (count >= 2 && correctCount > 0) return 1;  // very likely
-    if (count >= 3) return 2;                      // likely
-    if (count == 2 || correctCount > 0) return 3;  // unlikely
-    return 4;                                      // invalid
+    if (correctCount >= 2) return 0;       // STATE_CORRECT
+    if (count >= 2 && correctCount) return 1;  // STATE_VERY_LIKELY
+    if (count >= 3) return 2;              // STATE_LIKELY
+    if (count == 2 || correctCount) return 3;  // STATE_UNLIKELY
+    return 4;                              // STATE_INVALID
 }
 }  // namespace
 
@@ -184,10 +185,12 @@ XDRServer::XDRServer(uint16_t port)
     m_scanContinuous = false;
     m_scanStartPending = false;
     m_scanCancelPending = false;
-    m_piHistFill = 0;
-    m_piHistPos = static_cast<uint8_t>(m_piHistory.size() - 1);
-    m_piHistory.fill(0);
-    m_piErrorHistory.fill(1);
+    m_piFill = 0;
+    m_piPos = 63;
+    m_piBuffer.fill(0);
+    m_piErrorBuffer.fill(0);
+    m_piLastState = 4;
+    m_piLastValue = 0xFFFF;
 }
 
 XDRServer::~XDRServer() {
@@ -273,8 +276,8 @@ std::string XDRServer::buildXdrStateSnapshot() const {
 std::string XDRServer::buildSignalLine() const {
     const bool forcedMono = m_signalForcedMono.load();
     const bool stereo = m_signalStereo.load();
-    const int cci = m_cci.load();
-    const int aci = m_aci.load();
+    const int cci = std::max(0, m_cci.load());
+    const int aci = std::max(0, m_aci.load());
     const double level = m_signalDeci.load() / 10.0;
 
     char mode = 'm';
@@ -305,38 +308,71 @@ void XDRServer::updatePilot(int pilotTenthsKHz) {
 
 void XDRServer::updateRDS(uint16_t blockA, uint16_t blockB, uint16_t blockC, uint16_t blockD, uint8_t errors) {
     char buffer[32];
-    std::snprintf(buffer, sizeof(buffer), "R%04X%04X%04X%04X%02X", blockA, blockB, blockC, blockD, errors);
-    const std::string line(buffer);
-
+    std::snprintf(buffer, sizeof(buffer), "R%04X%04X%04X%02X", blockB, blockC, blockD, errors);
+    std::string rLine(buffer);
+    
     std::lock_guard<std::mutex> lock(m_rdsMutex);
-    const uint8_t blockAErr = static_cast<uint8_t>((errors >> 6) & 0x03u);
-    m_piHistPos = static_cast<uint8_t>((m_piHistPos + 1) % m_piHistory.size());
-    m_piHistory[m_piHistPos] = blockA;
-    m_piErrorHistory[m_piHistPos] = (blockAErr == 0 ? 0 : 1);
-    if (m_piHistFill < m_piHistory.size()) {
-        m_piHistFill++;
-    }
-
-    const uint8_t piState = evaluatePiState(m_piHistory, m_piErrorHistory, m_piHistFill, blockA);
+    
     constexpr size_t kMaxRdsQueue = 256;
-    if (piState <= 3) {
-        char piBuffer[16];
-        std::snprintf(piBuffer, sizeof(piBuffer), "P%04X%.*s", blockA, static_cast<int>(piState), "???");
-        if (m_rdsQueue.size() >= kMaxRdsQueue) {
-            m_rdsQueue.pop_front();
-        }
-        m_rdsQueue.emplace_back(m_rdsNextSeq++, std::string(piBuffer));
+
+    const uint8_t blockAErr = static_cast<uint8_t>((errors >> 6) & 0x03u);
+    
+    m_piPos = (m_piPos + 1) % 64;
+    m_piBuffer[m_piPos] = blockA;
+    
+    const uint8_t errPos = m_piPos / 8;
+    const uint8_t errBit = m_piPos % 8;
+    if (blockAErr != 0) {
+        m_piErrorBuffer[errPos] |= (1 << errBit);
+    } else {
+        m_piErrorBuffer[errPos] &= ~(1 << errBit);
+    }
+    
+    if (m_piFill < 64) {
+        m_piFill++;
     }
 
-    if (m_rdsQueue.size() >= kMaxRdsQueue) {
-        m_rdsQueue.pop_front();
+    const uint8_t piState = evaluatePiState(m_piBuffer, m_piErrorBuffer, m_piFill, blockA);
+    
+    if (piState <= 3) {
+        uint8_t matchCount = 0;
+        for (uint8_t i = 0; i < m_piFill && i < 16; i++) {
+            uint8_t idx = (m_piPos + 64 - i) % 64;
+            if (m_piBuffer[idx] == blockA) {
+                matchCount++;
+            }
+        }
+        
+        if (matchCount >= 2) {
+            char piBuffer[16];
+            std::snprintf(piBuffer, sizeof(piBuffer), "P%04X%.*s", blockA, static_cast<int>(piState), "???");
+            if (m_rdsQueue.size() >= kMaxRdsQueue) {
+                m_rdsQueue.pop_front();
+            }
+            m_rdsQueue.emplace_back(m_rdsNextSeq++, std::string(piBuffer));
+            
+            if (m_rdsQueue.size() >= kMaxRdsQueue) {
+                m_rdsQueue.pop_front();
+            }
+            m_rdsQueue.emplace_back(m_rdsNextSeq++, rLine);
+        }
     }
-    m_rdsQueue.emplace_back(m_rdsNextSeq++, line);
+    m_piLastState = piState;
+    m_piLastValue = blockA;
 }
 
 void XDRServer::setFrequencyState(uint32_t freqHz) {
     if (freqHz == 0) {
         return;
+    }
+    if (freqHz != m_frequency) {
+        std::lock_guard<std::mutex> lock(m_rdsMutex);
+        m_piFill = 0;
+        m_piPos = 63;
+        m_piBuffer.fill(0);
+        m_piErrorBuffer.fill(0);
+        m_piLastState = 4;
+        m_piLastValue = 0xFFFF;
     }
     m_frequency = freqHz;
 }

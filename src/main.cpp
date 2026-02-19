@@ -167,6 +167,8 @@ void printUsage(const char* prog) {
               << "  -w, --wav <file>      Output WAV file\n"
               << "  -i, --iq <file>       Capture raw IQ bytes to file\n"
               << "  -s, --audio           Enable audio output\n"
+              << "  -l, --list-audio      List available audio output devices\n"
+              << "  -d, --device <id>     Audio output device (index or name)\n"
               << "  -P, --password <pwd>   XDR server password\n"
               << "  -G, --guest            Enable guest mode (no password required)\n"
               << "  -h, --help             Show this help\n";
@@ -239,6 +241,7 @@ int main(int argc, char* argv[]) {
     std::string wavFile;
     std::string iqFile;
     bool enableSpeaker = false;
+    std::string audioDevice;
     std::string xdrPassword = config.xdr.password;
     bool xdrGuestMode = config.xdr.guest_mode;
     uint16_t xdrPort = config.xdr.port;
@@ -252,6 +255,8 @@ int main(int argc, char* argv[]) {
         {"wav", required_argument, 0, 'w'},
         {"iq", required_argument, 0, 'i'},
         {"audio", no_argument, 0, 's'},
+        {"list-audio", no_argument, 0, 'l'},
+        {"device", required_argument, 0, 'd'},
         {"password", required_argument, 0, 'P'},
         {"guest", no_argument, 0, 'G'},
         {"help", no_argument, 0, 'h'},
@@ -259,7 +264,7 @@ int main(int argc, char* argv[]) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "c:t:f:g:w:i:sP:Gh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:t:f:g:w:i:sld:P:Gh", longOptions, nullptr)) != -1) {
         switch (opt) {
             case 'c':
                 configPath = optarg;
@@ -316,6 +321,14 @@ int main(int argc, char* argv[]) {
                 break;
             case 's':
                 enableSpeaker = true;
+                break;
+            case 'l':
+                if (!AudioOutput::listDevices()) {
+                    return 1;
+                }
+                return 0;
+            case 'd':
+                audioDevice = optarg;
                 break;
             case 'P':
                 xdrPassword = optarg;
@@ -559,7 +572,8 @@ int main(int argc, char* argv[]) {
     if (verboseLogging) {
         std::cerr << "Initializing audio output..." << std::endl;
     }
-    if (!audioOut.init(enableSpeaker, wavFile, config.audio.device, verboseLogging)) {
+    const std::string& audioDeviceToUse = !audioDevice.empty() ? audioDevice : config.audio.device;
+    if (!audioOut.init(enableSpeaker, wavFile, audioDeviceToUse, verboseLogging)) {
         std::cerr << "Failed to initialize audio output\n";
         rtlClient.disconnect();
         return 1;
@@ -942,7 +956,7 @@ int main(int argc, char* argv[]) {
                     if (samples > 0) {
                         writeIqCapture(iqBuffer, samples);
                         const double powerSum = computeNormalizedIqPowerSum(iqBuffer, samples);
-                        powerAccum += powerSum / static_cast<double>(samples * 2);
+                        powerAccum += powerSum / static_cast<double>(samples);
                         validReads++;
                     }
                 }
@@ -1021,7 +1035,7 @@ int main(int argc, char* argv[]) {
 
         // RF-domain strength estimate from raw IQ power before demodulation.
         const double powerSum = computeNormalizedIqPowerSum(iqBuffer, samples);
-        const double avgPower = (samples > 0) ? (powerSum / static_cast<double>(samples * 2)) : 0.0;
+        const double avgPower = (samples > 0) ? (powerSum / static_cast<double>(samples)) : 0.0;
         const double dbfs = 10.0 * std::log10(avgPower + 1e-12);
         size_t hardClippedCount = 0;
         size_t nearClippedCount = 0;

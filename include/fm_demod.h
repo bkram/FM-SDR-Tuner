@@ -27,6 +27,8 @@ public:
     void setBandwidthHz(int bwHz);
     void setDemodMode(DemodMode mode);
     DemodMode getDemodMode() const { return m_demodMode; }
+    bool isClipping() const { return m_clipping; }
+    float getClippingRatio() const { return m_clippingRatio; }
 
 private:
     void demodulate(const uint8_t* iq, float* audio, size_t len);
@@ -73,6 +75,9 @@ private:
     float m_iqPrevInQ;
     float m_iqDcStateI;
     float m_iqDcStateQ;
+
+    bool m_clipping;
+    float m_clippingRatio;
 
     bool m_useNeon;
     bool m_useSse2;
