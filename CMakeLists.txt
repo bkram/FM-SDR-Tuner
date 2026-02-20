@@ -26,7 +26,7 @@ if(FM_TUNER_ENABLE_PORTAUDIO)
     )
 
     find_library(PORTAUDIO_LIBRARY
-        NAMES portaudio portaudio_static
+        NAMES portaudio portaudio_static portaudio_x64 portaudio_x86
         HINTS /opt/homebrew/lib /usr/local/lib
     )
 

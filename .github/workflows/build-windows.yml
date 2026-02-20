@@ -29,7 +29,9 @@ jobs:
       shell: pwsh
       run: |
         $toolchain = "$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
-        cmake -S . -B build -DFM_TUNER_ENABLE_PORTAUDIO=ON -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DVCPKG_TARGET_TRIPLET=x64-windows
+        $paInclude = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\include"
+        $paLibrary = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib\portaudio_x64.lib"
+        cmake -S . -B build -DFM_TUNER_ENABLE_PORTAUDIO=ON -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DVCPKG_TARGET_TRIPLET=x64-windows -DPORTAUDIO_INCLUDE_DIR="$paInclude" -DPORTAUDIO_LIBRARY="$paLibrary"
         cmake --build build --config Release
 
     - name: Bundle runtime dependencies
