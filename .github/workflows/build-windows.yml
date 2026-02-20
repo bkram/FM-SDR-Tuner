@@ -20,13 +20,11 @@ jobs:
     - name: Build
       shell: pwsh
       run: |
-        mkdir build
-        cd build
-        cmake ..
-        make
+        cmake -S . -B build -DFM_TUNER_ENABLE_PORTAUDIO=ON
+        cmake --build build --config Release
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: fmtuner-sdr-windows
-        path: build/fmtuner-sdr.exe
+        path: build/Release/fm-tuner-sdr.exe

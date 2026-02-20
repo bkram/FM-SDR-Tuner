@@ -24,13 +24,11 @@ jobs:
     - name: Build
       run: |
         export OPENSSL_ROOT_DIR=$(brew --prefix openssl)
-        mkdir -p build
-        cd build
-        cmake .. -DFM_TUNER_ENABLE_PORTAUDIO=ON
-        make -j$(sysctl -n hw.ncpu)
+        cmake -S . -B build -DFM_TUNER_ENABLE_PORTAUDIO=ON
+        cmake --build build -j$(sysctl -n hw.ncpu)
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: fmtuner-sdr-macos
-        path: build/fmtuner-sdr
+        path: build/fm-tuner-sdr

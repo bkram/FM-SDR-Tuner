@@ -20,13 +20,11 @@ jobs:
 
     - name: Build
       run: |
-        mkdir -p build
-        cd build
-        cmake ..
-        make -j$(nproc)
+        cmake -S . -B build
+        cmake --build build -j$(nproc)
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: fmtuner-sdr-linux
-        path: build/fmtuner-sdr
+        path: build/fm-tuner-sdr
