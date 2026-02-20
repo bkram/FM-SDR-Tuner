@@ -10,7 +10,7 @@
 #include <mutex>
 #include <condition_variable>
 
-#if defined(__APPLE__)
+#if defined(FM_TUNER_HAS_PORTAUDIO)
 #include <portaudio.h>
 #elif defined(__linux__)
 #if defined(FM_TUNER_HAS_ALSA)
@@ -47,7 +47,7 @@ private:
     bool initAlsa(const std::string& deviceName);
     void shutdownAlsa();
 
-#if defined(__APPLE__)
+#if defined(FM_TUNER_HAS_PORTAUDIO)
     static int paCallback(const void* inputBuffer, void* outputBuffer,
                           unsigned long framesPerBuffer,
                           const PaStreamInfo* timeInfo,
@@ -68,7 +68,7 @@ private:
     std::atomic<int> m_requestedVolumePercent;
     float m_currentVolumeScale;
 
-#if defined(__APPLE__)
+#if defined(FM_TUNER_HAS_PORTAUDIO)
     PaStream* m_paStream;
     bool m_portAudioInitialized;
     std::thread m_outputThread;

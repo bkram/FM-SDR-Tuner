@@ -30,7 +30,7 @@ bool parseHwDeviceGlobal(const std::string& selector, int& card, int& device) {
 }
 #endif
 
-#if defined(__APPLE__)
+#if defined(FM_TUNER_HAS_PORTAUDIO)
 namespace {
 std::string trim(const std::string& value) {
     size_t start = 0;
@@ -180,7 +180,7 @@ void printOutputDeviceList() {
 bool AudioOutput::listDevices() {
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
     listAlsaDevices();
-#elif defined(__APPLE__)
+#elif defined(FM_TUNER_HAS_PORTAUDIO)
     PaError err = Pa_Initialize();
     if (err != paNoError) {
         std::cerr << "PortAudio init failed: " << Pa_GetErrorText(err) << std::endl;
@@ -413,7 +413,7 @@ void AudioOutput::shutdownAlsa() {
 }
 #endif
 
-#if defined(__APPLE__)
+#if defined(FM_TUNER_HAS_PORTAUDIO)
 void AudioOutput::runOutputThread() {
     constexpr size_t kBlockSamples = static_cast<size_t>(FRAMES_PER_BUFFER) * CHANNELS;
     std::vector<float> block(kBlockSamples, 0.0f);
@@ -504,7 +504,7 @@ AudioOutput::AudioOutput()
     , m_verboseLogging(true)
     , m_requestedVolumePercent(100)
     , m_currentVolumeScale(0.85f)
-#if defined(__APPLE__)
+#if defined(FM_TUNER_HAS_PORTAUDIO)
     , m_paStream(nullptr)
     , m_portAudioInitialized(false)
     , m_outputThreadRunning(false)
@@ -535,7 +535,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
         }
     }
 
-#if defined(__APPLE__)
+#if defined(FM_TUNER_HAS_PORTAUDIO)
     if (enableSpeaker) {
         const std::string normalizedSelector = normalizeSelector(deviceSelector);
         if (verboseLogging) {
@@ -642,7 +642,7 @@ void AudioOutput::shutdown() {
     shutdownAlsa();
 #endif
 
-#if defined(__APPLE__)
+#if defined(FM_TUNER_HAS_PORTAUDIO)
     m_outputThreadRunning = false;
     m_outputCv.notify_all();
     if (m_outputThread.joinable()) {
@@ -800,7 +800,7 @@ bool AudioOutput::write(const float* left, const float* right, size_t numSamples
     }
 #endif
 
-#if defined(__APPLE__)
+#if defined(FM_TUNER_HAS_PORTAUDIO)
     if (m_enableSpeaker && m_paStream) {
         std::lock_guard<std::mutex> lock(m_outputMutex);
         constexpr size_t kMaxQueuedSamples = static_cast<size_t>(SAMPLE_RATE) * CHANNELS * 2;

@@ -14,8 +14,10 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Install dependencies
+      shell: pwsh
       run: |
-        choco install cmake pkgconfig openssl portaudio
+        choco install openssl -y --no-progress --limit-output
+        choco install portaudio -y --no-progress --limit-output
 
     - name: Build
       shell: pwsh
@@ -23,8 +25,62 @@ jobs:
         cmake -S . -B build -DFM_TUNER_ENABLE_PORTAUDIO=ON
         cmake --build build --config Release
 
+    - name: Bundle runtime dependencies
+      shell: pwsh
+      run: |
+        $dist = "dist/windows"
+        New-Item -ItemType Directory -Force -Path $dist | Out-Null
+        Copy-Item "build/Release/fm-tuner-sdr.exe" $dist -Force
+
+        $opensslBinCandidates = @(
+          "C:\Program Files\OpenSSL-Win64\bin",
+          "C:\Program Files\OpenSSL\bin"
+        )
+
+        $opensslBin = $null
+        foreach ($candidate in $opensslBinCandidates) {
+          if (Test-Path (Join-Path $candidate "libssl-3-x64.dll")) {
+            $opensslBin = $candidate
+            break
+          }
+        }
+
+        if (-not $opensslBin) {
+          throw "Could not locate OpenSSL runtime DLLs (libssl-3-x64.dll/libcrypto-3-x64.dll)."
+        }
+
+        Copy-Item (Join-Path $opensslBin "libssl-3-x64.dll") $dist -Force
+        Copy-Item (Join-Path $opensslBin "libcrypto-3-x64.dll") $dist -Force
+
+        $portaudioCandidates = @(
+          "C:\ProgramData\chocolatey\lib\portaudio\tools\portaudio.dll",
+          "C:\ProgramData\chocolatey\bin\portaudio.dll",
+          "C:\Program Files\PortAudio\portaudio.dll"
+        )
+
+        $portaudioDll = $null
+        foreach ($candidate in $portaudioCandidates) {
+          if (Test-Path $candidate) {
+            $portaudioDll = $candidate
+            break
+          }
+        }
+
+        if (-not $portaudioDll) {
+          $dynamicCandidate = Get-ChildItem -Path "C:\ProgramData\chocolatey\lib" -Recurse -File -Filter "portaudio.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($dynamicCandidate) {
+            $portaudioDll = $dynamicCandidate.FullName
+          }
+        }
+
+        if (-not $portaudioDll) {
+          throw "Could not locate portaudio.dll runtime for bundled Windows artifact."
+        }
+
+        Copy-Item $portaudioDll $dist -Force
+
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: fmtuner-sdr-windows
-        path: build/Release/fm-tuner-sdr.exe
+        path: dist/windows
