@@ -16,6 +16,7 @@ find_package(Threads REQUIRED)
 
 if(FM_TUNER_ENABLE_PORTAUDIO)
     find_package(PkgConfig QUIET)
+    find_package(portaudio CONFIG QUIET)
 
     set(PORTAUDIO_INCLUDE_DIR "")
     set(PORTAUDIO_LIBRARY "")
@@ -68,7 +69,10 @@ if(FM_TUNER_ENABLE_PORTAUDIO)
         endif()
     endif()
 
-    if((NOT PORTAUDIO_INCLUDE_DIR OR NOT PORTAUDIO_LIBRARY) AND NOT TARGET PkgConfig::PC_PORTAUDIO)
+    if((NOT PORTAUDIO_INCLUDE_DIR OR NOT PORTAUDIO_LIBRARY)
+       AND NOT TARGET PkgConfig::PC_PORTAUDIO
+       AND NOT TARGET portaudio
+       AND NOT TARGET PortAudio::PortAudio)
         message(FATAL_ERROR "PortAudio not found. Install PortAudio or set PORTAUDIO_INCLUDE_DIR and PORTAUDIO_LIBRARY.")
     endif()
 endif()
@@ -145,7 +149,11 @@ target_link_libraries(fm-tuner-sdr PRIVATE
     OpenSSL::SSL
 )
 if(FM_TUNER_ENABLE_PORTAUDIO)
-    if(TARGET PkgConfig::PC_PORTAUDIO)
+    if(TARGET portaudio)
+        target_link_libraries(fm-tuner-sdr PRIVATE portaudio)
+    elseif(TARGET PortAudio::PortAudio)
+        target_link_libraries(fm-tuner-sdr PRIVATE PortAudio::PortAudio)
+    elseif(TARGET PkgConfig::PC_PORTAUDIO)
         target_link_libraries(fm-tuner-sdr PRIVATE PkgConfig::PC_PORTAUDIO)
     elseif(PORTAUDIO_LIBRARY)
         target_link_libraries(fm-tuner-sdr PRIVATE ${PORTAUDIO_LIBRARY})
