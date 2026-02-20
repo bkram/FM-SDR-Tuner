@@ -77,10 +77,10 @@ rtl_tcp -p 1234 -f 88600000 -g 20 -s 512000
 
 ```bash
 # Play audio
-./fm-tuner-sdr -t localhost:1234 -f 101100 -s
+./fm-sdr-tuner -t localhost:1234 -f 101100 -s
 
 # Record to WAV
-./fm-tuner-sdr -t localhost:1234 -f 101100 -w output.wav
+./fm-sdr-tuner -t localhost:1234 -f 101100 -w output.wav
 ```
 
 ## Project Structure

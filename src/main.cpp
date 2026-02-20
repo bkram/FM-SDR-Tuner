@@ -177,7 +177,7 @@ int main(int argc, char* argv[]) {
     constexpr int INPUT_RATE = 256000;
     constexpr int OUTPUT_RATE = 32000;
 
-    std::cout << "FM-Tuner-SDR version " << FM_TUNER_SDR_VERSION << "\n"
+    std::cout << "FM-SDR-Tuner version " << FM_SDR_TUNER_VERSION << "\n"
               << "Copyright 2026 by Bkram Developments\n";
 
     const CPUFeatures cpu = detectCPUFeatures();

@@ -1,4 +1,4 @@
-# FM Tuner SDR
+# FM-SDR-Tuner
 
 A cross-platform SDR FM tuner that bridges rtl_tcp hardware to the XDR/FM-DX protocol ecosystem. Control any RTL-SDR (or other rtl_tcp source) remotely using FM-DX-Webserver, XDR-GTK, or similar clients as if it were a native hardware tuner.
 
@@ -109,7 +109,7 @@ Install rtl-sdr (provides rtl_tcp):
 rtl_tcp -p 1234 -f 88600000 -g 20 -s 512000
 
 # Terminal 2: Run FM tuner
-./fm-tuner-sdr -t localhost:1234 -f 88600 -s
+./fm-sdr-tuner -t localhost:1234 -f 88600 -s
 ```
 
 ### Command Line Options
@@ -133,19 +133,19 @@ rtl_tcp -p 1234 -f 88600000 -g 20 -s 512000
 Record to WAV file, for testing:
 
 ```bash
-./fm-tuner-sdr -t localhost:1234 -f 101100 -w output.wav
+./fm-sdr-tuner -t localhost:1234 -f 101100 -w output.wav
 ```
 
 Play on audio device:
 
 ```bash
-./fm-tuner-sdr -t localhost:1234 -f 101100 -s
+./fm-sdr-tuner -t localhost:1234 -f 101100 -s
 ```
 
 With XDR password protection:
 
 ```bash
-./fm-tuner-sdr -t localhost:1234 -f 101100 -s -P mypassword
+./fm-sdr-tuner -t localhost:1234 -f 101100 -s -P mypassword
 ```
 
 ### INI Configuration
@@ -153,7 +153,7 @@ With XDR password protection:
 Run with:
 
 ```bash
-./fm-tuner-sdr -c fm-tuner-sdr.ini -s
+./fm-sdr-tuner -c fm-sdr-tuner.ini -s
 ```
 
 Key sections:
@@ -200,7 +200,7 @@ Run with `-g -1` for auto (A2=30dB), or `-g 36` for specific gain.
 
 An audio loopback (virtual audio cable) creates a virtual audio device that
 captures output from one application and makes it available as input to
-another. This lets you pipe FM-Tuner-SDR audio to other apps like
+another. This lets you pipe FM-SDR-Tuner audio to other apps like
 FM-DX-Webserver.
 
 | OS      | Tool                        |
