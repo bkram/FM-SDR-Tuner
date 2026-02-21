@@ -15,7 +15,9 @@
 #elif defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
 #include <AudioUnit/AudioUnit.h>
 #elif defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <mmsystem.h>
 #elif defined(__linux__)
