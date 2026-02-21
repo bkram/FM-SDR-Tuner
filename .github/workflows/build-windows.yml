@@ -53,24 +53,34 @@ jobs:
         cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
         cmake --build build -j$(nproc)
 
+    - name: Smoke test CLI (MinGW-w64)
+      shell: msys2 {0}
+      run: |
+        ./build/fm-sdr-tuner.exe --help
+
     - name: Bundle runtime dependencies (MinGW-w64)
       shell: msys2 {0}
       run: |
         mkdir -p dist/windows-mingw
         cp build/fm-sdr-tuner.exe dist/windows-mingw/
 
-        for dll in \
-          libgcc_s_seh-1.dll \
-          libstdc++-6.dll \
-          libwinpthread-1.dll \
-          libssl-3-x64.dll \
-          libcrypto-3-x64.dll \
-          librtlsdr.dll \
-          libliquid.dll; do
-          if [ -f "/mingw64/bin/$dll" ]; then
-            cp "/mingw64/bin/$dll" dist/windows-mingw/
+        mapfile -t deps < <(
+          ldd build/fm-sdr-tuner.exe \
+            | awk '/=> \\/mingw64\\/bin\\/.*\\.dll/ {print $3}' \
+            | sort -u
+        )
+
+        for dep in "${deps[@]}"; do
+          if [ -f "$dep" ]; then
+            cp "$dep" dist/windows-mingw/
           fi
         done
+
+    - name: Smoke test packaged artifact (MinGW-w64)
+      shell: msys2 {0}
+      run: |
+        cd dist/windows-mingw
+        ./fm-sdr-tuner.exe --help
 
     - name: Upload artifact (MinGW-w64)
       uses: actions/upload-artifact@v4
