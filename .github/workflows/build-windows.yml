@@ -7,71 +7,6 @@ on:
     branches: [main, master]
 
 jobs:
-  build-msvc:
-    runs-on: windows-latest
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install dependencies (vcpkg)
-      shell: pwsh
-      run: |
-        if (-not $env:VCPKG_INSTALLATION_ROOT) {
-          if (Test-Path "C:\vcpkg") {
-            $env:VCPKG_INSTALLATION_ROOT = "C:\vcpkg"
-          } else {
-            throw "VCPKG_INSTALLATION_ROOT is not set and C:\vcpkg was not found."
-          }
-        }
-        $vcpkg = "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe"
-        & $vcpkg install openssl:x64-windows
-        if ($LASTEXITCODE -ne 0) {
-          throw "Failed to install openssl via vcpkg"
-        }
-
-        # liquid-dsp is marked unsupported on Windows in vcpkg;
-        # we still attempt install because the project requires it for current RDS path.
-        & $vcpkg install liquid-dsp:x64-windows --allow-unsupported
-        if ($LASTEXITCODE -ne 0) {
-          throw "Failed to install liquid-dsp via vcpkg (with --allow-unsupported)"
-        }
-
-        & $vcpkg install rtlsdr:x64-windows
-        if ($LASTEXITCODE -ne 0) {
-          & $vcpkg install librtlsdr:x64-windows
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to install rtl-sdr package via vcpkg (tried rtlsdr and librtlsdr)"
-          }
-        }
-
-    - name: Build
-      shell: pwsh
-      run: |
-        $toolchain = "$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
-        cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DVCPKG_TARGET_TRIPLET=x64-windows
-        cmake --build build --config Release
-
-    - name: Bundle runtime dependencies
-      shell: pwsh
-      run: |
-        $dist = "dist/windows"
-        New-Item -ItemType Directory -Force -Path $dist | Out-Null
-        Copy-Item "build/Release/fm-sdr-tuner.exe" $dist -Force
-
-        $vcpkgBin = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin"
-        if (-not (Test-Path $vcpkgBin)) {
-          throw "vcpkg runtime bin directory not found: $vcpkgBin"
-        }
-
-        Copy-Item (Join-Path $vcpkgBin "libssl-3-x64.dll") $dist -Force
-        Copy-Item (Join-Path $vcpkgBin "libcrypto-3-x64.dll") $dist -Force
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: fm-sdr-tuner-windows-msvc
-        path: dist/windows
-
   build-mingw:
     runs-on: windows-latest
 
@@ -86,6 +21,10 @@ jobs:
         install: >-
           git
           make
+          mingw-w64-x86_64-binutils
+          mingw-w64-x86_64-headers
+          mingw-w64-x86_64-crt
+          mingw-w64-x86_64-winpthreads
           mingw-w64-x86_64-gcc
           mingw-w64-x86_64-cmake
           mingw-w64-x86_64-ninja
@@ -115,7 +54,6 @@ jobs:
         mkdir -p dist/windows-mingw
         cp build/fm-sdr-tuner.exe dist/windows-mingw/
 
-        # Common runtime DLLs for MinGW builds
         for dll in \
           libgcc_s_seh-1.dll \
           libstdc++-6.dll \
