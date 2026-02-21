@@ -222,8 +222,8 @@ int main(int argc, char* argv[]) {
     }
     std::string tcpHost = config.rtl_tcp.host;
     uint16_t tcpPort = config.rtl_tcp.port;
-    std::string tunerSource = "rtl_sdr";
-    uint32_t rtlDeviceIndex = 0;
+    std::string tunerSource = config.tuner.source;
+    uint32_t rtlDeviceIndex = config.tuner.rtl_device;
     uint32_t freqKHz = config.tuner.default_freq;
     int gain = config.sdr.rtl_gain_db;
     const bool useSdrppGainStrategy = (config.sdr.gain_strategy == "sdrpp");
@@ -231,7 +231,7 @@ int main(int argc, char* argv[]) {
     bool allowClientGainOverride = config.processing.client_gain_allowed;
     std::string wavFile;
     std::string iqFile;
-    bool enableSpeaker = false;
+    bool enableSpeaker = config.audio.enable_audio;
     std::string audioDevice;
     std::string xdrPassword = config.xdr.password;
     bool xdrGuestMode = config.xdr.guest_mode;
@@ -296,9 +296,15 @@ int main(int argc, char* argv[]) {
             tunerSource = "rtl_sdr";
             return true;
         }
-        std::cerr << "Invalid --source value: " << value << " (expected rtl_tcp or rtl_sdr)\n";
+        std::cerr << "Invalid source value: " << value << " (expected rtl_tcp or rtl_sdr)\n";
         return false;
     };
+
+    if (!parseSourceOption(tunerSource)) {
+        std::cerr << "Invalid tuner.source in config: " << config.tuner.source
+                  << " (expected rtl_tcp or rtl_sdr), using rtl_sdr\n";
+        tunerSource = "rtl_sdr";
+    }
 
     auto parseDeviceIndexOption = [&](const std::string& value) -> bool {
         try {
@@ -1200,7 +1206,9 @@ int main(int argc, char* argv[]) {
                 audioRight[i] = mono;
             }
         } else {
-            demod.processNoDownsample(iqBuffer, demodBuffer, samples);
+            // Feed RDS with full-rate discriminator MPX (includes 57 kHz RDS subcarrier).
+            // redsea expects composite MPX, not post-audio-filtered baseband.
+            demod.processSplit(iqBuffer, demodBuffer, nullptr, samples);
             queueRdsBlock(demodBuffer, samples);
             const size_t stereoSamples = stereo.processAudio(demodBuffer, stereoLeft, stereoRight, samples);
             outSamples = afPost.process(stereoLeft, stereoRight, stereoSamples, audioLeft, audioRight, BUF_SAMPLES);

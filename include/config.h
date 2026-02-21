@@ -12,6 +12,7 @@ struct Config {
 
     struct AudioSection {
         std::string device;
+        bool enable_audio = false;
     } audio;
 
     struct SDRSection {
@@ -25,6 +26,8 @@ struct Config {
     } sdr;
 
     struct TunerSection {
+        std::string source = "rtl_sdr"; // rtl_sdr|rtl_tcp
+        uint32_t rtl_device = 0;
         uint32_t default_freq = 88600;
         int deemphasis = 0;
     } tuner;

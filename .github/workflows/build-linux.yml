@@ -24,7 +24,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev
+        sudo apt-get install -y cmake pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev
 
     - name: Build
       run: |

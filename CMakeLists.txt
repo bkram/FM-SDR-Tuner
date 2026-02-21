@@ -13,7 +13,10 @@ if(WIN32)
     set(FM_TUNER_DEFAULT_PORTAUDIO OFF)
 endif()
 option(FM_TUNER_ENABLE_PORTAUDIO "Enable PortAudio for audio output (macOS/Windows)" ${FM_TUNER_DEFAULT_PORTAUDIO})
-option(FM_TUNER_ENABLE_ALSA "Enable ALSA for audio output (Linux)" OFF)
+set(FM_TUNER_ENABLE_ALSA OFF)
+if(UNIX AND NOT APPLE)
+    set(FM_TUNER_ENABLE_ALSA ON)
+endif()
 
 if(APPLE)
     set(FM_TUNER_ENABLE_PORTAUDIO OFF CACHE BOOL "PortAudio is disabled on macOS (native Core Audio backend is used)" FORCE)
@@ -118,6 +121,7 @@ endif()
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
     pkg_check_modules(PC_RTLSDR QUIET IMPORTED_TARGET librtlsdr)
+    pkg_check_modules(PC_LIQUID QUIET IMPORTED_TARGET liquid)
 endif()
 if(PC_RTLSDR_FOUND)
     set(RTLSDR_INCLUDE_DIRS ${PC_RTLSDR_INCLUDE_DIRS})
@@ -130,6 +134,17 @@ if(NOT RTLSDR_INCLUDE_DIRS OR NOT RTLSDR_LIBRARIES)
     message(FATAL_ERROR "librtlsdr not found. Install librtlsdr.")
 endif()
 
+if(PC_LIQUID_FOUND)
+    set(LIQUID_INCLUDE_DIRS ${PC_LIQUID_INCLUDE_DIRS})
+    set(LIQUID_LIBRARIES ${PC_LIQUID_LIBRARIES})
+else()
+    find_path(LIQUID_INCLUDE_DIRS NAMES liquid/liquid.h)
+    find_library(LIQUID_LIBRARIES NAMES liquid)
+endif()
+if(NOT LIQUID_INCLUDE_DIRS OR NOT LIQUID_LIBRARIES)
+    message(FATAL_ERROR "liquid-dsp not found. Install liquid-dsp (libliquid).")
+endif()
+
 set(SOURCES
     src/rtl_tcp_client.cpp
     src/rtl_sdr_device.cpp
@@ -138,6 +153,11 @@ set(SOURCES
     src/af_post_processor.cpp
     src/cpu_features.cpp
     src/rds_decoder.cpp
+    src/redsea_port/block_sync.cpp
+    src/redsea_port/group.cpp
+    src/redsea_port/dsp/liquid_wrappers.cpp
+    src/redsea_port/dsp/subcarrier.cpp
+    src/redsea_port/util/util.cpp
     src/xdr_server.cpp
     src/audio_output.cpp
     src/config.cpp
@@ -216,6 +236,12 @@ if(PC_RTLSDR_FOUND AND TARGET PkgConfig::PC_RTLSDR)
 else()
     target_include_directories(fm-sdr-tuner PRIVATE ${RTLSDR_INCLUDE_DIRS})
     target_link_libraries(fm-sdr-tuner PRIVATE ${RTLSDR_LIBRARIES})
+endif()
+if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
+    target_link_libraries(fm-sdr-tuner PRIVATE PkgConfig::PC_LIQUID)
+else()
+    target_include_directories(fm-sdr-tuner PRIVATE ${LIQUID_INCLUDE_DIRS})
+    target_link_libraries(fm-sdr-tuner PRIVATE ${LIQUID_LIBRARIES})
 endif()
 if(WIN32)
     target_link_libraries(fm-sdr-tuner PRIVATE ws2_32 ${WINMM_LIB})
