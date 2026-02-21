@@ -38,6 +38,11 @@ jobs:
         git clone --depth 1 https://github.com/jgaeddert/liquid-dsp.git /tmp/liquid-dsp
         cmake -S /tmp/liquid-dsp -B /tmp/liquid-dsp/build -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_AUTOTESTS=OFF \
+          -DBUILD_BENCHMARKS=OFF \
+          -DBUILD_SANDBOX=OFF \
           -DCMAKE_INSTALL_PREFIX=/mingw64
         cmake --build /tmp/liquid-dsp/build -j$(nproc)
         cmake --install /tmp/liquid-dsp/build
