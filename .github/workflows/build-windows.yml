@@ -23,13 +23,13 @@ jobs:
             throw "VCPKG_INSTALLATION_ROOT is not set and C:\vcpkg was not found."
           }
         }
-        & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install portaudio:x64-windows openssl:x64-windows
+        & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl:x64-windows
 
     - name: Build
       shell: pwsh
       run: |
         $toolchain = "$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
-        cmake -S . -B build -DFM_TUNER_ENABLE_PORTAUDIO=ON -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DVCPKG_TARGET_TRIPLET=x64-windows
+        cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DVCPKG_TARGET_TRIPLET=x64-windows
         cmake --build build --config Release
 
     - name: Bundle runtime dependencies
@@ -46,20 +46,6 @@ jobs:
 
         Copy-Item (Join-Path $vcpkgBin "libssl-3-x64.dll") $dist -Force
         Copy-Item (Join-Path $vcpkgBin "libcrypto-3-x64.dll") $dist -Force
-
-        $portaudioDllCandidates = @("portaudio.dll", "portaudio_x64.dll")
-        $portaudioFound = $false
-        foreach ($dll in $portaudioDllCandidates) {
-          $src = Join-Path $vcpkgBin $dll
-          if (Test-Path $src) {
-            Copy-Item $src $dist -Force
-            $portaudioFound = $true
-            break
-          }
-        }
-        if (-not $portaudioFound) {
-          throw "Could not locate PortAudio runtime DLL in $vcpkgBin"
-        }
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4

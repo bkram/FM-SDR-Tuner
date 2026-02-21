@@ -12,8 +12,6 @@ struct Config {
 
     struct AudioSection {
         std::string device;
-        int output_rate = 32000;
-        int buffer_size = 1024;
     } audio;
 
     struct SDRSection {

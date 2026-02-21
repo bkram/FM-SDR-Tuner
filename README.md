@@ -10,7 +10,7 @@ A cross-platform SDR FM tuner that bridges rtl_tcp hardware to the XDR/FM-DX pro
 - FM Stereo Demodulation - PLL-based 19kHz pilot detection using SDR++ algorithms
 - RDS Decoding - Decodes RDS groups in a background thread
 - XDR Protocol Server - Compatible with XDR-GTK and FM-DX-Webserver clients on port 7373
-- Audio Output - Audio output via ALSA (Linux) or PortAudio (macOS), or WAV file recording
+- Audio Output - Native audio output via ALSA (Linux), Core Audio (macOS), WinMM (Windows), or WAV file recording
 - SIMD Acceleration - Optimized DSP paths for x86 (SSE/AVX) and ARM (NEON)
 
 ## Requirements
@@ -22,7 +22,7 @@ A cross-platform SDR FM tuner that bridges rtl_tcp hardware to the XDR/FM-DX pro
 ### macOS
 
 ```bash
-brew install openssl portaudio
+brew install openssl
 ```
 
 ### Linux (Debian/Ubuntu)
@@ -75,12 +75,6 @@ cmake .. -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
 make
 ```
 
-Or with manual PortAudio:
-
-```bash
-cmake .. -DPORTAUDIO_INCLUDE_DIR=C:/path/to/portaudio/include -DPORTAUDIO_LIBRARY=C:/path/to/portaudio/lib/portaudio.lib
-```
-
 ### AVX2/FMA Notes
 
 - AVX2/FMA is disabled by default for portable x86 binaries.
@@ -89,6 +83,17 @@ cmake .. -DPORTAUDIO_INCLUDE_DIR=C:/path/to/portaudio/include -DPORTAUDIO_LIBRAR
 ```bash
 cmake .. -DFM_TUNER_ENABLE_X86_AVX2=ON
 ```
+
+### Direct RTL-SDR Input
+
+To bypass `rtl_tcp` and read directly from USB RTL-SDR hardware:
+
+```bash
+cmake ..
+```
+
+Direct RTL-SDR support is always built in. Run with `--source rtl_sdr` and
+optionally `--rtl-device <index>`.
 
 ## Usage
 
@@ -117,6 +122,8 @@ rtl_tcp -p 1234 -f 88600000 -g 20 -s 512000
 | Option                      | Description                  | Default        |
 |-----------------------------|-------------------------------|---------------|
 | `-t, --tcp <host:port>`    | rtl_tcp server address       | localhost:1234 |
+| `--source <name>`          | Tuner source (`rtl_tcp`/`rtl_sdr`) | rtl_sdr |
+| `--rtl-device <id>`        | RTL-SDR device index (for `rtl_sdr`) | 0 |
 | `-f, --freq <khz>`         | Frequency in kHz             | 88600         |
 | `-g, --gain <db>`          | RTL-SDR gain in dB           | auto          |
 | `-w, --wav <file>`         | Output WAV file              | -             |
@@ -140,6 +147,12 @@ Play on audio device:
 
 ```bash
 ./fm-sdr-tuner -t localhost:1234 -f 101100 -s
+```
+
+Direct RTL-SDR (no `rtl_tcp` server):
+
+```bash
+./fm-sdr-tuner --source rtl_sdr --rtl-device 0 -f 101100 -s
 ```
 
 With XDR password protection:
@@ -239,7 +252,7 @@ Components:
 - **Stereo Decoder**: PLL-based 19kHz pilot detection, stereo/mono blend
 - **RDS Decoder**: Background thread decoding RDS groups
 - **AF Post Processor**: Deemphasis, resampling, volume
-- **Audio Output**: ALSA/PortAudio speaker or WAV file recording
+- **Audio Output**: ALSA/Core Audio/WinMM speaker or WAV file recording
 - **XDR Server**: Handles remote client connections on port 7373
 
 ## Testing
@@ -272,7 +285,6 @@ This software includes the following third-party components:
 | Component    | License          | Notes                                                                                     |
 |--------------|------------------|-------------------------------------------------------------------------------------------|
 | OpenSSL      | Apache 2.0 / SSLeay | See [LICENSE](LICENSE) and [OpenSSL license](https://www.openssl.org/source/license.html) |
-| PortAudio    | MIT              |                                                                                           |
 | SDRPlusPlus  | GPLv3            |                                                                                           |
 | XDR-GTK      | GPLv3            |                                                                                           |
 | FM-DX-Tuner  | GPLv3            |                                                                                           |

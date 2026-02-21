@@ -8,7 +8,15 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            artifact_suffix: x64
+          - runner: ubuntu-24.04-arm
+            artifact_suffix: arm64
 
     steps:
     - uses: actions/checkout@v4
@@ -26,5 +34,5 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: fm-sdr-tuner-linux
+        name: fm-sdr-tuner-linux-${{ matrix.artifact_suffix }}
         path: build/fm-sdr-tuner

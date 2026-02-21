@@ -12,6 +12,12 @@
 
 #if defined(FM_TUNER_HAS_PORTAUDIO)
 #include <portaudio.h>
+#elif defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+#include <AudioUnit/AudioUnit.h>
+#elif defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+#define NOMINMAX
+#include <windows.h>
+#include <mmsystem.h>
 #elif defined(__linux__)
 #if defined(FM_TUNER_HAS_ALSA)
 #include <alsa/asoundlib.h>
@@ -34,6 +40,7 @@ public:
     static bool listDevices();
 
     bool write(const float* left, const float* right, size_t numSamples);
+    void clearRealtimeQueue();
     bool isRunning() const { return m_running; }
 
 private:
@@ -44,6 +51,19 @@ private:
     void runOutputThread();
     void runAlsaOutputThread();
     static bool listAlsaDevices();
+#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+    static bool listCoreAudioDevices();
+    static OSStatus coreAudioRenderCallback(void* inRefCon,
+                                            AudioUnitRenderActionFlags* ioActionFlags,
+                                            const AudioTimeStamp* inTimeStamp,
+                                            UInt32 inBusNumber,
+                                            UInt32 inNumberFrames,
+                                            AudioBufferList* ioData);
+#endif
+#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+    static bool listWinMMDevices();
+    void runWinMMOutputThread();
+#endif
     bool initAlsa(const std::string& deviceName);
     void shutdownAlsa();
 
@@ -73,6 +93,27 @@ private:
     bool m_portAudioInitialized;
     std::thread m_outputThread;
     std::atomic<bool> m_outputThreadRunning;
+    std::mutex m_outputMutex;
+    std::condition_variable m_outputCv;
+    std::vector<float> m_outputQueue;
+    size_t m_outputReadIndex;
+#endif
+
+#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+    AudioUnit m_audioUnit;
+    std::mutex m_outputMutex;
+    std::condition_variable m_outputCv;
+    std::vector<float> m_outputQueue;
+    size_t m_outputReadIndex;
+    double m_coreAudioOutputRate;
+    double m_coreAudioSourcePerDest;
+    double m_coreAudioResamplePhase;
+#endif
+
+#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+    HWAVEOUT m_waveOut;
+    std::thread m_winmmThread;
+    std::atomic<bool> m_winmmThreadRunning;
     std::mutex m_outputMutex;
     std::condition_variable m_outputCv;
     std::vector<float> m_outputQueue;

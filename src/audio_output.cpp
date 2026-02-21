@@ -5,6 +5,49 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+#include <CoreAudio/CoreAudio.h>
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+
+#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+    if (enableSpeaker) {
+        const std::string normalizedSelector = trimWinMM(deviceSelector);
+        if (verboseLogging) {
+            std::cerr << "[Audio] winmm selector raw='" << deviceSelector
+                      << "' normalized='" << normalizedSelector << "'\n";
+        }
+        const UINT devId = selectWinMMDevice(normalizedSelector);
+        if (devId == UINT_MAX) {
+            std::cerr << "WinMM device not found for selector: " << normalizedSelector << "\n";
+            listWinMMDevices();
+            return false;
+        }
+
+        WAVEFORMATEX fmt{};
+        fmt.wFormatTag = WAVE_FORMAT_PCM;
+        fmt.nChannels = static_cast<WORD>(CHANNELS);
+        fmt.nSamplesPerSec = SAMPLE_RATE;
+        fmt.wBitsPerSample = 16;
+        fmt.nBlockAlign = static_cast<WORD>((fmt.nChannels * fmt.wBitsPerSample) / 8);
+        fmt.nAvgBytesPerSec = fmt.nBlockAlign * fmt.nSamplesPerSec;
+        fmt.cbSize = 0;
+
+        const UINT openId = normalizedSelector.empty() ? WAVE_MAPPER : devId;
+        const MMRESULT wr = waveOutOpen(&m_waveOut, openId, &fmt, 0, 0, CALLBACK_NULL);
+        if (wr != MMSYSERR_NOERROR || !m_waveOut) {
+            std::cerr << "WinMM open failed: " << wr << "\n";
+            m_waveOut = nullptr;
+            return false;
+        }
+        m_outputReadIndex = 0;
+        m_winmmThreadRunning = true;
+        m_winmmThread = std::thread(&AudioOutput::runWinMMOutputThread, this);
+        if (verboseLogging) {
+            std::cerr << "WinMM started successfully\n";
+        }
+    }
+#endif
 
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
 namespace {
@@ -177,9 +220,255 @@ void printOutputDeviceList() {
 
 #endif
 
+#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+namespace {
+std::string trimCoreAudio(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+        start++;
+    }
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+        end--;
+    }
+    return value.substr(start, end - start);
+}
+
+std::string normalizeCoreAudioSelector(const std::string& rawSelector) {
+    std::string selector = trimCoreAudio(rawSelector);
+    if (selector.size() >= 2) {
+        const char first = selector.front();
+        const char last = selector.back();
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            selector = trimCoreAudio(selector.substr(1, selector.size() - 2));
+        }
+    }
+    return selector;
+}
+
+bool parseCoreAudioDeviceIndex(const std::string& selector, int& outIndex) {
+    if (selector.empty()) {
+        return false;
+    }
+    for (char c : selector) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    outIndex = std::stoi(selector);
+    return true;
+}
+
+std::string toLowerCoreAudio(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string cfStringToStdString(CFStringRef str) {
+    if (!str) {
+        return std::string();
+    }
+    const CFIndex length = CFStringGetLength(str);
+    const CFIndex maxSize = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1;
+    std::string result(static_cast<size_t>(maxSize), '\0');
+    if (CFStringGetCString(str, result.data(), maxSize, kCFStringEncodingUTF8) == 0) {
+        return std::string();
+    }
+    result.resize(std::strlen(result.c_str()));
+    return result;
+}
+
+bool deviceHasOutputChannels(AudioDeviceID deviceId) {
+    AudioObjectPropertyAddress addr{
+        kAudioDevicePropertyStreamConfiguration,
+        kAudioDevicePropertyScopeOutput,
+        kAudioObjectPropertyElementWildcard
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(deviceId, &addr, 0, nullptr, &size) != noErr || size == 0) {
+        return false;
+    }
+    std::vector<uint8_t> storage(size);
+    AudioBufferList* bufferList = reinterpret_cast<AudioBufferList*>(storage.data());
+    if (AudioObjectGetPropertyData(deviceId, &addr, 0, nullptr, &size, bufferList) != noErr) {
+        return false;
+    }
+    UInt32 channels = 0;
+    for (UInt32 i = 0; i < bufferList->mNumberBuffers; i++) {
+        channels += bufferList->mBuffers[i].mNumberChannels;
+    }
+    return channels > 0;
+}
+
+std::vector<AudioDeviceID> enumerateOutputDevices() {
+    AudioObjectPropertyAddress addr{
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, nullptr, &size) != noErr || size == 0) {
+        return {};
+    }
+    std::vector<AudioDeviceID> devices(size / sizeof(AudioDeviceID));
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, nullptr, &size, devices.data()) != noErr) {
+        return {};
+    }
+    std::vector<AudioDeviceID> outputs;
+    outputs.reserve(devices.size());
+    for (AudioDeviceID id : devices) {
+        if (id != kAudioObjectUnknown && deviceHasOutputChannels(id)) {
+            outputs.push_back(id);
+        }
+    }
+    return outputs;
+}
+
+AudioDeviceID defaultOutputDevice() {
+    AudioDeviceID device = kAudioObjectUnknown;
+    UInt32 size = sizeof(device);
+    AudioObjectPropertyAddress addr{
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, nullptr, &size, &device) != noErr) {
+        return kAudioObjectUnknown;
+    }
+    return device;
+}
+
+std::string outputDeviceName(AudioDeviceID deviceId) {
+    CFStringRef cfName = nullptr;
+    UInt32 size = sizeof(cfName);
+    AudioObjectPropertyAddress addr{
+        kAudioObjectPropertyName,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectGetPropertyData(deviceId, &addr, 0, nullptr, &size, &cfName) != noErr || !cfName) {
+        return std::string();
+    }
+    std::string name = cfStringToStdString(cfName);
+    CFRelease(cfName);
+    return name;
+}
+
+AudioDeviceID selectOutputDeviceCoreAudio(const std::string& selector) {
+    const auto devices = enumerateOutputDevices();
+    if (devices.empty()) {
+        return kAudioObjectUnknown;
+    }
+    if (selector.empty()) {
+        const AudioDeviceID def = defaultOutputDevice();
+        if (def != kAudioObjectUnknown) {
+            return def;
+        }
+        return devices.front();
+    }
+    int requestedIndex = -1;
+    if (parseCoreAudioDeviceIndex(selector, requestedIndex)) {
+        if (requestedIndex >= 0 && requestedIndex < static_cast<int>(devices.size())) {
+            return devices[static_cast<size_t>(requestedIndex)];
+        }
+        return kAudioObjectUnknown;
+    }
+    const std::string needle = toLowerCoreAudio(selector);
+    for (AudioDeviceID id : devices) {
+        const std::string name = outputDeviceName(id);
+        if (!name.empty() && toLowerCoreAudio(name).find(needle) != std::string::npos) {
+            return id;
+        }
+    }
+    return kAudioObjectUnknown;
+}
+}  // namespace
+#endif
+
+#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+namespace {
+std::string narrowFromWide(const WCHAR* wide) {
+    if (!wide || *wide == L'\0') {
+        return std::string();
+    }
+    const int len = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 1) {
+        return std::string();
+    }
+    std::string out(static_cast<size_t>(len - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+std::string trimWinMM(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+        start++;
+    }
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+        end--;
+    }
+    return value.substr(start, end - start);
+}
+
+bool parseWinMMIndex(const std::string& selector, UINT& index) {
+    if (selector.empty()) {
+        return false;
+    }
+    for (char c : selector) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    index = static_cast<UINT>(std::stoul(selector));
+    return true;
+}
+
+std::string toLowerWinMM(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+UINT selectWinMMDevice(const std::string& selector) {
+    const UINT num = waveOutGetNumDevs();
+    if (selector.empty()) {
+        return WAVE_MAPPER;
+    }
+    UINT idx = 0;
+    if (parseWinMMIndex(selector, idx)) {
+        if (idx < num) {
+            return idx;
+        }
+        return UINT_MAX;
+    }
+    const std::string needle = toLowerWinMM(selector);
+    for (UINT i = 0; i < num; i++) {
+        WAVEOUTCAPSW caps{};
+        if (waveOutGetDevCapsW(i, &caps, sizeof(caps)) != MMSYSERR_NOERROR) {
+            continue;
+        }
+        const std::string name = toLowerWinMM(narrowFromWide(caps.szPname));
+        if (!name.empty() && name.find(needle) != std::string::npos) {
+            return i;
+        }
+    }
+    return UINT_MAX;
+}
+}  // namespace
+#endif
+
 bool AudioOutput::listDevices() {
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
     listAlsaDevices();
+#elif defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+    return listCoreAudioDevices();
+#elif defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+    return listWinMMDevices();
 #elif defined(FM_TUNER_HAS_PORTAUDIO)
     PaError err = Pa_Initialize();
     if (err != paNoError) {
@@ -188,9 +477,97 @@ bool AudioOutput::listDevices() {
     }
     printOutputDeviceList();
     Pa_Terminate();
+#else
+    std::cerr << "Audio device listing is unavailable in this build "
+                 "(enable PortAudio on macOS/Windows or ALSA on Linux)\n";
+    return false;
 #endif
     return true;
 }
+
+#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+bool AudioOutput::listWinMMDevices() {
+    const UINT num = waveOutGetNumDevs();
+    std::cout << "Available audio output devices:\n";
+    for (UINT i = 0; i < num; i++) {
+        WAVEOUTCAPSW caps{};
+        if (waveOutGetDevCapsW(i, &caps, sizeof(caps)) != MMSYSERR_NOERROR) {
+            continue;
+        }
+        std::cout << "  [" << i << "] " << narrowFromWide(caps.szPname) << " (API: WinMM)\n";
+    }
+    return true;
+}
+#endif
+
+#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+bool AudioOutput::listCoreAudioDevices() {
+    const auto devices = enumerateOutputDevices();
+    std::cout << "Available audio output devices:\n";
+    for (size_t i = 0; i < devices.size(); i++) {
+        const std::string name = outputDeviceName(devices[i]);
+        std::cout << "  [" << i << "] " << (name.empty() ? "(unknown)" : name) << " (API: Core Audio)\n";
+    }
+    return true;
+}
+
+OSStatus AudioOutput::coreAudioRenderCallback(void* inRefCon,
+                                              AudioUnitRenderActionFlags*,
+                                              const AudioTimeStamp*,
+                                              UInt32,
+                                              UInt32 inNumberFrames,
+                                              AudioBufferList* ioData) {
+    auto* self = reinterpret_cast<AudioOutput*>(inRefCon);
+    if (!self || !ioData || inNumberFrames == 0) {
+        return noErr;
+    }
+
+    float* outA = (ioData->mNumberBuffers > 0)
+        ? reinterpret_cast<float*>(ioData->mBuffers[0].mData)
+        : nullptr;
+    float* outB = (ioData->mNumberBuffers > 1)
+        ? reinterpret_cast<float*>(ioData->mBuffers[1].mData)
+        : nullptr;
+    if (!outA) {
+        return noErr;
+    }
+
+    std::lock_guard<std::mutex> lock(self->m_outputMutex);
+    const size_t available = (self->m_outputQueue.size() > self->m_outputReadIndex)
+        ? (self->m_outputQueue.size() - self->m_outputReadIndex)
+        : 0;
+    const size_t samplePairs = std::min(available / 2, static_cast<size_t>(inNumberFrames));
+    for (size_t i = 0; i < samplePairs; i++) {
+        const float l = self->m_outputQueue[self->m_outputReadIndex + i * 2];
+        const float r = self->m_outputQueue[self->m_outputReadIndex + i * 2 + 1];
+        if (outB) {
+            outA[i] = l;
+            outB[i] = r;
+        } else {
+            outA[i * 2] = l;
+            outA[i * 2 + 1] = r;
+        }
+    }
+    for (size_t i = samplePairs; i < static_cast<size_t>(inNumberFrames); i++) {
+        if (outB) {
+            outA[i] = 0.0f;
+            outB[i] = 0.0f;
+        } else {
+            outA[i * 2] = 0.0f;
+            outA[i * 2 + 1] = 0.0f;
+        }
+    }
+
+    self->m_outputReadIndex += samplePairs * 2;
+    if (self->m_outputReadIndex > 0 &&
+        (self->m_outputReadIndex >= 16384 || (self->m_outputReadIndex * 2) >= self->m_outputQueue.size())) {
+        self->m_outputQueue.erase(self->m_outputQueue.begin(),
+                                  self->m_outputQueue.begin() + static_cast<std::ptrdiff_t>(self->m_outputReadIndex));
+        self->m_outputReadIndex = 0;
+    }
+    return noErr;
+}
+#endif
 
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
 bool AudioOutput::listAlsaDevices() {
@@ -449,7 +826,11 @@ void AudioOutput::runOutputThread() {
                 lastR = block[copied - 1];
             }
 
-            if (copied < kBlockSamples) {
+            if (copied == 0) {
+                std::fill(block.begin(), block.end(), 0.0f);
+                lastL = 0.0f;
+                lastR = 0.0f;
+            } else if (copied < kBlockSamples) {
                 const size_t missing = kBlockSamples - copied;
                 constexpr int kFadeMs = 5;
                 const size_t fadeSamples = std::min(
@@ -494,6 +875,89 @@ void AudioOutput::runOutputThread() {
 }
 #endif
 
+#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+void AudioOutput::runWinMMOutputThread() {
+    constexpr size_t kFrames = static_cast<size_t>(FRAMES_PER_BUFFER);
+    constexpr size_t kSamplesPerBuffer = kFrames * CHANNELS;
+    constexpr size_t kNumBuffers = 4;
+
+    std::vector<std::vector<int16_t>> buffers(kNumBuffers, std::vector<int16_t>(kSamplesPerBuffer, 0));
+    std::vector<WAVEHDR> headers(kNumBuffers);
+    for (size_t i = 0; i < kNumBuffers; i++) {
+        std::memset(&headers[i], 0, sizeof(WAVEHDR));
+        headers[i].lpData = reinterpret_cast<LPSTR>(buffers[i].data());
+        headers[i].dwBufferLength = static_cast<DWORD>(kSamplesPerBuffer * sizeof(int16_t));
+        headers[i].dwFlags = WHDR_DONE;
+        waveOutPrepareHeader(m_waveOut, &headers[i], sizeof(WAVEHDR));
+    }
+
+    while (m_winmmThreadRunning.load()) {
+        WAVEHDR* hdr = nullptr;
+        std::vector<int16_t>* pcm = nullptr;
+        for (size_t i = 0; i < kNumBuffers; i++) {
+            if ((headers[i].dwFlags & WHDR_INQUEUE) == 0) {
+                hdr = &headers[i];
+                pcm = &buffers[i];
+                break;
+            }
+        }
+        if (!hdr || !pcm) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+
+        size_t copied = 0;
+        {
+            std::unique_lock<std::mutex> lock(m_outputMutex);
+            m_outputCv.wait_for(lock, std::chrono::milliseconds(10), [&]() {
+                const size_t available = (m_outputQueue.size() > m_outputReadIndex)
+                    ? (m_outputQueue.size() - m_outputReadIndex)
+                    : 0;
+                return !m_winmmThreadRunning.load() || available > 0;
+            });
+
+            if (!m_winmmThreadRunning.load()) {
+                break;
+            }
+
+            const size_t available = (m_outputQueue.size() > m_outputReadIndex)
+                ? (m_outputQueue.size() - m_outputReadIndex)
+                : 0;
+            copied = std::min(available, kSamplesPerBuffer);
+            for (size_t i = 0; i < copied; i++) {
+                float v = m_outputQueue[m_outputReadIndex + i];
+                v = std::clamp(v, -1.0f, 1.0f);
+                (*pcm)[i] = static_cast<int16_t>(v * 32767.0f);
+            }
+            for (size_t i = copied; i < kSamplesPerBuffer; i++) {
+                (*pcm)[i] = 0;
+            }
+            m_outputReadIndex += copied;
+            if (m_outputReadIndex > 0 &&
+                (m_outputReadIndex >= 16384 || (m_outputReadIndex * 2) >= m_outputQueue.size())) {
+                m_outputQueue.erase(m_outputQueue.begin(),
+                                    m_outputQueue.begin() + static_cast<std::ptrdiff_t>(m_outputReadIndex));
+                m_outputReadIndex = 0;
+            }
+        }
+
+        hdr->dwBufferLength = static_cast<DWORD>(kSamplesPerBuffer * sizeof(int16_t));
+        const MMRESULT wr = waveOutWrite(m_waveOut, hdr, sizeof(WAVEHDR));
+        if (wr != MMSYSERR_NOERROR && m_verboseLogging) {
+            std::cerr << "[Audio] WinMM write failed: " << wr << "\n";
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+
+    if (m_waveOut) {
+        waveOutReset(m_waveOut);
+    }
+    for (size_t i = 0; i < kNumBuffers; i++) {
+        waveOutUnprepareHeader(m_waveOut, &headers[i], sizeof(WAVEHDR));
+    }
+}
+#endif
+
 AudioOutput::AudioOutput()
     : m_enableSpeaker(false)
     , m_wavHandle(nullptr)
@@ -508,6 +972,15 @@ AudioOutput::AudioOutput()
     , m_paStream(nullptr)
     , m_portAudioInitialized(false)
     , m_outputThreadRunning(false)
+    , m_outputReadIndex(0)
+#endif
+#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+    , m_audioUnit(nullptr)
+    , m_outputReadIndex(0)
+#endif
+#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+    , m_waveOut(nullptr)
+    , m_winmmThreadRunning(false)
     , m_outputReadIndex(0)
 #endif
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
@@ -618,6 +1091,107 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
     }
 #endif
 
+#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+    if (enableSpeaker) {
+        const std::string normalizedSelector = normalizeCoreAudioSelector(deviceSelector);
+        if (verboseLogging) {
+            std::cerr << "[Audio] coreaudio selector raw='" << deviceSelector
+                      << "' normalized='" << normalizedSelector << "'\n";
+        }
+
+        AudioComponentDescription desc{};
+        desc.componentType = kAudioUnitType_Output;
+        desc.componentSubType = kAudioUnitSubType_DefaultOutput;
+        desc.componentManufacturer = kAudioUnitManufacturer_Apple;
+        AudioComponent component = AudioComponentFindNext(nullptr, &desc);
+        if (!component) {
+            std::cerr << "CoreAudio output component not found\n";
+            return false;
+        }
+        if (AudioComponentInstanceNew(component, &m_audioUnit) != noErr || !m_audioUnit) {
+            std::cerr << "CoreAudio instance creation failed\n";
+            m_audioUnit = nullptr;
+            return false;
+        }
+
+        if (!normalizedSelector.empty()) {
+            AudioDeviceID selected = selectOutputDeviceCoreAudio(normalizedSelector);
+            if (selected == kAudioObjectUnknown) {
+                std::cerr << "CoreAudio device not found for selector: " << normalizedSelector << "\n";
+                listCoreAudioDevices();
+                AudioComponentInstanceDispose(m_audioUnit);
+                m_audioUnit = nullptr;
+                return false;
+            }
+            const OSStatus selErr = AudioUnitSetProperty(m_audioUnit,
+                                                         kAudioOutputUnitProperty_CurrentDevice,
+                                                         kAudioUnitScope_Global,
+                                                         0,
+                                                         &selected,
+                                                         sizeof(selected));
+            if (selErr != noErr) {
+                std::cerr << "CoreAudio failed to select output device (status=" << selErr << ")\n";
+                AudioComponentInstanceDispose(m_audioUnit);
+                m_audioUnit = nullptr;
+                return false;
+            }
+        }
+
+        AURenderCallbackStruct callback{};
+        callback.inputProc = &AudioOutput::coreAudioRenderCallback;
+        callback.inputProcRefCon = this;
+        if (AudioUnitSetProperty(m_audioUnit,
+                                 kAudioUnitProperty_SetRenderCallback,
+                                 kAudioUnitScope_Input,
+                                 0,
+                                 &callback,
+                                 sizeof(callback)) != noErr) {
+            std::cerr << "CoreAudio set render callback failed\n";
+            AudioComponentInstanceDispose(m_audioUnit);
+            m_audioUnit = nullptr;
+            return false;
+        }
+
+        AudioStreamBasicDescription asbd{};
+        asbd.mSampleRate = static_cast<Float64>(SAMPLE_RATE);
+        asbd.mFormatID = kAudioFormatLinearPCM;
+        asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved;
+        asbd.mFramesPerPacket = 1;
+        asbd.mChannelsPerFrame = CHANNELS;
+        asbd.mBitsPerChannel = 32;
+        asbd.mBytesPerFrame = sizeof(float);
+        asbd.mBytesPerPacket = sizeof(float);
+        if (AudioUnitSetProperty(m_audioUnit,
+                                 kAudioUnitProperty_StreamFormat,
+                                 kAudioUnitScope_Input,
+                                 0,
+                                 &asbd,
+                                 sizeof(asbd)) != noErr) {
+            std::cerr << "CoreAudio set stream format failed\n";
+            AudioComponentInstanceDispose(m_audioUnit);
+            m_audioUnit = nullptr;
+            return false;
+        }
+
+        if (AudioUnitInitialize(m_audioUnit) != noErr) {
+            std::cerr << "CoreAudio initialize failed\n";
+            AudioComponentInstanceDispose(m_audioUnit);
+            m_audioUnit = nullptr;
+            return false;
+        }
+        if (AudioOutputUnitStart(m_audioUnit) != noErr) {
+            std::cerr << "CoreAudio start failed\n";
+            AudioUnitUninitialize(m_audioUnit);
+            AudioComponentInstanceDispose(m_audioUnit);
+            m_audioUnit = nullptr;
+            return false;
+        }
+        if (verboseLogging) {
+            std::cerr << "CoreAudio started successfully\n";
+        }
+    }
+#endif
+
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
     if (enableSpeaker) {
         std::string alsaDevice = deviceSelector.empty() ? "default" : deviceSelector;
@@ -656,6 +1230,27 @@ void AudioOutput::shutdown() {
     if (m_portAudioInitialized) {
         Pa_Terminate();
         m_portAudioInitialized = false;
+    }
+#endif
+
+#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+    if (m_audioUnit) {
+        AudioOutputUnitStop(m_audioUnit);
+        AudioUnitUninitialize(m_audioUnit);
+        AudioComponentInstanceDispose(m_audioUnit);
+        m_audioUnit = nullptr;
+    }
+#endif
+
+#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+    m_winmmThreadRunning = false;
+    m_outputCv.notify_all();
+    if (m_winmmThread.joinable()) {
+        m_winmmThread.join();
+    }
+    if (m_waveOut) {
+        waveOutClose(m_waveOut);
+        m_waveOut = nullptr;
     }
 #endif
 
@@ -735,6 +1330,30 @@ void AudioOutput::closeWAV() {
     }
 }
 
+void AudioOutput::clearRealtimeQueue() {
+#if defined(FM_TUNER_HAS_PORTAUDIO)
+    if (m_paStream) {
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+        m_outputQueue.clear();
+        m_outputReadIndex = 0;
+    }
+#endif
+#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+    if (m_audioUnit) {
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+        m_outputQueue.clear();
+        m_outputReadIndex = 0;
+    }
+#endif
+#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+    if (m_waveOut) {
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+        m_outputQueue.clear();
+        m_outputReadIndex = 0;
+    }
+#endif
+}
+
 bool AudioOutput::write(const float* left, const float* right, size_t numSamples) {
     if (!m_running) return false;
 
@@ -803,7 +1422,7 @@ bool AudioOutput::write(const float* left, const float* right, size_t numSamples
 #if defined(FM_TUNER_HAS_PORTAUDIO)
     if (m_enableSpeaker && m_paStream) {
         std::lock_guard<std::mutex> lock(m_outputMutex);
-        constexpr size_t kMaxQueuedSamples = static_cast<size_t>(SAMPLE_RATE) * CHANNELS * 2;
+        constexpr size_t kMaxQueuedSamples = static_cast<size_t>(SAMPLE_RATE) * CHANNELS;
         const size_t queuedSamples = (m_outputQueue.size() > m_outputReadIndex)
             ? (m_outputQueue.size() - m_outputReadIndex)
             : 0;
@@ -830,6 +1449,62 @@ bool AudioOutput::write(const float* left, const float* right, size_t numSamples
             }
         }
 
+        const size_t base = m_outputQueue.size();
+        m_outputQueue.resize(base + incomingSamples);
+        for (size_t i = 0; i < numSamples; i++) {
+            m_outputQueue[base + i * 2] = writeLeft[i];
+            m_outputQueue[base + i * 2 + 1] = writeRight[i];
+        }
+        m_outputCv.notify_one();
+    }
+#endif
+
+#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+    if (m_enableSpeaker && m_audioUnit) {
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+        constexpr size_t kMaxQueuedSamples = static_cast<size_t>(SAMPLE_RATE) * CHANNELS;
+        const size_t queuedSamples = (m_outputQueue.size() > m_outputReadIndex)
+            ? (m_outputQueue.size() - m_outputReadIndex)
+            : 0;
+        const size_t incomingSamples = numSamples * CHANNELS;
+        if (queuedSamples + incomingSamples > kMaxQueuedSamples) {
+            const size_t drop = (queuedSamples + incomingSamples) - kMaxQueuedSamples;
+            m_outputReadIndex += std::min(drop, queuedSamples);
+            if (m_verboseLogging) {
+                static std::atomic<uint32_t> dropCount{0};
+                const uint32_t count = ++dropCount;
+                if (count <= 5 || (count % 50) == 0) {
+                    std::cerr << "[Audio] CoreAudio queue overflow (" << count << ")\n";
+                }
+            }
+        }
+        const size_t base = m_outputQueue.size();
+        m_outputQueue.resize(base + incomingSamples);
+        for (size_t i = 0; i < numSamples; i++) {
+            m_outputQueue[base + i * 2] = writeLeft[i];
+            m_outputQueue[base + i * 2 + 1] = writeRight[i];
+        }
+    }
+#endif
+#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+    if (m_enableSpeaker && m_waveOut) {
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+        constexpr size_t kMaxQueuedSamples = static_cast<size_t>(SAMPLE_RATE) * CHANNELS;
+        const size_t queuedSamples = (m_outputQueue.size() > m_outputReadIndex)
+            ? (m_outputQueue.size() - m_outputReadIndex)
+            : 0;
+        const size_t incomingSamples = numSamples * CHANNELS;
+        if (queuedSamples + incomingSamples > kMaxQueuedSamples) {
+            const size_t drop = (queuedSamples + incomingSamples) - kMaxQueuedSamples;
+            m_outputReadIndex += std::min(drop, queuedSamples);
+            if (m_verboseLogging) {
+                static std::atomic<uint32_t> dropCount{0};
+                const uint32_t count = ++dropCount;
+                if (count <= 5 || (count % 50) == 0) {
+                    std::cerr << "[Audio] WinMM queue overflow (" << count << ")\n";
+                }
+            }
+        }
         const size_t base = m_outputQueue.size();
         m_outputQueue.resize(base + incomingSamples);
         for (size_t i = 0; i < numSamples; i++) {

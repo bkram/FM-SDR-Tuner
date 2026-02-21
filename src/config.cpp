@@ -149,16 +149,6 @@ bool Config::loadFromFile(const std::string& filename) {
         } else if (section == "audio") {
             if (key == "device") {
                 audio.device = value;
-            } else if (key == "output_rate") {
-                int parsed = 0;
-                if (parseInt(value, parsed) && parsed > 0) {
-                    audio.output_rate = parsed;
-                }
-            } else if (key == "buffer_size") {
-                int parsed = 0;
-                if (parseInt(value, parsed) && parsed > 0) {
-                    audio.buffer_size = parsed;
-                }
             }
         } else if (section == "sdr") {
             if (key == "rtl_gain_db") {
