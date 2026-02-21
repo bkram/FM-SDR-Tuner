@@ -10,45 +10,6 @@
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 
-#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
-    if (enableSpeaker) {
-        const std::string normalizedSelector = trimWinMM(deviceSelector);
-        if (verboseLogging) {
-            std::cerr << "[Audio] winmm selector raw='" << deviceSelector
-                      << "' normalized='" << normalizedSelector << "'\n";
-        }
-        const UINT devId = selectWinMMDevice(normalizedSelector);
-        if (devId == UINT_MAX) {
-            std::cerr << "WinMM device not found for selector: " << normalizedSelector << "\n";
-            listWinMMDevices();
-            return false;
-        }
-
-        WAVEFORMATEX fmt{};
-        fmt.wFormatTag = WAVE_FORMAT_PCM;
-        fmt.nChannels = static_cast<WORD>(CHANNELS);
-        fmt.nSamplesPerSec = SAMPLE_RATE;
-        fmt.wBitsPerSample = 16;
-        fmt.nBlockAlign = static_cast<WORD>((fmt.nChannels * fmt.wBitsPerSample) / 8);
-        fmt.nAvgBytesPerSec = fmt.nBlockAlign * fmt.nSamplesPerSec;
-        fmt.cbSize = 0;
-
-        const UINT openId = normalizedSelector.empty() ? WAVE_MAPPER : devId;
-        const MMRESULT wr = waveOutOpen(&m_waveOut, openId, &fmt, 0, 0, CALLBACK_NULL);
-        if (wr != MMSYSERR_NOERROR || !m_waveOut) {
-            std::cerr << "WinMM open failed: " << wr << "\n";
-            m_waveOut = nullptr;
-            return false;
-        }
-        m_outputReadIndex = 0;
-        m_winmmThreadRunning = true;
-        m_winmmThread = std::thread(&AudioOutput::runWinMMOutputThread, this);
-        if (verboseLogging) {
-            std::cerr << "WinMM started successfully\n";
-        }
-    }
-#endif
-
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
 namespace {
 bool parseHwDeviceGlobal(const std::string& selector, int& card, int& device) {
@@ -1188,6 +1149,46 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
         }
         if (verboseLogging) {
             std::cerr << "CoreAudio started successfully\n";
+        }
+    }
+#endif
+
+#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+    if (enableSpeaker) {
+        const std::string normalizedSelector = trimWinMM(deviceSelector);
+        if (verboseLogging) {
+            std::cerr << "[Audio] winmm selector raw='" << deviceSelector
+                      << "' normalized='" << normalizedSelector << "'\n";
+        }
+        const UINT devId = selectWinMMDevice(normalizedSelector);
+        if (devId == UINT_MAX) {
+            std::cerr << "WinMM device not found for selector: " << normalizedSelector << "\n";
+            listWinMMDevices();
+            return false;
+        }
+
+        WAVEFORMATEX fmt{};
+        fmt.wFormatTag = WAVE_FORMAT_PCM;
+        fmt.nChannels = static_cast<WORD>(CHANNELS);
+        fmt.nSamplesPerSec = SAMPLE_RATE;
+        fmt.wBitsPerSample = 16;
+        fmt.nBlockAlign = static_cast<WORD>((fmt.nChannels * fmt.wBitsPerSample) / 8);
+        fmt.nAvgBytesPerSec = fmt.nBlockAlign * fmt.nSamplesPerSec;
+        fmt.cbSize = 0;
+
+        const UINT openId = normalizedSelector.empty() ? WAVE_MAPPER : devId;
+        const MMRESULT wr = waveOutOpen(&m_waveOut, openId, &fmt, 0, 0, CALLBACK_NULL);
+        if (wr != MMSYSERR_NOERROR || !m_waveOut) {
+            std::cerr << "WinMM open failed: " << wr << "\n";
+            m_waveOut = nullptr;
+            return false;
+        }
+
+        m_outputReadIndex = 0;
+        m_winmmThreadRunning = true;
+        m_winmmThread = std::thread(&AudioOutput::runWinMMOutputThread, this);
+        if (verboseLogging) {
+            std::cerr << "WinMM started successfully\n";
         }
     }
 #endif
