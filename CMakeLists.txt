@@ -278,7 +278,7 @@ if(UNIX AND NOT APPLE)
     set(CPACK_DEBIAN_PACKAGE_SECTION "hamradio")
     set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
     set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libliquid1")
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libliquid1, librtlsdr0")
 endif()
 
 include(CPack)
