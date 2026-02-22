@@ -28,7 +28,7 @@ jobs:
 
     - name: Build
       run: |
-        cmake -S . -B build
+        cmake -S . -B build -DFM_TUNER_ENABLE_X86_AVX2=OFF
         cmake --build build -j$(nproc)
 
     - name: Build Debian package
