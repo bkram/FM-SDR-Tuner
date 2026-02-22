@@ -8,6 +8,27 @@
 
 #if defined(FM_TUNER_HAS_RTLSDR)
 #include <rtl-sdr.h>
+
+namespace {
+const char* tunerTypeName(enum rtlsdr_tuner tuner) {
+    switch (tuner) {
+        case RTLSDR_TUNER_E4000:
+            return "E4000";
+        case RTLSDR_TUNER_FC0012:
+            return "FC0012";
+        case RTLSDR_TUNER_FC0013:
+            return "FC0013";
+        case RTLSDR_TUNER_FC2580:
+            return "FC2580";
+        case RTLSDR_TUNER_R820T:
+            return "R820T";
+        case RTLSDR_TUNER_R828D:
+            return "R828D";
+        default:
+            return "unknown";
+    }
+}
+}  // namespace
 #endif
 
 RTLSDRDevice::RTLSDRDevice(uint32_t deviceIndex)
@@ -33,21 +54,22 @@ bool RTLSDRDevice::connect() {
     }
     const uint32_t count = rtlsdr_get_device_count();
     if (count == 0) {
-        std::cerr << "No RTL-SDR device found\n";
+        std::cerr << "[SDR] no RTL-SDR device found\n";
         return false;
     }
     if (m_deviceIndex >= count) {
-        std::cerr << "Invalid RTL-SDR device index " << m_deviceIndex
+        std::cerr << "[SDR] invalid RTL-SDR device index " << m_deviceIndex
                   << " (available: " << count << ")\n";
         return false;
     }
     rtlsdr_dev_t* dev = nullptr;
     if (rtlsdr_open(&dev, m_deviceIndex) != 0 || !dev) {
-        std::cerr << "Failed to open RTL-SDR device index " << m_deviceIndex << "\n";
+        std::cerr << "[SDR] failed to open RTL-SDR device index " << m_deviceIndex << "\n";
         return false;
     }
+    std::cout << "[SDR] found " << tunerTypeName(rtlsdr_get_tuner_type(dev)) << " tuner\n";
     if (rtlsdr_reset_buffer(dev) != 0) {
-        std::cerr << "Warning: failed to reset RTL-SDR buffer\n";
+        std::cerr << "[SDR] warning: failed to reset RTL-SDR buffer\n";
     }
     m_supportedGains.clear();
     const int gainCount = rtlsdr_get_tuner_gains(dev, nullptr);
@@ -72,7 +94,7 @@ bool RTLSDRDevice::connect() {
     m_asyncThread = std::thread(&RTLSDRDevice::asyncReadLoop, this);
     return true;
 #else
-    std::cerr << "Direct RTL-SDR source not available in this build (enable FM_TUNER_ENABLE_RTLSDR)\n";
+    std::cerr << "[SDR] direct RTL-SDR source not available in this build (enable FM_TUNER_ENABLE_RTLSDR)\n";
     return false;
 #endif
 }
@@ -247,7 +269,7 @@ void RTLSDRDevice::asyncCallback(unsigned char* buf, uint32_t len, void* ctx) {
             }
             const uint32_t count = ++overflowCount;
             if (count <= 5 || (count % 1000) == 0) {
-                std::cerr << "[RTLSDR] IQ ring overflow (" << count << ")\n";
+                std::cerr << "[SDR] IQ ring overflow (" << count << ")\n";
             }
         }
         self->m_ringFull = (self->m_ringWritePos == self->m_ringReadPos);
@@ -271,7 +293,7 @@ void RTLSDRDevice::asyncReadLoop() {
     }
     const int rc = rtlsdr_read_async(dev, &RTLSDRDevice::asyncCallback, this, 12, 16384);
     if (m_asyncRunning.load() && rc != 0) {
-        std::cerr << "[RTLSDR] read_async stopped with error rc=" << rc << "\n";
+        std::cerr << "[SDR] read_async stopped with error rc=" << rc << "\n";
         m_asyncFailed = true;
     }
     m_asyncRunning = false;

@@ -11,7 +11,6 @@
 #include <condition_variable>
 #include <chrono>
 #include <deque>
-#include <string>
 #include <vector>
 #include <utility>
 #include <array>
@@ -153,9 +152,7 @@ private:
     uint8_t m_piLastState = 4;
     uint16_t m_piLastValue = 0xFFFF;
     std::atomic<uint64_t> m_lastRdsMs;
-    
-    std::deque<std::pair<uint64_t, std::string>> m_rdsDataQueue;
-    std::mutex m_rdsDataMutex;
+
     std::atomic<int> m_scanStartKHz;
     std::atomic<int> m_scanStopKHz;
     std::atomic<int> m_scanStepKHz;

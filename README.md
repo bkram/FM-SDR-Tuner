@@ -180,15 +180,10 @@ Supported sections/keys:
 - `[processing]`
   - `agc_mode`
   - `client_gain_allowed`
-  - `demodulator` (`fast` or `exact`)
+  - `dsp_block_samples` (fixed DSP block size, clamped to `1024..32768`)
+  - `w0_bandwidth_hz` (fallback bandwidth for `W0` in Hz; set `0` for widest)
   - `stereo_blend` (`soft`, `normal`, `aggressive`)
   - `stereo`
-- `[rds]`
-  - `aggressiveness`
-  - `agc_attack`
-  - `agc_release`
-  - `lock_acquire_groups`
-  - `lock_loss_groups`
 - `[debug]`
   - `log_level`
 - `[reconnection]`

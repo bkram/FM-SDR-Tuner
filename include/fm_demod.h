@@ -3,15 +3,12 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <array>
 #include <vector>
+#include "dsp/liquid_primitives.h"
 
 class FMDemod {
 public:
-    enum class DemodMode {
-        Fast = 0,
-        Exact = 1
-    };
-
     FMDemod(int inputRate, int outputRate);
     ~FMDemod();
 
@@ -25,63 +22,34 @@ public:
     void setDeviation(double deviation);
     void setBandwidthMode(int mode);
     void setBandwidthHz(int bwHz);
-    void setDemodMode(DemodMode mode);
-    DemodMode getDemodMode() const { return m_demodMode; }
+    void setW0BandwidthHz(int bwHz);
     bool isClipping() const { return m_clipping; }
     float getClippingRatio() const { return m_clippingRatio; }
 
 private:
     void demodulate(const uint8_t* iq, float* audio, size_t len);
-    void initAudioFilter();
-    void rebuildAudioFilter(double cutoffHz);
-    void initIQFilter();
-    void rebuildIQFilter(double cutoffHz);
-    void initDecimFilter();
 
     int m_inputRate;
     int m_outputRate;
-    int m_downsampleFactor;
 
-    DemodMode m_demodMode;
-    float m_lastPhase;
-    bool m_haveLastPhase;
-    float m_prevI;
-    float m_prevQ;
-    bool m_havePrevIQ;
     double m_deviation;
-    double m_invDeviation;
 
-    float m_deemphAlpha;
-    float m_deemphasisState;
+    bool m_deemphasisEnabled;
     int m_bandwidthMode;
+    int m_w0BandwidthHz;
 
-    std::vector<float> m_audioTaps;
-    std::vector<float> m_audioTapsRev;
-    std::vector<float> m_audioHistoryLinear;
-    std::vector<float> m_decimTaps;
-    std::vector<float> m_decimTapsRev;
-    std::vector<float> m_decimHistoryLinear;
     std::vector<float> m_demodScratch;
-    size_t m_audioHistPos;
-    size_t m_decimHistPos;
-    int m_decimPhase;
-
-    std::vector<float> m_iqTaps;
-    std::vector<float> m_iqTapsRev;
-    std::vector<float> m_iqIHistory;
-    std::vector<float> m_iqQHistory;
-    size_t m_iqHistPos;
-    float m_iqPrevInI;
-    float m_iqPrevInQ;
-    float m_iqDcStateI;
-    float m_iqDcStateQ;
 
     bool m_clipping;
     float m_clippingRatio;
-
-    bool m_useNeon;
-    bool m_useSse2;
-    bool m_useAvx2;
+    fm_tuner::dsp::liquid::FIRFilter m_liquidIqFilter;
+    fm_tuner::dsp::liquid::FreqDemod m_liquidFreqDemod;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidIqDcBlockI;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidIqDcBlockQ;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidMonoDeemphasis;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidMonoDcBlock;
+    fm_tuner::dsp::liquid::Resampler m_liquidMonoResampler;
+    std::array<float, fm_tuner::dsp::liquid::Resampler::kMaxOutput> m_liquidResampleTmp{};
 };
 
 #endif

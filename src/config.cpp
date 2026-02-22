@@ -93,7 +93,6 @@ void Config::loadDefaults() {
     tuner = TunerSection{};
     xdr = XDRSection{};
     processing = ProcessingSection{};
-    rds = RDSSection{};
     debug = DebugSection{};
     reconnection = ReconnectionSection{};
 }
@@ -241,10 +240,15 @@ bool Config::loadFromFile(const std::string& filename) {
                 if (parseBool(value, parsed)) {
                     processing.client_gain_allowed = parsed;
                 }
-            } else if (key == "demodulator") {
-                const std::string parsed = toLower(trim(value));
-                if (parsed == "fast" || parsed == "exact") {
-                    processing.demodulator = parsed;
+            } else if (key == "dsp_block_samples") {
+                int parsed = 0;
+                if (parseInt(value, parsed)) {
+                    processing.dsp_block_samples = std::clamp(parsed, 1024, 32768);
+                }
+            } else if (key == "w0_bandwidth_hz") {
+                int parsed = 0;
+                if (parseInt(value, parsed)) {
+                    processing.w0_bandwidth_hz = std::clamp(parsed, 0, 400000);
                 }
             } else if (key == "stereo_blend") {
                 const std::string parsed = toLower(trim(value));
@@ -255,11 +259,6 @@ bool Config::loadFromFile(const std::string& filename) {
                 bool parsed = false;
                 if (parseBool(value, parsed)) {
                     processing.stereo = parsed;
-                }
-            } else if (key == "rds") {
-                bool parsed = false;
-                if (parseBool(value, parsed)) {
-                    processing.rds = parsed;
                 }
             }
         } else if (section == "debug") {

@@ -72,12 +72,6 @@ void RDSDecoder::reset() {
     m_impl->reset();
 }
 
-void RDSDecoder::setAggressiveness(Aggressiveness) {}
-
-void RDSDecoder::setLockThresholds(int, int) {}
-
-void RDSDecoder::setAgcCoefficients(float, float) {}
-
 void RDSDecoder::process(const float* mpx, size_t numSamples, const std::function<void(const RDSGroup&)>& onGroup) {
     if (!mpx || numSamples == 0) {
         return;

@@ -301,13 +301,13 @@ void XDRServer::setVerboseLogging(bool enabled) {
 
 std::string XDRServer::generateSalt() {
     static const char chars[] = "QWERTYUIOPASDFGHJKLZXCVBNMqwertyuiopasdfghjklzxcvbnm0123456789_-";
-    const int len = strlen(chars);
+    constexpr size_t len = sizeof(chars) - 1;
     unsigned char random_data[SALT_LENGTH];
     
     if (!RAND_bytes(random_data, sizeof(random_data))) {
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dis(0, len - 1);
+        std::uniform_int_distribution<size_t> dis(0, len - 1);
         std::string salt;
         for (int i = 0; i < SALT_LENGTH; i++) {
             salt += chars[dis(gen)];
@@ -317,7 +317,7 @@ std::string XDRServer::generateSalt() {
     
     std::string salt;
     for (int i = 0; i < SALT_LENGTH; i++) {
-        salt += chars[random_data[i] % len];
+        salt += chars[static_cast<size_t>(random_data[i]) % len];
     }
     return salt;
 }
@@ -500,13 +500,13 @@ bool XDRServer::start() {
     }
 
     if (!ensureSocketSubsystem()) {
-        std::cerr << "Failed to initialize socket subsystem" << std::endl;
+        std::cerr << "[XDR] failed to initialize socket subsystem" << std::endl;
         return false;
     }
 
     m_serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (m_serverSocket < 0) {
-        std::cerr << "Failed to create server socket" << std::endl;
+        std::cerr << "[XDR] failed to create server socket" << std::endl;
         return false;
     }
 
@@ -525,14 +525,14 @@ bool XDRServer::start() {
     serverAddr.sin_port = htons(m_port);
 
     if (bind(m_serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        std::cerr << "Failed to bind to port " << m_port << std::endl;
+        std::cerr << "[XDR] failed to bind to port " << m_port << std::endl;
         closeSocket(m_serverSocket);
         m_serverSocket = -1;
         return false;
     }
 
     if (listen(m_serverSocket, 5) < 0) {
-        std::cerr << "Failed to listen on port " << m_port << std::endl;
+        std::cerr << "[XDR] failed to listen on port " << m_port << std::endl;
         closeSocket(m_serverSocket);
         m_serverSocket = -1;
         return false;
@@ -562,7 +562,7 @@ bool XDRServer::start() {
     });
 
     if (m_verboseLogging.load()) {
-        std::cout << "XDR server listening on port " << m_port << std::endl;
+        std::cout << "[XDR] listening on port " << m_port << std::endl;
     }
     return true;
 }
@@ -606,7 +606,7 @@ void XDRServer::handleClient(int clientSocket) {
     getpeername(clientSocket, (struct sockaddr*)&clientAddr, &clientLen);
     inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
     
-    std::cout << "Client connected from " << clientIP << std::endl;
+    std::cout << "[XDR] client connected from " << clientIP << std::endl;
     
     setRecvTimeoutMs(clientSocket, 200);
     char firstByte = '\0';
@@ -620,24 +620,24 @@ void XDRServer::handleClient(int clientSocket) {
         std::string handshake;
         if (!recvLine(clientSocket, handshake, 16) || handshake != "x") {
             if (m_verboseLogging.load()) {
-                std::cout << "Invalid FM-DX handshake payload" << std::endl;
+                std::cout << "[XDR] invalid FM-DX handshake payload" << std::endl;
             }
-            std::cout << "Client disconnected from " << clientIP << std::endl;
+            std::cout << "[XDR] client disconnected from " << clientIP << std::endl;
             return;
         }
         if (m_verboseLogging.load()) {
-            std::cout << "Detected FM-DX protocol handshake" << std::endl;
+            std::cout << "[XDR] detected FM-DX protocol handshake" << std::endl;
         }
         send(clientSocket, "1\n", 2, 0);
         handleFmdxClient(clientSocket);
     } else {
         if (m_verboseLogging.load()) {
-            std::cout << "Detected XDR protocol handshake" << std::endl;
+            std::cout << "[XDR] detected XDR protocol handshake" << std::endl;
         }
         handleXdrClient(clientSocket, clientIP);
     }
 
-    std::cout << "Client disconnected from " << clientIP << std::endl;
+    std::cout << "[XDR] client disconnected from " << clientIP << std::endl;
 }
 
 void XDRServer::handleFmdxClient(int clientSocket) {
@@ -707,7 +707,7 @@ void XDRServer::handleFmdxClient(int clientSocket) {
 
 void XDRServer::handleXdrClient(int clientSocket, const char* clientIP) {
     if (m_verboseLogging.load()) {
-        std::cout << "XDR client authenticating from " << clientIP << std::endl;
+        std::cout << "[XDR] client authenticating from " << clientIP << std::endl;
     }
     bool authenticated = false;
     bool guestSession = false;
@@ -715,7 +715,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char* clientIP) {
     std::string salt = generateSalt();
     
     if (m_verboseLogging.load()) {
-        std::cout << "Sending salt: '" << salt << "'" << std::endl;
+        std::cout << "[XDR] sending salt: '" << salt << "'" << std::endl;
     }
     
     std::string msg = salt + "\n";
@@ -724,7 +724,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char* clientIP) {
     std::string authMsg;
     if (!recvLine(clientSocket, authMsg, HASH_LENGTH + 2)) {
         if (m_verboseLogging.load()) {
-            std::cout << "Client disconnected before sending auth hash" << std::endl;
+            std::cout << "[XDR] client disconnected before sending auth hash" << std::endl;
         }
         return;
     }
@@ -736,13 +736,13 @@ void XDRServer::handleXdrClient(int clientSocket, const char* clientIP) {
     }
     
     if (m_verboseLogging.load()) {
-        std::cout << "Received auth payload: '" << authMsg << "' -> hash '" << clientHash
+        std::cout << "[XDR] received auth payload: '" << authMsg << "' -> hash '" << clientHash
                   << "' (length: " << clientHash.length() << ")" << std::endl;
     }
     
     bool authSuccess = authenticate(salt, clientHash);
     if (m_verboseLogging.load()) {
-        std::cout << "Authentication " << (authSuccess ? "SUCCESS" : "FAILED") << std::endl;
+        std::cout << "[XDR] authentication " << (authSuccess ? "SUCCESS" : "FAILED") << std::endl;
     }
     
     if (!authSuccess && !m_guestMode) {

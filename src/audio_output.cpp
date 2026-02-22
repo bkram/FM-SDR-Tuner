@@ -576,12 +576,12 @@ bool AudioOutput::initAlsa(const std::string& deviceName) {
     }
 
     if (m_verboseLogging) {
-        std::cerr << "[Audio] opening ALSA device: " << alsaDevice << "\n";
+        std::cout << "[AUDIO] opening ALSA device: " << alsaDevice << "\n";
     }
 
     int err = snd_pcm_open(&m_alsaPcm, alsaDevice.c_str(), SND_PCM_STREAM_PLAYBACK, 0);
     if (err < 0) {
-        std::cerr << "[Audio] ALSA snd_pcm_open failed: " << snd_strerror(err) << "\n";
+        std::cerr << "[AUDIO] ALSA snd_pcm_open failed: " << snd_strerror(err) << "\n";
         return false;
     }
 
@@ -597,14 +597,14 @@ bool AudioOutput::initAlsa(const std::string& deviceName) {
     int dir = 0;
     err = snd_pcm_hw_params_set_rate_near(m_alsaPcm, hwparams, &rate, &dir);
     if (err < 0) {
-        std::cerr << "[Audio] ALSA set_rate failed: " << snd_strerror(err) << "\n";
+        std::cerr << "[AUDIO] ALSA set_rate failed: " << snd_strerror(err) << "\n";
         snd_pcm_close(m_alsaPcm);
         m_alsaPcm = nullptr;
         return false;
     }
     
     if (rate != SAMPLE_RATE && m_verboseLogging) {
-        std::cerr << "[Audio] ALSA rate " << SAMPLE_RATE << " not supported, using " << rate << " (will resample)\n";
+        std::cerr << "[AUDIO] ALSA rate " << SAMPLE_RATE << " not supported, using " << rate << " (will resample)\n";
     }
 
     snd_pcm_uframes_t bufferSize = 16384;
@@ -615,7 +615,7 @@ bool AudioOutput::initAlsa(const std::string& deviceName) {
 
     err = snd_pcm_hw_params(m_alsaPcm, hwparams);
     if (err < 0) {
-        std::cerr << "[Audio] ALSA snd_pcm_hw_params failed: " << snd_strerror(err) << "\n";
+        std::cerr << "[AUDIO] ALSA snd_pcm_hw_params failed: " << snd_strerror(err) << "\n";
         snd_pcm_close(m_alsaPcm);
         m_alsaPcm = nullptr;
         return false;
@@ -631,7 +631,7 @@ bool AudioOutput::initAlsa(const std::string& deviceName) {
     snd_pcm_get_params(m_alsaPcm, &bufferSize, &periodSize);
 
     if (m_verboseLogging) {
-        std::cerr << "[Audio] ALSA initialized: rate=" << rate 
+        std::cout << "[AUDIO] ALSA initialized: rate=" << rate 
                   << " buffer=" << bufferSize << " (" << (bufferSize * 1000 / rate) << "ms)"
                   << " period=" << periodSize << "\n";
     }
@@ -722,14 +722,14 @@ void AudioOutput::runAlsaOutputThread() {
                     static std::atomic<uint32_t> underflowCount{0};
                     const uint32_t count = ++underflowCount;
                     if (count <= 5 || (count % 50) == 0) {
-                        std::cerr << "[Audio] ALSA underrun (" << count << ")\n";
+                        std::cerr << "[AUDIO] ALSA underrun (" << count << ")\n";
                     }
                 }
             } else if (frames == -EAGAIN) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             } else {
                 if (m_verboseLogging) {
-                    std::cerr << "[Audio] ALSA write error: " << snd_strerror(frames) << "\n";
+                    std::cerr << "[AUDIO] ALSA write error: " << snd_strerror(frames) << "\n";
                 }
                 snd_pcm_recover(m_alsaPcm, static_cast<int>(frames), 1);
             }
@@ -823,12 +823,12 @@ void AudioOutput::runOutputThread() {
             static std::atomic<uint32_t> underflowCount{0};
             const uint32_t count = ++underflowCount;
             if (m_verboseLogging && (count <= 5 || (count % 50) == 0)) {
-                std::cerr << "[Audio] output underflow (" << count
+                std::cerr << "[AUDIO] output underflow (" << count
                           << ") - consider higher system audio buffer/less CPU load\n";
             }
         } else if (writeErr != paNoError) {
             if (m_verboseLogging) {
-                std::cerr << "[Audio] write failed: " << Pa_GetErrorText(writeErr) << "\n";
+                std::cerr << "[AUDIO] write failed: " << Pa_GetErrorText(writeErr) << "\n";
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
@@ -905,7 +905,7 @@ void AudioOutput::runWinMMOutputThread() {
         hdr->dwBufferLength = static_cast<DWORD>(kSamplesPerBuffer * sizeof(int16_t));
         const MMRESULT wr = waveOutWrite(m_waveOut, hdr, sizeof(WAVEHDR));
         if (wr != MMSYSERR_NOERROR && m_verboseLogging) {
-            std::cerr << "[Audio] WinMM write failed: " << wr << "\n";
+            std::cerr << "[AUDIO] WinMM write failed: " << wr << "\n";
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
@@ -973,7 +973,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
     if (enableSpeaker) {
         const std::string normalizedSelector = normalizeSelector(deviceSelector);
         if (verboseLogging) {
-            std::cerr << "[Audio] device selector raw='" << deviceSelector
+            std::cout << "[AUDIO] device selector raw='" << deviceSelector
                       << "' normalized='" << normalizedSelector << "'\n";
         }
 
@@ -1028,7 +1028,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
                     m_portAudioInitialized = false;
                     return false;
                 } else if (verboseLogging) {
-                    std::cerr << "PortAudio started successfully" << std::endl;
+                    std::cout << "[AUDIO] PortAudio started successfully" << std::endl;
                 }
 
                 float primeBuffer[FRAMES_PER_BUFFER * CHANNELS] = {0.0f};
@@ -1056,7 +1056,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
     if (enableSpeaker) {
         const std::string normalizedSelector = normalizeCoreAudioSelector(deviceSelector);
         if (verboseLogging) {
-            std::cerr << "[Audio] coreaudio selector raw='" << deviceSelector
+            std::cout << "[AUDIO] coreaudio selector raw='" << deviceSelector
                       << "' normalized='" << normalizedSelector << "'\n";
         }
 
@@ -1066,11 +1066,11 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
         desc.componentManufacturer = kAudioUnitManufacturer_Apple;
         AudioComponent component = AudioComponentFindNext(nullptr, &desc);
         if (!component) {
-            std::cerr << "CoreAudio output component not found\n";
+            std::cerr << "[AUDIO] CoreAudio output component not found\n";
             return false;
         }
         if (AudioComponentInstanceNew(component, &m_audioUnit) != noErr || !m_audioUnit) {
-            std::cerr << "CoreAudio instance creation failed\n";
+            std::cerr << "[AUDIO] CoreAudio instance creation failed\n";
             m_audioUnit = nullptr;
             return false;
         }
@@ -1078,7 +1078,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
         if (!normalizedSelector.empty()) {
             AudioDeviceID selected = selectOutputDeviceCoreAudio(normalizedSelector);
             if (selected == kAudioObjectUnknown) {
-                std::cerr << "CoreAudio device not found for selector: " << normalizedSelector << "\n";
+                std::cerr << "[AUDIO] CoreAudio device not found for selector: " << normalizedSelector << "\n";
                 listCoreAudioDevices();
                 AudioComponentInstanceDispose(m_audioUnit);
                 m_audioUnit = nullptr;
@@ -1091,7 +1091,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
                                                          &selected,
                                                          sizeof(selected));
             if (selErr != noErr) {
-                std::cerr << "CoreAudio failed to select output device (status=" << selErr << ")\n";
+                std::cerr << "[AUDIO] CoreAudio failed to select output device (status=" << selErr << ")\n";
                 AudioComponentInstanceDispose(m_audioUnit);
                 m_audioUnit = nullptr;
                 return false;
@@ -1107,7 +1107,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
                                  0,
                                  &callback,
                                  sizeof(callback)) != noErr) {
-            std::cerr << "CoreAudio set render callback failed\n";
+            std::cerr << "[AUDIO] CoreAudio set render callback failed\n";
             AudioComponentInstanceDispose(m_audioUnit);
             m_audioUnit = nullptr;
             return false;
@@ -1128,27 +1128,27 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
                                  0,
                                  &asbd,
                                  sizeof(asbd)) != noErr) {
-            std::cerr << "CoreAudio set stream format failed\n";
+            std::cerr << "[AUDIO] CoreAudio set stream format failed\n";
             AudioComponentInstanceDispose(m_audioUnit);
             m_audioUnit = nullptr;
             return false;
         }
 
         if (AudioUnitInitialize(m_audioUnit) != noErr) {
-            std::cerr << "CoreAudio initialize failed\n";
+            std::cerr << "[AUDIO] CoreAudio initialize failed\n";
             AudioComponentInstanceDispose(m_audioUnit);
             m_audioUnit = nullptr;
             return false;
         }
         if (AudioOutputUnitStart(m_audioUnit) != noErr) {
-            std::cerr << "CoreAudio start failed\n";
+            std::cerr << "[AUDIO] CoreAudio start failed\n";
             AudioUnitUninitialize(m_audioUnit);
             AudioComponentInstanceDispose(m_audioUnit);
             m_audioUnit = nullptr;
             return false;
         }
         if (verboseLogging) {
-            std::cerr << "CoreAudio started successfully\n";
+            std::cout << "[AUDIO] CoreAudio started successfully\n";
         }
     }
 #endif
@@ -1157,7 +1157,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
     if (enableSpeaker) {
         const std::string normalizedSelector = trimWinMM(deviceSelector);
         if (verboseLogging) {
-            std::cerr << "[Audio] winmm selector raw='" << deviceSelector
+            std::cout << "[AUDIO] winmm selector raw='" << deviceSelector
                       << "' normalized='" << normalizedSelector << "'\n";
         }
         const UINT devId = selectWinMMDevice(normalizedSelector);
@@ -1188,7 +1188,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
         m_winmmThreadRunning = true;
         m_winmmThread = std::thread(&AudioOutput::runWinMMOutputThread, this);
         if (verboseLogging) {
-            std::cerr << "WinMM started successfully\n";
+            std::cout << "[AUDIO] WinMM started successfully\n";
         }
     }
 #endif
@@ -1197,7 +1197,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
     if (enableSpeaker) {
         std::string alsaDevice = deviceSelector.empty() ? "default" : deviceSelector;
         if (verboseLogging) {
-            std::cerr << "[Audio] device selector: " << alsaDevice << "\n";
+            std::cout << "[AUDIO] device selector: " << alsaDevice << "\n";
         }
         if (!initAlsa(alsaDevice)) {
             std::cerr << "Failed to initialize ALSA audio output" << std::endl;
@@ -1405,7 +1405,7 @@ bool AudioOutput::write(const float* left, const float* right, size_t numSamples
                 static std::atomic<uint32_t> dropCount{0};
                 const uint32_t count = ++dropCount;
                 if (count <= 5 || (count % 50) == 0) {
-                    std::cerr << "[Audio] ALSA queue overflow (" << count << ")\n";
+                    std::cerr << "[AUDIO] ALSA queue overflow (" << count << ")\n";
                 }
             }
         }
@@ -1444,7 +1444,7 @@ bool AudioOutput::write(const float* left, const float* right, size_t numSamples
                 static std::atomic<uint32_t> dropCount{0};
                 const uint32_t count = ++dropCount;
                 if (count <= 5 || (count % 50) == 0) {
-                    std::cerr << "[Audio] queue overflow (" << count
+                    std::cerr << "[AUDIO] queue overflow (" << count
                               << ") - ramping out oldest samples to prevent clicks\n";
                 }
             }
@@ -1475,7 +1475,7 @@ bool AudioOutput::write(const float* left, const float* right, size_t numSamples
                 static std::atomic<uint32_t> dropCount{0};
                 const uint32_t count = ++dropCount;
                 if (count <= 5 || (count % 50) == 0) {
-                    std::cerr << "[Audio] CoreAudio queue overflow (" << count << ")\n";
+                    std::cerr << "[AUDIO] CoreAudio queue overflow (" << count << ")\n";
                 }
             }
         }
@@ -1502,7 +1502,7 @@ bool AudioOutput::write(const float* left, const float* right, size_t numSamples
                 static std::atomic<uint32_t> dropCount{0};
                 const uint32_t count = ++dropCount;
                 if (count <= 5 || (count % 50) == 0) {
-                    std::cerr << "[Audio] WinMM queue overflow (" << count << ")\n";
+                    std::cerr << "[AUDIO] WinMM queue overflow (" << count << ")\n";
                 }
             }
         }

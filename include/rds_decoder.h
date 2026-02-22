@@ -16,19 +16,10 @@ struct RDSGroup {
 
 class RDSDecoder {
 public:
-    enum class Aggressiveness {
-        Strict = 0,
-        Balanced = 1,
-        Loose = 2
-    };
-
     explicit RDSDecoder(int inputRate);
     ~RDSDecoder();
 
     void reset();
-    void setAggressiveness(Aggressiveness mode);
-    void setLockThresholds(int acquireGroups, int lossGroups);
-    void setAgcCoefficients(float attack, float release);
     void process(const float* mpx, size_t numSamples, const std::function<void(const RDSGroup&)>& onGroup);
 
 private:
