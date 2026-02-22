@@ -31,15 +31,17 @@ jobs:
         cmake -S . -B build
         cmake --build build -j$(nproc)
 
-    - name: Package artifact
+    - name: Build Debian package
       run: |
-        mkdir -p dist/linux
-        cp build/fm-sdr-tuner dist/linux/
-        cp README.md dist/linux/
-        cp fm-sdr-tuner.ini dist/linux/
+        cd build
+        cpack -G DEB
+        mkdir -p ../dist/linux
+        cp ./*.deb ../dist/linux/
+        cp ../README.md ../dist/linux/
+        cp ../fm-sdr-tuner.ini ../dist/linux/
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: fm-sdr-tuner-linux-${{ matrix.artifact_suffix }}
+        name: fm-sdr-tuner-linux-deb-${{ matrix.artifact_suffix }}
         path: dist/linux

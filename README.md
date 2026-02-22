@@ -77,6 +77,19 @@ cmake ..
 cmake --build .
 ```
 
+Build a Debian package on Ubuntu/Debian:
+
+```bash
+cd build
+cpack -G DEB
+```
+
+Install locally:
+
+```bash
+sudo apt install ./fm-sdr-tuner_*_*.deb
+```
+
 ### Windows (vcpkg)
 
 ```bash
@@ -206,6 +219,8 @@ Current workflows exist for:
 - Linux (`x64`, `arm64`)
 - macOS
 - Windows
+
+Linux CI publishes real `.deb` artifacts for Ubuntu x64 and arm64 runners.
 
 If CI fails on dependencies, align workflow package installs with local requirements listed above.
 
