@@ -25,7 +25,7 @@ jobs:
       run: |
         if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
         $SUDO apt-get update
-        $SUDO apt-get install -y cmake pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev
+        $SUDO apt-get install -y cmake g++ pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev
 
     - name: Build
       run: |
@@ -66,7 +66,7 @@ jobs:
       run: |
         if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
         $SUDO apt-get update
-        $SUDO apt-get install -y cmake pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev
+        $SUDO apt-get install -y cmake g++ pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev
 
     - name: Build
       run: |
