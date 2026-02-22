@@ -21,21 +21,15 @@ public:
                    size_t outCapacity);
 
 private:
-    void processDCBlock(float* left, float* right, size_t samples);
-
     int m_inputRate;
     int m_outputRate;
 
     bool m_deemphasisEnabled;
-    float m_deemphAlpha;
-    float m_deemphStateLeft;
-    float m_deemphStateRight;
-
-    float m_dcBlockPrevInLeft;
-    float m_dcBlockPrevInRight;
-    float m_dcBlockPrevOutLeft;
-    float m_dcBlockPrevOutRight;
-    static constexpr float kDcBlockR = 0.995f;
+    static constexpr float kDcBlockAlpha = 0.005f;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidLeftDeemphasis;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidRightDeemphasis;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidLeftDcBlock;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidRightDcBlock;
     fm_tuner::dsp::liquid::Resampler m_liquidLeftResampler;
     fm_tuner::dsp::liquid::Resampler m_liquidRightResampler;
     std::array<float, fm_tuner::dsp::liquid::Resampler::kMaxOutput> m_liquidLeftTmp{};

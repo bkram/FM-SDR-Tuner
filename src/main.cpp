@@ -219,7 +219,7 @@ int main(int argc, char* argv[]) {
     if (verboseLogging) {
         std::cout << "[Config] audio.device='" << config.audio.device << "'\n";
         std::cout << "[Config] processing.dsp_block_samples=" << config.processing.dsp_block_samples << "\n";
-        std::cout << "[Config] processing.demodulator='" << config.processing.demodulator << "'\n";
+        std::cout << "[Config] processing.w0_bandwidth_hz=" << config.processing.w0_bandwidth_hz << "\n";
         std::cout << "[Config] processing.stereo_blend='" << config.processing.stereo_blend << "'\n";
     }
     std::string tcpHost = config.rtl_tcp.host;
@@ -648,17 +648,7 @@ int main(int argc, char* argv[]) {
     };
 
     FMDemod demod(INPUT_RATE, OUTPUT_RATE);
-    {
-        std::string demodMode = config.processing.demodulator;
-        std::transform(demodMode.begin(), demodMode.end(), demodMode.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        if (demodMode == "exact") {
-            demod.setDemodMode(FMDemod::DemodMode::Exact);
-        } else {
-            demod.setDemodMode(FMDemod::DemodMode::Fast);
-        }
-    }
+    demod.setW0BandwidthHz(config.processing.w0_bandwidth_hz);
     StereoDecoder stereo(INPUT_RATE, OUTPUT_RATE);
     {
         std::string blendMode = config.processing.stereo_blend;

@@ -2,47 +2,46 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 AFPostProcessor::AFPostProcessor(int inputRate, int outputRate)
     : m_inputRate(std::max(1, inputRate))
     , m_outputRate(std::max(1, outputRate))
-    , m_deemphasisEnabled(true)
-    , m_deemphAlpha(1.0f)
-    , m_deemphStateLeft(0.0f)
-    , m_deemphStateRight(0.0f)
-    , m_dcBlockPrevInLeft(0.0f)
-    , m_dcBlockPrevInRight(0.0f)
-    , m_dcBlockPrevOutLeft(0.0f)
-    , m_dcBlockPrevOutRight(0.0f) {
+    , m_deemphasisEnabled(false) {
     const float ratio = static_cast<float>(m_outputRate) / static_cast<float>(m_inputRate);
     m_liquidLeftResampler.init(ratio);
     m_liquidRightResampler.init(ratio);
+    m_liquidLeftDcBlock.initDCBlocker(kDcBlockAlpha);
+    m_liquidRightDcBlock.initDCBlocker(kDcBlockAlpha);
     reset();
     setDeemphasis(75);
 }
 
 void AFPostProcessor::reset() {
-    m_deemphStateLeft = 0.0f;
-    m_deemphStateRight = 0.0f;
-    m_dcBlockPrevInLeft = 0.0f;
-    m_dcBlockPrevInRight = 0.0f;
-    m_dcBlockPrevOutLeft = 0.0f;
-    m_dcBlockPrevOutRight = 0.0f;
     m_liquidLeftResampler.reset();
     m_liquidRightResampler.reset();
+    m_liquidLeftDcBlock.reset();
+    m_liquidRightDcBlock.reset();
+    if (m_deemphasisEnabled) {
+        m_liquidLeftDeemphasis.reset();
+        m_liquidRightDeemphasis.reset();
+    }
 }
 
 void AFPostProcessor::setDeemphasis(int tau_us) {
     if (tau_us <= 0) {
         m_deemphasisEnabled = false;
-        m_deemphAlpha = 1.0f;
         return;
     }
 
     m_deemphasisEnabled = true;
     const float tau = static_cast<float>(tau_us) * 1e-6f;
     const float dt = 1.0f / static_cast<float>(m_outputRate);
-    m_deemphAlpha = dt / (tau + dt);
+    const float alpha = dt / (tau + dt);
+    const std::vector<float> b = {alpha};
+    const std::vector<float> a = {1.0f, -(1.0f - alpha)};
+    m_liquidLeftDeemphasis.init(b, a);
+    m_liquidRightDeemphasis.init(b, a);
 }
 
 size_t AFPostProcessor::process(const float* inLeft,
@@ -65,35 +64,15 @@ size_t AFPostProcessor::process(const float* inLeft,
             float left = m_liquidLeftTmp[p];
             float right = m_liquidRightTmp[p];
             if (m_deemphasisEnabled) {
-                m_deemphStateLeft = (m_deemphAlpha * left) + ((1.0f - m_deemphAlpha) * m_deemphStateLeft);
-                m_deemphStateRight = (m_deemphAlpha * right) + ((1.0f - m_deemphAlpha) * m_deemphStateRight);
-                left = m_deemphStateLeft;
-                right = m_deemphStateRight;
+                left = m_liquidLeftDeemphasis.execute(left);
+                right = m_liquidRightDeemphasis.execute(right);
             }
+            left = m_liquidLeftDcBlock.execute(left);
+            right = m_liquidRightDcBlock.execute(right);
             outLeft[outCount] = left;
             outRight[outCount] = right;
             outCount++;
         }
     }
-
-    processDCBlock(outLeft, outRight, outCount);
     return outCount;
-}
-
-void AFPostProcessor::processDCBlock(float* left, float* right, size_t samples) {
-    for (size_t i = 0; i < samples; i++) {
-        const float inL = left[i];
-        const float inR = right[i];
-
-        const float outL = (inL - m_dcBlockPrevInLeft) + (kDcBlockR * m_dcBlockPrevOutLeft);
-        const float outR = (inR - m_dcBlockPrevInRight) + (kDcBlockR * m_dcBlockPrevOutRight);
-
-        m_dcBlockPrevInLeft = inL;
-        m_dcBlockPrevInRight = inR;
-        m_dcBlockPrevOutLeft = outL;
-        m_dcBlockPrevOutRight = outR;
-
-        left[i] = outL;
-        right[i] = outR;
-    }
 }

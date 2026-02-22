@@ -5,6 +5,7 @@
 #include <complex>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -46,6 +47,7 @@ public:
     FIRFilter& operator=(FIRFilter&&) = delete;
 
     void init(std::uint32_t length, float cutoff, float stopBandAtten = 60.0f, float center = 0.0f);
+    void initWithTaps(const std::vector<float>& taps, float scale = 1.0f);
     void reset();
     void push(std::complex<float> sample) const;
     std::complex<float> execute() const;
@@ -58,6 +60,9 @@ private:
     float m_cutoff = 0.0f;
     float m_stopBandAtten = 60.0f;
     float m_center = 0.0f;
+    std::vector<float> m_taps{};
+    bool m_useDirectTaps = false;
+    float m_scale = 1.0f;
 };
 
 class NCO {
@@ -81,6 +86,48 @@ private:
     nco_crcf m_object = nullptr;
     liquid_ncotype m_type = LIQUID_VCO;
     float m_angularFrequency = 0.0f;
+};
+
+class FreqDemod {
+public:
+    FreqDemod() = default;
+    ~FreqDemod();
+    FreqDemod(const FreqDemod&) = delete;
+    FreqDemod& operator=(const FreqDemod&) = delete;
+    FreqDemod(FreqDemod&&) = delete;
+    FreqDemod& operator=(FreqDemod&&) = delete;
+
+    void init(float modulationFactor);
+    void reset();
+    float execute(std::complex<float> sample) const;
+    bool ready() const { return m_object != nullptr; }
+
+private:
+    freqdem m_object = nullptr;
+    float m_modulationFactor = 1.0f;
+};
+
+class IIRFilterReal {
+public:
+    IIRFilterReal() = default;
+    ~IIRFilterReal();
+    IIRFilterReal(const IIRFilterReal&) = delete;
+    IIRFilterReal& operator=(const IIRFilterReal&) = delete;
+    IIRFilterReal(IIRFilterReal&&) = delete;
+    IIRFilterReal& operator=(IIRFilterReal&&) = delete;
+
+    void init(const std::vector<float>& b, const std::vector<float>& a);
+    void initDCBlocker(float alpha);
+    void reset();
+    float execute(float input) const;
+    bool ready() const { return m_object != nullptr; }
+
+private:
+    iirfilt_rrrf m_object = nullptr;
+    std::vector<float> m_b{};
+    std::vector<float> m_a{};
+    bool m_useDcBlocker = false;
+    float m_dcAlpha = 0.0f;
 };
 
 class Resampler {

@@ -1056,7 +1056,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string& wavFile, const std
     if (enableSpeaker) {
         const std::string normalizedSelector = normalizeCoreAudioSelector(deviceSelector);
         if (verboseLogging) {
-            std::cerr << "[Audio] coreaudio selector raw='" << deviceSelector
+            std::cerr << "[AUDIO] coreaudio selector raw='" << deviceSelector
                       << "' normalized='" << normalizedSelector << "'\n";
         }
 

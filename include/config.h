@@ -42,7 +42,7 @@ struct Config {
         int agc_mode = 2;
         bool client_gain_allowed = true;
         int dsp_block_samples = 8192;
-        std::string demodulator = "exact";
+        int w0_bandwidth_hz = 194000;
         std::string stereo_blend = "normal";
         bool stereo = true;
         bool rds = true;

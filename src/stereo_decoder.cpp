@@ -20,14 +20,6 @@ constexpr float kPilotEnvSmooth = 0.9995f;
 constexpr float kPilotEnvInject = 1.0f - kPilotEnvSmooth;
 constexpr float kPilotIqSmooth = 0.9995f;
 constexpr float kPilotIqInject = 1.0f - kPilotIqSmooth;
-
-float dotProduct(const float* a, const float* b, size_t n) {
-    float sum = 0.0f;
-    for (size_t i = 0; i < n; i++) {
-        sum += a[i] * b[i];
-    }
-    return sum;
-}
 }  // namespace
 
 StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
@@ -49,14 +41,11 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
     , m_pllMaxFreq(2.0f * kPi * 19250.0f / static_cast<float>(inputRate))
     , m_pilotCount(0)
     , m_pilotLossCount(0)
-    , m_pilotHistPos(0)
     , m_delayPos(0)
     , m_delaySamples(0)
 {
     m_pilotTaps = designBandPass(18750.0, 19250.0, 3000.0);
-    m_pilotTapsRev = m_pilotTaps;
-    std::reverse(m_pilotTapsRev.begin(), m_pilotTapsRev.end());
-    m_pilotHistory.assign(m_pilotTapsRev.size() * 2, 0.0f);
+    m_liquidPilotBandFilter.initWithTaps(m_pilotTaps, 1.0f);
     const float audioCutoffNorm = std::clamp(15000.0f / static_cast<float>(m_inputRate), 0.01f, 0.45f);
     m_liquidLeftAudioFilter.init(121, audioCutoffNorm);
     m_liquidRightAudioFilter.init(121, audioCutoffNorm);
@@ -83,10 +72,9 @@ void StereoDecoder::reset() {
     m_pllFreq = 2.0f * kPi * 19000.0f / static_cast<float>(m_inputRate);
     m_pilotCount = 0;
     m_pilotLossCount = 0;
-    m_pilotHistPos = 0;
     m_delayPos = 0;
-    std::fill(m_pilotHistory.begin(), m_pilotHistory.end(), 0.0f);
     std::fill(m_delayLine.begin(), m_delayLine.end(), 0.0f);
+    m_liquidPilotBandFilter.reset();
     m_liquidPilotPll.reset();
     m_liquidLeftAudioFilter.reset();
     m_liquidRightAudioFilter.reset();
@@ -132,15 +120,14 @@ size_t StereoDecoder::processAudio(const float* mono, float* left, float* right,
             return 1.0f;
         }
 
-        const float absQ = std::clamp((pilotMag - kPilotAbsHold) /
-                                      std::max(kPilotAbsAcquire - kPilotAbsHold, 1e-4f), 0.0f, 1.0f);
         const float ratioQ = std::clamp((pilotRatio - kPilotRatioHold) /
                                         std::max(kPilotRatioAcquire - kPilotRatioHold, 1e-4f), 0.0f, 1.0f);
         const float cohQ = std::clamp((pilotCoherence - kPilotCoherenceHold) /
                                       std::max(kPilotCoherenceAcquire - kPilotCoherenceHold, 1e-4f), 0.0f, 1.0f);
         const float pllQ = std::clamp((kPllLockHoldHz - pllErrHz) /
                                       std::max(kPllLockHoldHz - kPllLockAcquireHz, 1e-3f), 0.0f, 1.0f);
-        const float quality = std::min(absQ, std::min(ratioQ, std::min(cohQ, pllQ)));
+        (void)pilotMag;
+        const float quality = std::min(ratioQ, std::min(cohQ, pllQ));
         float qualityShaped = quality * quality;
         if (m_blendMode == BlendMode::Soft) {
             qualityShaped = std::sqrt(std::max(0.0f, quality));
@@ -167,7 +154,8 @@ size_t StereoDecoder::processAudio(const float* mono, float* left, float* right,
     for (size_t i = 0; i < numSamples; i++) {
         const float mpx = mono[i];
 
-        const float pilot = filterSample(mpx, m_pilotTapsRev, m_pilotHistory, m_pilotHistPos);
+        m_liquidPilotBandFilter.push(std::complex<float>(mpx, 0.0f));
+        const float pilot = m_liquidPilotBandFilter.execute().real();
         m_pilotBandMagnitude = (m_pilotBandMagnitude * kPilotEnvSmooth) + (std::abs(pilot) * kPilotEnvInject);
         m_mpxMagnitude = (m_mpxMagnitude * kPilotEnvSmooth) + (std::abs(mpx) * kPilotEnvInject);
         const float phaseNow = m_liquidPilotPll.phase();
@@ -235,13 +223,11 @@ size_t StereoDecoder::processAudio(const float* mono, float* left, float* right,
     const float mpxThreshold = m_stereoDetected ? kMpxMinHold : kMpxMinAcquire;
     const float pilotRatio = m_pilotBandMagnitude / std::max(m_mpxMagnitude, 1e-3f);
     const float pilotCoherence = m_pilotMagnitude / std::max(m_pilotBandMagnitude, 1e-4f);
-    const float absThreshold = m_stereoDetected ? kPilotAbsHold : kPilotAbsAcquire;
     const float ratioThreshold = m_stereoDetected ? kPilotRatioHold : kPilotRatioAcquire;
     const float coherenceThreshold = m_stereoDetected ? kPilotCoherenceHold : kPilotCoherenceAcquire;
     const float pllErrHz = std::abs(m_pllFreq - nominalPllFreq) * static_cast<float>(m_inputRate) / (2.0f * kPi);
     const float pllThreshold = m_stereoDetected ? kPllLockHoldHz : kPllLockAcquireHz;
     const bool pilotPresent = (m_mpxMagnitude > mpxThreshold) &&
-                              (m_pilotMagnitude > absThreshold) &&
                               (pilotRatio > ratioThreshold) &&
                               (pilotCoherence > coherenceThreshold) &&
                               (pllErrHz < pllThreshold);
@@ -268,24 +254,6 @@ size_t StereoDecoder::processAudio(const float* mono, float* left, float* right,
     const float calibrated = m_pilotMagnitude * 8.0f;
     m_pilotLevelTenthsKHz = std::clamp(static_cast<int>(std::round(calibrated * 750.0f)), 0, 750);
     return outCount;
-}
-
-float StereoDecoder::filterSample(float input, const std::vector<float>& taps, std::vector<float>& history, size_t& pos) {
-    if (taps.empty() || history.size() < (taps.size() * 2)) {
-        return input;
-    }
-
-    const size_t tapCount = taps.size();
-    history[pos] = input;
-    history[pos + tapCount] = input;
-    pos++;
-    if (pos >= tapCount) {
-        pos = 0;
-    }
-
-    const float* x = &history[pos];
-    const float* h = taps.data();
-    return dotProduct(x, h, tapCount);
 }
 
 std::vector<float> StereoDecoder::designBandPass(double lowHz, double highHz, double transitionHz) const {

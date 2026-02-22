@@ -9,11 +9,6 @@
 
 class FMDemod {
 public:
-    enum class DemodMode {
-        Fast = 0,
-        Exact = 1
-    };
-
     FMDemod(int inputRate, int outputRate);
     ~FMDemod();
 
@@ -27,8 +22,7 @@ public:
     void setDeviation(double deviation);
     void setBandwidthMode(int mode);
     void setBandwidthHz(int bwHz);
-    void setDemodMode(DemodMode mode);
-    DemodMode getDemodMode() const { return m_demodMode; }
+    void setW0BandwidthHz(int bwHz);
     bool isClipping() const { return m_clipping; }
     float getClippingRatio() const { return m_clippingRatio; }
 
@@ -38,28 +32,23 @@ private:
     int m_inputRate;
     int m_outputRate;
 
-    DemodMode m_demodMode;
-    float m_lastPhase;
-    bool m_haveLastPhase;
-    float m_prevI;
-    float m_prevQ;
-    bool m_havePrevIQ;
     double m_deviation;
     double m_invDeviation;
 
-    float m_deemphAlpha;
-    float m_deemphasisState;
+    bool m_deemphasisEnabled;
     int m_bandwidthMode;
+    int m_w0BandwidthHz;
 
     std::vector<float> m_demodScratch;
-    float m_iqPrevInI;
-    float m_iqPrevInQ;
-    float m_iqDcStateI;
-    float m_iqDcStateQ;
 
     bool m_clipping;
     float m_clippingRatio;
     fm_tuner::dsp::liquid::FIRFilter m_liquidIqFilter;
+    fm_tuner::dsp::liquid::FreqDemod m_liquidFreqDemod;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidIqDcBlockI;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidIqDcBlockQ;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidMonoDeemphasis;
+    fm_tuner::dsp::liquid::IIRFilterReal m_liquidMonoDcBlock;
     fm_tuner::dsp::liquid::Resampler m_liquidMonoResampler;
     std::array<float, fm_tuner::dsp::liquid::Resampler::kMaxOutput> m_liquidResampleTmp{};
 };

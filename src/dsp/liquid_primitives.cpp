@@ -59,16 +59,43 @@ void FIRFilter::init(std::uint32_t length, float cutoff, float stopBandAtten, fl
     m_cutoff = cutoff;
     m_stopBandAtten = stopBandAtten;
     m_center = center;
+    m_taps.clear();
+    m_useDirectTaps = false;
     // For low-pass filters, normalize DC gain near unity.
     // For shifted filters (e.g. band-pass via non-zero center), keep native scaling.
-    const float scale = (std::abs(m_center) < 1e-6f) ? (2.0f * m_cutoff) : 1.0f;
-    firfilt_crcf_set_scale(m_object, scale);
+    m_scale = (std::abs(m_center) < 1e-6f) ? (2.0f * m_cutoff) : 1.0f;
+    firfilt_crcf_set_scale(m_object, m_scale);
+}
+
+void FIRFilter::initWithTaps(const std::vector<float>& taps, float scale) {
+    if (taps.empty()) {
+        throw std::runtime_error("cannot create fir filter with empty taps");
+    }
+    if (m_object != nullptr) {
+        firfilt_crcf_destroy(m_object);
+    }
+    m_object = firfilt_crcf_create(const_cast<float*>(taps.data()), static_cast<unsigned int>(taps.size()));
+    if (m_object == nullptr) {
+        throw std::runtime_error("failed to create liquid firfilt_crcf from taps");
+    }
+    m_length = static_cast<std::uint32_t>(taps.size());
+    m_cutoff = 0.0f;
+    m_stopBandAtten = 0.0f;
+    m_center = 0.0f;
+    m_taps = taps;
+    m_useDirectTaps = true;
+    m_scale = scale;
+    firfilt_crcf_set_scale(m_object, m_scale);
 }
 
 void FIRFilter::reset() {
     if (m_object != nullptr) {
         firfilt_crcf_destroy(m_object);
         m_object = nullptr;
+    }
+    if (m_useDirectTaps) {
+        initWithTaps(m_taps, m_scale);
+        return;
     }
     init(m_length, m_cutoff, m_stopBandAtten, m_center);
 }
@@ -112,6 +139,104 @@ void NCO::init(liquid_ncotype type, float angularFrequency) {
     m_type = type;
     m_angularFrequency = angularFrequency;
     nco_crcf_set_frequency(m_object, m_angularFrequency);
+}
+
+FreqDemod::~FreqDemod() {
+    if (m_object != nullptr) {
+        freqdem_destroy(m_object);
+    }
+}
+
+void FreqDemod::init(float modulationFactor) {
+    if (m_object != nullptr) {
+        freqdem_destroy(m_object);
+    }
+    m_modulationFactor = modulationFactor;
+    m_object = freqdem_create(m_modulationFactor);
+    if (m_object == nullptr) {
+        throw std::runtime_error("failed to create liquid freqdem");
+    }
+}
+
+void FreqDemod::reset() {
+    if (m_object != nullptr) {
+        freqdem_reset(m_object);
+    }
+}
+
+float FreqDemod::execute(std::complex<float> sample) const {
+    if (m_object == nullptr) {
+        return 0.0f;
+    }
+    float out = 0.0f;
+    freqdem_demodulate(m_object, sample, &out);
+    return out;
+}
+
+IIRFilterReal::~IIRFilterReal() {
+    if (m_object != nullptr) {
+        iirfilt_rrrf_destroy(m_object);
+    }
+}
+
+void IIRFilterReal::init(const std::vector<float>& b, const std::vector<float>& a) {
+    if (b.empty() || a.empty()) {
+        throw std::runtime_error("iir filter requires non-empty numerator and denominator");
+    }
+    if (m_object != nullptr) {
+        iirfilt_rrrf_destroy(m_object);
+    }
+    m_b = b;
+    m_a = a;
+    m_useDcBlocker = false;
+    m_object = iirfilt_rrrf_create(const_cast<float*>(m_b.data()),
+                                   static_cast<unsigned int>(m_b.size()),
+                                   const_cast<float*>(m_a.data()),
+                                   static_cast<unsigned int>(m_a.size()));
+    if (m_object == nullptr) {
+        throw std::runtime_error("failed to create liquid iirfilt_rrrf");
+    }
+}
+
+void IIRFilterReal::initDCBlocker(float alpha) {
+    if (m_object != nullptr) {
+        iirfilt_rrrf_destroy(m_object);
+    }
+    m_useDcBlocker = true;
+    m_dcAlpha = alpha;
+    m_b.clear();
+    m_a.clear();
+    m_object = iirfilt_rrrf_create_dc_blocker(m_dcAlpha);
+    if (m_object == nullptr) {
+        throw std::runtime_error("failed to create liquid iirfilt_rrrf dc blocker");
+    }
+}
+
+void IIRFilterReal::reset() {
+    if (m_object != nullptr) {
+        iirfilt_rrrf_destroy(m_object);
+        m_object = nullptr;
+    }
+    if (m_useDcBlocker) {
+        if (m_dcAlpha <= 0.0f) {
+            return;
+        }
+        initDCBlocker(m_dcAlpha);
+    } else {
+        if (m_b.empty() || m_a.empty()) {
+            return;
+        }
+        init(m_b, m_a);
+    }
+}
+
+float IIRFilterReal::execute(float input) const {
+    if (m_object == nullptr) {
+        return input;
+    }
+    float out = 0.0f;
+    iirfilt_rrrf_execute(m_object, input, &out);
+    return out;
 }
 
 void NCO::reset() {

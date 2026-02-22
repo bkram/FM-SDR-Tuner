@@ -28,7 +28,6 @@ public:
     bool isStereo() const { return m_stereoDetected; }
 
 private:
-    float filterSample(float input, const std::vector<float>& taps, std::vector<float>& history, size_t& pos);
     std::vector<float> designBandPass(double lowHz, double highHz, double transitionHz) const;
     float windowNuttall(int n, int count) const;
 
@@ -52,13 +51,11 @@ private:
     int m_pilotCount;
     int m_pilotLossCount;
     std::vector<float> m_pilotTaps;
-    std::vector<float> m_pilotTapsRev;
-    std::vector<float> m_pilotHistory;
-    size_t m_pilotHistPos;
 
     std::vector<float> m_delayLine;
     size_t m_delayPos;
     int m_delaySamples;
+    fm_tuner::dsp::liquid::FIRFilter m_liquidPilotBandFilter;
     fm_tuner::dsp::liquid::NCO m_liquidPilotPll;
     fm_tuner::dsp::liquid::FIRFilter m_liquidLeftAudioFilter;
     fm_tuner::dsp::liquid::FIRFilter m_liquidRightAudioFilter;

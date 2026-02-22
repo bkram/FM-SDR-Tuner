@@ -8,7 +8,6 @@
 
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
-constexpr float kTwoPi = 6.28318530717958647692f;
 constexpr std::array<int, 30> kXdrFmBwHz = {
     309000, 298000, 281000, 263000, 246000, 229000, 211000, 194000,
     177000, 159000, 142000, 125000, 108000, 95000, 90000, 83000,
@@ -31,62 +30,60 @@ const std::array<float, 256>& iqNormLut() {
 FMDemod::FMDemod(int inputRate, int outputRate)
     : m_inputRate(std::max(1, inputRate))
     , m_outputRate(std::max(1, outputRate))
-    , m_demodMode(DemodMode::Fast)
-    , m_lastPhase(0.0f)
-    , m_haveLastPhase(false)
-    , m_prevI(0.0f)
-    , m_prevQ(0.0f)
-    , m_havePrevIQ(false)
     , m_deviation(75000.0)
     , m_invDeviation(0.0)
-    , m_deemphAlpha(1.0f)
-    , m_deemphasisState(0.0f)
+    , m_deemphasisEnabled(true)
     , m_bandwidthMode(0)
-    , m_iqPrevInI(0.0f)
-    , m_iqPrevInQ(0.0f)
-    , m_iqDcStateI(0.0f)
-    , m_iqDcStateQ(0.0f)
+    , m_w0BandwidthHz(194000)
     , m_clipping(false)
     , m_clippingRatio(0.0f) {
-    setDeviation(75000.0);
-    setDeemphasis(75);
     const float iqCutoffNorm = std::clamp(110000.0f / static_cast<float>(m_inputRate), 0.01f, 0.45f);
     m_liquidIqFilter.init(81, iqCutoffNorm);
+    m_liquidIqDcBlockI.initDCBlocker(0.0005f);
+    m_liquidIqDcBlockQ.initDCBlocker(0.0005f);
     const float ratio = static_cast<float>(m_outputRate) / static_cast<float>(m_inputRate);
     m_liquidMonoResampler.init(ratio);
+    m_liquidMonoDcBlock.initDCBlocker(0.0008f);
+    setDeviation(75000.0);
+    setDeemphasis(75);
 }
 
 FMDemod::~FMDemod() = default;
 
 void FMDemod::setDeemphasis(int tau_us) {
     if (tau_us <= 0) {
-        m_deemphAlpha = 1.0f;
+        m_deemphasisEnabled = false;
         return;
     }
+    m_deemphasisEnabled = true;
     const float tau = static_cast<float>(tau_us) * 1e-6f;
     const float dt = 1.0f / static_cast<float>(m_outputRate);
-    m_deemphAlpha = dt / (tau + dt);
+    const float alpha = dt / (tau + dt);
+    const std::vector<float> b = {alpha};
+    const std::vector<float> a = {1.0f, -(1.0f - alpha)};
+    m_liquidMonoDeemphasis.init(b, a);
 }
 
 void FMDemod::setDeviation(double deviation) {
     m_deviation = deviation;
-    m_invDeviation = m_inputRate / (2.0 * static_cast<double>(kPi) * deviation);
+    m_invDeviation = m_inputRate / (2.0 * static_cast<double>(kPi) * deviation); // 1/kf
+    // liquid freqdem expects kf in cycles/sample; match legacy gain:
+    // out = delta_phase * Fs / (2*pi*deviation)
+    // => kf = deviation / Fs
+    m_liquidFreqDemod.init(static_cast<float>(m_deviation / static_cast<double>(m_inputRate)));
 }
 
 void FMDemod::reset() {
-    m_lastPhase = 0.0f;
-    m_haveLastPhase = false;
-    m_prevI = 0.0f;
-    m_prevQ = 0.0f;
-    m_havePrevIQ = false;
-    m_deemphasisState = 0.0f;
-    m_iqPrevInI = 0.0f;
-    m_iqPrevInQ = 0.0f;
-    m_iqDcStateI = 0.0f;
-    m_iqDcStateQ = 0.0f;
     m_clipping = false;
     m_clippingRatio = 0.0f;
     m_liquidIqFilter.reset();
+    m_liquidFreqDemod.reset();
+    m_liquidIqDcBlockI.reset();
+    m_liquidIqDcBlockQ.reset();
+    if (m_deemphasisEnabled) {
+        m_liquidMonoDeemphasis.reset();
+    }
+    m_liquidMonoDcBlock.reset();
     m_liquidMonoResampler.reset();
 }
 
@@ -100,11 +97,12 @@ void FMDemod::setBandwidthMode(int mode) {
 }
 
 void FMDemod::setBandwidthHz(int bwHz) {
+    const int effectiveBwHz = (bwHz <= 0) ? m_w0BandwidthHz : bwHz;
     int selected = static_cast<int>(kXdrFmBwHz.size() - 1);
-    if (bwHz > 0) {
+    if (effectiveBwHz > 0) {
         int minDiff = std::numeric_limits<int>::max();
         for (int i = 0; i < static_cast<int>(kXdrFmBwHz.size()) - 1; i++) {
-            const int diff = std::abs(kXdrFmBwHz[static_cast<size_t>(i)] - bwHz);
+            const int diff = std::abs(kXdrFmBwHz[static_cast<size_t>(i)] - effectiveBwHz);
             if (diff < minDiff) {
                 minDiff = diff;
                 selected = i;
@@ -129,112 +127,31 @@ void FMDemod::setBandwidthHz(int bwHz) {
     m_liquidIqFilter.init(filterLen, cutoffNorm, stopBandAtten);
 }
 
-void FMDemod::setDemodMode(DemodMode mode) {
-    if (m_demodMode == mode) {
-        return;
-    }
-    m_demodMode = mode;
-    m_lastPhase = 0.0f;
-    m_haveLastPhase = false;
-    m_prevI = 0.0f;
-    m_prevQ = 0.0f;
-    m_havePrevIQ = false;
+void FMDemod::setW0BandwidthHz(int bwHz) {
+    m_w0BandwidthHz = std::clamp(bwHz, 0, 400000);
 }
 
 void FMDemod::demodulate(const uint8_t* iq, float* audio, size_t len) {
-    constexpr float kDcBlockR = 0.9995f;
     const auto& kIqNorm = iqNormLut();
     const uint8_t* iqPtr = iq;
     size_t clipCount = 0;
 
-    if (m_demodMode == DemodMode::Fast) {
-        float prevI = m_prevI;
-        float prevQ = m_prevQ;
-        bool havePrev = m_havePrevIQ;
-        for (size_t i = 0; i < len; i++) {
-            const uint8_t iByte = iqPtr[0];
-            const uint8_t qByte = iqPtr[1];
-            iqPtr += 2;
-            if (iByte == 0 || iByte == 255 || qByte == 0 || qByte == 255) {
-                clipCount++;
-            }
-
-            const float iRaw = kIqNorm[iByte];
-            const float qRaw = kIqNorm[qByte];
-            const float iDc = (iRaw - m_iqPrevInI) + (kDcBlockR * m_iqDcStateI);
-            const float qDc = (qRaw - m_iqPrevInQ) + (kDcBlockR * m_iqDcStateQ);
-            m_iqPrevInI = iRaw;
-            m_iqPrevInQ = qRaw;
-            m_iqDcStateI = iDc;
-            m_iqDcStateQ = qDc;
-
-            m_liquidIqFilter.push(std::complex<float>(iDc, qDc));
-            const std::complex<float> iqFilt = m_liquidIqFilter.execute();
-            const float iVal = iqFilt.real();
-            const float qVal = iqFilt.imag();
-
-            if (!havePrev) {
-                audio[i] = 0.0f;
-                prevI = iVal;
-                prevQ = qVal;
-                havePrev = true;
-                continue;
-            }
-
-            const float dI = iVal - prevI;
-            const float dQ = qVal - prevQ;
-            const float power = (iVal * iVal) + (qVal * qVal);
-            const float invPower = 1.0f / std::max(power, 1e-6f);
-            const float delta = ((iVal * dQ) - (qVal * dI)) * invPower;
-            audio[i] = delta * static_cast<float>(m_invDeviation);
-            prevI = iVal;
-            prevQ = qVal;
+    for (size_t i = 0; i < len; i++) {
+        const uint8_t iByte = iqPtr[0];
+        const uint8_t qByte = iqPtr[1];
+        iqPtr += 2;
+        if (iByte == 0 || iByte == 255 || qByte == 0 || qByte == 255) {
+            clipCount++;
         }
-        m_prevI = prevI;
-        m_prevQ = prevQ;
-        m_havePrevIQ = havePrev;
-    } else {
-        float lastPhase = m_lastPhase;
-        bool havePhase = m_haveLastPhase;
-        for (size_t i = 0; i < len; i++) {
-            const uint8_t iByte = iqPtr[0];
-            const uint8_t qByte = iqPtr[1];
-            iqPtr += 2;
-            if (iByte == 0 || iByte == 255 || qByte == 0 || qByte == 255) {
-                clipCount++;
-            }
 
-            const float iRaw = kIqNorm[iByte];
-            const float qRaw = kIqNorm[qByte];
-            const float iDc = (iRaw - m_iqPrevInI) + (kDcBlockR * m_iqDcStateI);
-            const float qDc = (qRaw - m_iqPrevInQ) + (kDcBlockR * m_iqDcStateQ);
-            m_iqPrevInI = iRaw;
-            m_iqPrevInQ = qRaw;
-            m_iqDcStateI = iDc;
-            m_iqDcStateQ = qDc;
+        const float iRaw = kIqNorm[iByte];
+        const float qRaw = kIqNorm[qByte];
+        const float iDc = m_liquidIqDcBlockI.execute(iRaw);
+        const float qDc = m_liquidIqDcBlockQ.execute(qRaw);
 
-            m_liquidIqFilter.push(std::complex<float>(iDc, qDc));
-            const std::complex<float> iqFilt = m_liquidIqFilter.execute();
-            const float phase = atan2f(iqFilt.imag(), iqFilt.real());
-
-            if (!havePhase) {
-                audio[i] = 0.0f;
-                lastPhase = phase;
-                havePhase = true;
-                continue;
-            }
-
-            float delta = phase - lastPhase;
-            if (delta > kPi) {
-                delta -= kTwoPi;
-            } else if (delta < -kPi) {
-                delta += kTwoPi;
-            }
-            audio[i] = delta * static_cast<float>(m_invDeviation);
-            lastPhase = phase;
-        }
-        m_lastPhase = lastPhase;
-        m_haveLastPhase = havePhase;
+        m_liquidIqFilter.push(std::complex<float>(iDc, qDc));
+        const std::complex<float> iqFilt = m_liquidIqFilter.execute();
+        audio[i] = m_liquidFreqDemod.execute(iqFilt);
     }
 
     m_clipping = (clipCount > 0);
@@ -246,9 +163,12 @@ size_t FMDemod::downsampleAudio(const float* demod, float* audio, size_t numSamp
     for (size_t i = 0; i < numSamples; i++) {
         const uint32_t produced = m_liquidMonoResampler.execute(demod[i], m_liquidResampleTmp);
         for (uint32_t p = 0; p < produced; p++) {
-            const float sample = m_liquidResampleTmp[p];
-            m_deemphasisState = (m_deemphAlpha * sample) + ((1.0f - m_deemphAlpha) * m_deemphasisState);
-            audio[outCount++] = m_deemphasisState;
+            float sample = m_liquidResampleTmp[p];
+            if (m_deemphasisEnabled) {
+                sample = m_liquidMonoDeemphasis.execute(sample);
+            }
+            sample = m_liquidMonoDcBlock.execute(sample);
+            audio[outCount++] = sample;
         }
     }
     return outCount;

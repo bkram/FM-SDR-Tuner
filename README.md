@@ -181,7 +181,7 @@ Supported sections/keys:
   - `agc_mode`
   - `client_gain_allowed`
   - `dsp_block_samples` (fixed DSP block size, clamped to `1024..32768`)
-  - `demodulator` (`fast` or `exact`)
+  - `w0_bandwidth_hz` (fallback bandwidth for `W0` in Hz; set `0` for widest)
   - `stereo_blend` (`soft`, `normal`, `aggressive`)
   - `stereo`
 - `[rds]`
