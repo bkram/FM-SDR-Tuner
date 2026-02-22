@@ -32,6 +32,7 @@
 #include "audio_output.h"
 #include "config.h"
 #include "rtl_sdr_device.h"
+#include "dsp/runtime.h"
 
 static std::atomic<bool> g_running(true);
 
@@ -217,6 +218,7 @@ int main(int argc, char* argv[]) {
     }
     if (verboseLogging) {
         std::cout << "[Config] audio.device='" << config.audio.device << "'\n";
+        std::cout << "[Config] processing.dsp_block_samples=" << config.processing.dsp_block_samples << "\n";
         std::cout << "[Config] processing.demodulator='" << config.processing.demodulator << "'\n";
         std::cout << "[Config] processing.stereo_blend='" << config.processing.stereo_blend << "'\n";
     }
@@ -237,6 +239,7 @@ int main(int argc, char* argv[]) {
     bool xdrGuestMode = config.xdr.guest_mode;
     uint16_t xdrPort = config.xdr.port;
     bool autoReconnect = config.reconnection.auto_reconnect;
+    std::cerr << "[DSP] runtime backend=liquid\n";
 
     auto parseTcpOption = [&](const std::string& value) -> bool {
         size_t colon = value.find(':');
@@ -672,6 +675,16 @@ int main(int argc, char* argv[]) {
         }
     }
     AFPostProcessor afPost(INPUT_RATE, OUTPUT_RATE);
+    const std::size_t dspBlockSize = static_cast<std::size_t>(std::clamp(config.processing.dsp_block_samples, 1024, 32768));
+    fm_tuner::dsp::Runtime dspRuntime(dspBlockSize, verboseLogging);
+    if (verboseLogging) {
+        std::cout << "[DSP] backend=liquid block_samples=" << dspBlockSize << "\n";
+    }
+    dspRuntime.addResetHandler([&]() {
+        demod.reset();
+        stereo.reset();
+        afPost.reset();
+    });
     int appliedBandwidthHz = requestedBandwidthHz.load();
     int appliedDeemphasis = requestedDeemphasis.load();
     bool appliedForceMono = requestedForceMono.load();
@@ -818,6 +831,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Tuner started by client\n";
         }
         connectTuner();
+        dspRuntime.reset(fm_tuner::dsp::ResetReason::Start);
         tunerActive = true;
     });
     xdrServer.setStopCallback([&]() {
@@ -825,6 +839,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Tuner stopped by client\n";
         }
         tunerActive = false;
+        dspRuntime.reset(fm_tuner::dsp::ResetReason::Stop);
         audioOut.clearRealtimeQueue();
         disconnectTuner();
     });
@@ -932,7 +947,7 @@ int main(int argc, char* argv[]) {
 
     // Direct RTL-SDR async callback is configured to 16384 bytes (8192 IQ samples).
     // Using 8192-sample reads avoids deterministic "short read" logs at 256 ksps.
-    const size_t BUF_SAMPLES = 8192;
+    const size_t BUF_SAMPLES = dspRuntime.blockSize();
     const auto noDataSleep = useDirectRtlSdr ? std::chrono::milliseconds(2)
                                              : std::chrono::milliseconds(10);
     const auto scanRetrySleep = useDirectRtlSdr ? std::chrono::milliseconds(2)
@@ -967,9 +982,7 @@ int main(int argc, char* argv[]) {
         if (rtlConnected) {
             tunerSetFrequency(scanRestoreFreqHz);
         }
-        demod.reset();
-        stereo.reset();
-        afPost.reset();
+        dspRuntime.reset(fm_tuner::dsp::ResetReason::ScanRestore);
         retuneMuteSamplesRemaining = kRetuneMuteSamples;
         retuneMuteTotalSamples = kRetuneMuteSamples;
         rdsReset = true;
@@ -1020,9 +1033,7 @@ int main(int argc, char* argv[]) {
             tunerSetFrequency(requestedFrequencyHz.load());
             audioOut.clearRealtimeQueue();
             // Clear pilot/stereo state on retune to avoid carrying lock across stations.
-            demod.reset();
-            stereo.reset();
-            afPost.reset();
+            dspRuntime.reset(fm_tuner::dsp::ResetReason::Retune);
             retuneMuteSamplesRemaining = kRetuneMuteSamples;
             retuneMuteTotalSamples = kRetuneMuteSamples;
             rdsReset = true;

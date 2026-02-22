@@ -41,6 +41,7 @@ struct Config {
     struct ProcessingSection {
         int agc_mode = 2;
         bool client_gain_allowed = true;
+        int dsp_block_samples = 8192;
         std::string demodulator = "exact";
         std::string stereo_blend = "normal";
         bool stereo = true;

@@ -1,105 +1,33 @@
 #include "stereo_decoder.h"
-#include "cpu_features.h"
 #include <algorithm>
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-#include <immintrin.h>
-#endif
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
-#include <arm_neon.h>
-#endif
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
-constexpr int kPilotAcquireBlocks = 10;
-constexpr int kPilotLossBlocks = 18;
+constexpr int kPilotAcquireBlocks = 6;
+constexpr int kPilotLossBlocks = 24;
 constexpr float kMatrixScale = 0.5f;
-constexpr float kPilotAbsAcquire = 0.0028f;
-constexpr float kPilotAbsHold = 0.0018f;
-constexpr float kPilotRatioAcquire = 0.060f;
-constexpr float kPilotRatioHold = 0.035f;
-constexpr float kMpxMinAcquire = 0.008f;
-constexpr float kMpxMinHold = 0.004f;
-constexpr float kPilotCoherenceAcquire = 0.25f;
-constexpr float kPilotCoherenceHold = 0.16f;
-constexpr float kPllLockAcquireHz = 120.0f;
-constexpr float kPllLockHoldHz = 220.0f;
+constexpr float kPilotAbsAcquire = 0.0018f;
+constexpr float kPilotAbsHold = 0.0011f;
+constexpr float kPilotRatioAcquire = 0.040f;
+constexpr float kPilotRatioHold = 0.022f;
+constexpr float kMpxMinAcquire = 0.005f;
+constexpr float kMpxMinHold = 0.0028f;
+constexpr float kPilotCoherenceAcquire = 0.18f;
+constexpr float kPilotCoherenceHold = 0.11f;
+constexpr float kPllLockAcquireHz = 180.0f;
+constexpr float kPllLockHoldHz = 320.0f;
 constexpr float kPilotEnvSmooth = 0.9995f;
 constexpr float kPilotEnvInject = 1.0f - kPilotEnvSmooth;
 constexpr float kPilotIqSmooth = 0.9995f;
 constexpr float kPilotIqInject = 1.0f - kPilotIqSmooth;
 
-float dotProductScalar(const float* a, const float* b, size_t n) {
+float dotProduct(const float* a, const float* b, size_t n) {
     float sum = 0.0f;
     for (size_t i = 0; i < n; i++) {
         sum += a[i] * b[i];
     }
     return sum;
 }
-
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
-float dotProductNeon(const float* a, const float* b, size_t n) {
-    float32x4_t sumv = vdupq_n_f32(0.0f);
-    size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        const float32x4_t av = vld1q_f32(a + i);
-        const float32x4_t bv = vld1q_f32(b + i);
-        sumv = vmlaq_f32(sumv, av, bv);
-    }
-#if defined(__aarch64__)
-    float sum = vaddvq_f32(sumv);
-#else
-    float32x2_t sum2 = vadd_f32(vget_low_f32(sumv), vget_high_f32(sumv));
-    sum2 = vpadd_f32(sum2, sum2);
-    float sum = vget_lane_f32(sum2, 0);
-#endif
-    for (; i < n; i++) {
-        sum += a[i] * b[i];
-    }
-    return sum;
-}
-#endif
-
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-float dotProductSse(const float* a, const float* b, size_t n) {
-    __m128 sumv = _mm_setzero_ps();
-    size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        const __m128 av = _mm_loadu_ps(a + i);
-        const __m128 bv = _mm_loadu_ps(b + i);
-        sumv = _mm_add_ps(sumv, _mm_mul_ps(av, bv));
-    }
-    alignas(16) float lanes[4];
-    _mm_store_ps(lanes, sumv);
-    float sum = lanes[0] + lanes[1] + lanes[2] + lanes[3];
-    for (; i < n; i++) {
-        sum += a[i] * b[i];
-    }
-    return sum;
-}
-
-#if defined(__AVX2__) && defined(__FMA__)
-float dotProductAvx2Fma(const float* a, const float* b, size_t n) {
-    __m256 sumv = _mm256_setzero_ps();
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        const __m256 av = _mm256_loadu_ps(a + i);
-        const __m256 bv = _mm256_loadu_ps(b + i);
-        sumv = _mm256_fmadd_ps(av, bv, sumv);
-    }
-    alignas(32) float lanes[8];
-    _mm256_store_ps(lanes, sumv);
-    float sum = lanes[0] + lanes[1] + lanes[2] + lanes[3] + lanes[4] + lanes[5] + lanes[6] + lanes[7];
-    for (; i < n; i++) {
-        sum += a[i] * b[i];
-    }
-    return sum;
-}
-#endif
-#endif
 }  // namespace
 
 StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
@@ -119,35 +47,25 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
     , m_pllFreq(2.0f * kPi * 19000.0f / static_cast<float>(inputRate))
     , m_pllMinFreq(2.0f * kPi * 18750.0f / static_cast<float>(inputRate))
     , m_pllMaxFreq(2.0f * kPi * 19250.0f / static_cast<float>(inputRate))
-    , m_pllAlpha(0.01f)
-    , m_pllBeta(0.0001f)
     , m_pilotCount(0)
     , m_pilotLossCount(0)
     , m_pilotHistPos(0)
-    , m_leftHistPos(0)
-    , m_rightHistPos(0)
-    , m_useNeon(false)
-    , m_useSse2(false)
-    , m_useAvx2(false)
     , m_delayPos(0)
-    , m_delaySamples(0) {
+    , m_delaySamples(0)
+{
     m_pilotTaps = designBandPass(18750.0, 19250.0, 3000.0);
     m_pilotTapsRev = m_pilotTaps;
     std::reverse(m_pilotTapsRev.begin(), m_pilotTapsRev.end());
     m_pilotHistory.assign(m_pilotTapsRev.size() * 2, 0.0f);
-    m_audioTaps = designLowPass(15000.0, 4000.0);
-    m_audioTapsRev = m_audioTaps;
-    std::reverse(m_audioTapsRev.begin(), m_audioTapsRev.end());
-    m_leftHistory.assign(m_audioTapsRev.size() * 2, 0.0f);
-    m_rightHistory.assign(m_audioTapsRev.size() * 2, 0.0f);
-    const CPUFeatures cpu = detectCPUFeatures();
-    m_useNeon = cpu.neon;
-    m_useSse2 = cpu.sse2;
-    m_useAvx2 = cpu.avx2 && cpu.fma;
+    const float audioCutoffNorm = std::clamp(15000.0f / static_cast<float>(m_inputRate), 0.01f, 0.45f);
+    m_liquidLeftAudioFilter.init(121, audioCutoffNorm);
+    m_liquidRightAudioFilter.init(121, audioCutoffNorm);
 
-    // Match SDR++ broadcast_fm delay around pilot filter latency.
     m_delaySamples = static_cast<int>((m_pilotTaps.size() > 0) ? ((m_pilotTaps.size() - 1) / 2) : 0);
     m_delayLine.assign(static_cast<size_t>(std::max(1, m_delaySamples + 1)), 0.0f);
+    const float nominalPllFreq = 2.0f * kPi * 19000.0f / static_cast<float>(m_inputRate);
+    m_liquidPilotPll.init(LIQUID_VCO, nominalPllFreq);
+    m_liquidPilotPll.setPLLBandwidth(0.01f);
 }
 
 StereoDecoder::~StereoDecoder() = default;
@@ -166,13 +84,12 @@ void StereoDecoder::reset() {
     m_pilotCount = 0;
     m_pilotLossCount = 0;
     m_pilotHistPos = 0;
-    m_leftHistPos = 0;
-    m_rightHistPos = 0;
     m_delayPos = 0;
     std::fill(m_pilotHistory.begin(), m_pilotHistory.end(), 0.0f);
-    std::fill(m_leftHistory.begin(), m_leftHistory.end(), 0.0f);
-    std::fill(m_rightHistory.begin(), m_rightHistory.end(), 0.0f);
     std::fill(m_delayLine.begin(), m_delayLine.end(), 0.0f);
+    m_liquidPilotPll.reset();
+    m_liquidLeftAudioFilter.reset();
+    m_liquidRightAudioFilter.reset();
 }
 
 void StereoDecoder::setForceStereo(bool force) {
@@ -260,21 +177,24 @@ size_t StereoDecoder::processAudio(const float* mono, float* left, float* right,
     for (size_t i = 0; i < numSamples; i++) {
         const float mpx = mono[i];
 
-        // Pilot extraction and PLL tracking (SDR++ style: pilot BPF then PLL).
         const float pilot = filterSample(mpx, m_pilotTapsRev, m_pilotHistory, m_pilotHistPos);
         m_pilotBandMagnitude = (m_pilotBandMagnitude * kPilotEnvSmooth) + (std::abs(pilot) * kPilotEnvInject);
         m_mpxMagnitude = (m_mpxMagnitude * kPilotEnvSmooth) + (std::abs(mpx) * kPilotEnvInject);
-        const float vcoI = std::cos(m_pllPhase);
-        const float vcoQ = std::sin(m_pllPhase);
+        const float phaseNow = m_liquidPilotPll.phase();
+        const float vcoI = std::cos(phaseNow);
+        const float vcoQ = std::sin(phaseNow);
         const float error = pilot * vcoQ;
-
-        m_pllFreq = std::clamp(m_pllFreq + (m_pllBeta * error), m_pllMinFreq, m_pllMaxFreq);
-        m_pllPhase += m_pllFreq + (m_pllAlpha * error);
-        if (m_pllPhase > 2.0f * kPi) {
-            m_pllPhase -= 2.0f * kPi;
-        } else if (m_pllPhase < 0.0f) {
-            m_pllPhase += 2.0f * kPi;
+        m_liquidPilotPll.stepPLL(error);
+        m_liquidPilotPll.step();
+        const float phaseNext = m_liquidPilotPll.phase();
+        float dphi = phaseNext - phaseNow;
+        if (dphi > kPi) {
+            dphi -= 2.0f * kPi;
+        } else if (dphi < -kPi) {
+            dphi += 2.0f * kPi;
         }
+        m_pllPhase = phaseNext;
+        m_pllFreq = std::clamp(dphi, m_pllMinFreq, m_pllMaxFreq);
 
         m_pilotI = (m_pilotI * kPilotIqSmooth) + ((pilot * vcoI) * kPilotIqInject);
         m_pilotQ = (m_pilotQ * kPilotIqSmooth) + ((pilot * vcoQ) * kPilotIqInject);
@@ -309,8 +229,10 @@ size_t StereoDecoder::processAudio(const float* mono, float* left, float* right,
         float leftRaw = monoNorm + ((stereoLeft - monoNorm) * m_stereoBlend);
         float rightRaw = monoNorm + ((stereoRight - monoNorm) * m_stereoBlend);
 
-        const float leftFilt = filterSample(leftRaw, m_audioTapsRev, m_leftHistory, m_leftHistPos);
-        const float rightFilt = filterSample(rightRaw, m_audioTapsRev, m_rightHistory, m_rightHistPos);
+        m_liquidLeftAudioFilter.push(std::complex<float>(leftRaw, 0.0f));
+        m_liquidRightAudioFilter.push(std::complex<float>(rightRaw, 0.0f));
+        const float leftFilt = m_liquidLeftAudioFilter.execute().real();
+        const float rightFilt = m_liquidRightAudioFilter.execute().real();
 
         left[outCount] = leftFilt;
         right[outCount] = rightFilt;
@@ -373,55 +295,7 @@ float StereoDecoder::filterSample(float input, const std::vector<float>& taps, s
 
     const float* x = &history[pos];
     const float* h = taps.data();
-
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
-    if (m_useNeon) {
-        return dotProductNeon(x, h, tapCount);
-    }
-#endif
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-#if defined(__AVX2__) && defined(__FMA__)
-    if (m_useAvx2) {
-        return dotProductAvx2Fma(x, h, tapCount);
-    }
-#endif
-    if (m_useSse2) {
-        return dotProductSse(x, h, tapCount);
-    }
-#endif
-    return dotProductScalar(x, h, tapCount);
-}
-
-std::vector<float> StereoDecoder::designLowPass(double cutoffHz, double transitionHz) const {
-    int tapCount = static_cast<int>(std::ceil(3.8 * static_cast<double>(m_inputRate) / transitionHz));
-    tapCount = std::clamp(tapCount, 63, 511);
-    if ((tapCount % 2) == 0) {
-        tapCount++;
-    }
-
-    std::vector<float> taps(static_cast<size_t>(tapCount), 0.0f);
-    const int mid = tapCount / 2;
-    const double omega = 2.0 * M_PI * cutoffHz / static_cast<double>(m_inputRate);
-    double sum = 0.0;
-
-    for (int n = 0; n < tapCount; n++) {
-        const int m = n - mid;
-        const double sinc = (m == 0)
-            ? (omega / M_PI)
-            : (std::sin(omega * static_cast<double>(m)) / (M_PI * static_cast<double>(m)));
-        const double h = sinc * windowNuttall(n, tapCount);
-        taps[static_cast<size_t>(n)] = static_cast<float>(h);
-        sum += h;
-    }
-
-    if (std::abs(sum) > 1e-12) {
-        const float invSum = static_cast<float>(1.0 / sum);
-        for (float& tap : taps) {
-            tap *= invSum;
-        }
-    }
-
-    return taps;
+    return dotProduct(x, h, tapCount);
 }
 
 std::vector<float> StereoDecoder::designBandPass(double lowHz, double highHz, double transitionHz) const {
@@ -443,7 +317,7 @@ std::vector<float> StereoDecoder::designBandPass(double lowHz, double highHz, do
             h = 2.0 * (highHz - lowHz) / fs;
         } else {
             const double mm = static_cast<double>(m);
-            h = (std::sin(2.0 * M_PI * highHz * mm / fs) - std::sin(2.0 * M_PI * lowHz * mm / fs)) / (M_PI * mm);
+            h = (std::sin(2.0 * kPi * highHz * mm / fs) - std::sin(2.0 * kPi * lowHz * mm / fs)) / (kPi * mm);
         }
         h *= windowNuttall(n, tapCount);
         taps[static_cast<size_t>(n)] = static_cast<float>(h);
@@ -461,7 +335,7 @@ std::vector<float> StereoDecoder::designBandPass(double lowHz, double highHz, do
 }
 
 float StereoDecoder::windowNuttall(int n, int count) const {
-    const double x = 2.0 * M_PI * static_cast<double>(n) / static_cast<double>(count - 1);
+    const double x = 2.0 * kPi * static_cast<double>(n) / static_cast<double>(count - 1);
     return static_cast<float>(0.355768
                             - 0.487396 * std::cos(x)
                             + 0.144232 * std::cos(2.0 * x)

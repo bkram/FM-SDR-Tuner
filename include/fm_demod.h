@@ -3,7 +3,9 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <array>
 #include <vector>
+#include "dsp/liquid_primitives.h"
 
 class FMDemod {
 public:
@@ -32,15 +34,9 @@ public:
 
 private:
     void demodulate(const uint8_t* iq, float* audio, size_t len);
-    void initAudioFilter();
-    void rebuildAudioFilter(double cutoffHz);
-    void initIQFilter();
-    void rebuildIQFilter(double cutoffHz);
-    void initDecimFilter();
 
     int m_inputRate;
     int m_outputRate;
-    int m_downsampleFactor;
 
     DemodMode m_demodMode;
     float m_lastPhase;
@@ -55,22 +51,7 @@ private:
     float m_deemphasisState;
     int m_bandwidthMode;
 
-    std::vector<float> m_audioTaps;
-    std::vector<float> m_audioTapsRev;
-    std::vector<float> m_audioHistoryLinear;
-    std::vector<float> m_decimTaps;
-    std::vector<float> m_decimTapsRev;
-    std::vector<float> m_decimHistoryLinear;
     std::vector<float> m_demodScratch;
-    size_t m_audioHistPos;
-    size_t m_decimHistPos;
-    int m_decimPhase;
-
-    std::vector<float> m_iqTaps;
-    std::vector<float> m_iqTapsRev;
-    std::vector<float> m_iqIHistory;
-    std::vector<float> m_iqQHistory;
-    size_t m_iqHistPos;
     float m_iqPrevInI;
     float m_iqPrevInQ;
     float m_iqDcStateI;
@@ -78,10 +59,9 @@ private:
 
     bool m_clipping;
     float m_clippingRatio;
-
-    bool m_useNeon;
-    bool m_useSse2;
-    bool m_useAvx2;
+    fm_tuner::dsp::liquid::FIRFilter m_liquidIqFilter;
+    fm_tuner::dsp::liquid::Resampler m_liquidMonoResampler;
+    std::array<float, fm_tuner::dsp::liquid::Resampler::kMaxOutput> m_liquidResampleTmp{};
 };
 
 #endif

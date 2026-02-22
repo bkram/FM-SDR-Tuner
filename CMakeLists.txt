@@ -142,10 +142,12 @@ else()
     find_library(LIQUID_LIBRARIES NAMES liquid)
 endif()
 if(NOT LIQUID_INCLUDE_DIRS OR NOT LIQUID_LIBRARIES)
-    message(FATAL_ERROR "liquid-dsp not found. Install liquid-dsp (libliquid).")
+    message(FATAL_ERROR "liquid-dsp not found. Install liquid-dsp (libliquid). Required for DSP and RDS pipelines.")
 endif()
 
 set(SOURCES
+    src/dsp/liquid_primitives.cpp
+    src/dsp/runtime.cpp
     src/rtl_tcp_client.cpp
     src/rtl_sdr_device.cpp
     src/fm_demod.cpp
@@ -166,6 +168,7 @@ set(SOURCES
 
 add_executable(fm-sdr-tuner ${SOURCES})
 target_compile_definitions(fm-sdr-tuner PRIVATE FM_SDR_TUNER_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_APP_LIQUID_BACKEND)
 if(FM_TUNER_ENABLE_PORTAUDIO)
     target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_PORTAUDIO)
 endif()

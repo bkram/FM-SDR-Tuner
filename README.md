@@ -180,6 +180,7 @@ Supported sections/keys:
 - `[processing]`
   - `agc_mode`
   - `client_gain_allowed`
+  - `dsp_block_samples` (fixed DSP block size, clamped to `1024..32768`)
   - `demodulator` (`fast` or `exact`)
   - `stereo_blend` (`soft`, `normal`, `aggressive`)
   - `stereo`

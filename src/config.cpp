@@ -246,6 +246,11 @@ bool Config::loadFromFile(const std::string& filename) {
                 if (parsed == "fast" || parsed == "exact") {
                     processing.demodulator = parsed;
                 }
+            } else if (key == "dsp_block_samples") {
+                int parsed = 0;
+                if (parseInt(value, parsed)) {
+                    processing.dsp_block_samples = std::clamp(parsed, 1024, 32768);
+                }
             } else if (key == "stereo_blend") {
                 const std::string parsed = toLower(trim(value));
                 if (parsed == "soft" || parsed == "normal" || parsed == "aggressive") {
