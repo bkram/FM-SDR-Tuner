@@ -149,15 +149,10 @@ bool Config::loadFromFile(const std::string& filename) {
         } else if (section == "audio") {
             if (key == "device") {
                 audio.device = value;
-            } else if (key == "output_rate") {
-                int parsed = 0;
-                if (parseInt(value, parsed) && parsed > 0) {
-                    audio.output_rate = parsed;
-                }
-            } else if (key == "buffer_size") {
-                int parsed = 0;
-                if (parseInt(value, parsed) && parsed > 0) {
-                    audio.buffer_size = parsed;
+            } else if (key == "enable_audio") {
+                bool parsed = false;
+                if (parseBool(value, parsed)) {
+                    audio.enable_audio = parsed;
                 }
             }
         } else if (section == "sdr") {
@@ -166,7 +161,7 @@ bool Config::loadFromFile(const std::string& filename) {
                 if (parseInt(value, parsed)) {
                     sdr.rtl_gain_db = parsed;
                 }
-            } else if (key == "default_custom_gain_flags" || key == "custom_gain_flags") {
+            } else if (key == "default_custom_gain_flags") {
                 int parsed = 0;
                 if (parseInt(value, parsed)) {
                     const int rf = ((parsed / 10) % 10) ? 1 : 0;
@@ -200,7 +195,17 @@ bool Config::loadFromFile(const std::string& filename) {
                 }
             }
         } else if (section == "tuner") {
-            if (key == "default_freq") {
+            if (key == "source") {
+                const std::string parsed = toLower(trim(value));
+                if (parsed == "rtl_sdr" || parsed == "rtl_tcp") {
+                    tuner.source = parsed;
+                }
+            } else if (key == "rtl_device") {
+                int parsed = 0;
+                if (parseInt(value, parsed) && parsed >= 0) {
+                    tuner.rtl_device = static_cast<uint32_t>(parsed);
+                }
+            } else if (key == "default_freq") {
                 int parsed = 0;
                 if (parseInt(value, parsed) && parsed > 0) {
                     tuner.default_freq = static_cast<uint32_t>(parsed);
@@ -219,7 +224,7 @@ bool Config::loadFromFile(const std::string& filename) {
                 }
             } else if (key == "password") {
                 xdr.password = value;
-            } else if (key == "guest_mode" || key == "guest") {
+            } else if (key == "guest_mode") {
                 bool parsed = false;
                 if (parseBool(value, parsed)) {
                     xdr.guest_mode = parsed;

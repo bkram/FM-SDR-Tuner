@@ -1,6 +1,8 @@
 #include "xdr_server.h"
 #if defined(_WIN32)
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
@@ -423,25 +425,29 @@ void XDRServer::updateRDS(uint16_t blockA, uint16_t blockB, uint16_t blockC, uin
     }
 
     const uint8_t piState = evaluatePiState(m_piBuffer, m_piErrorBuffer, m_piFill, blockA);
+    const bool blockAPresent = (blockAErr != 3);
+    const bool piDebounced = blockAPresent && (piState <= 1);
 
-    char piBuffer[16];
-    std::snprintf(piBuffer,
-                  sizeof(piBuffer),
-                  "P%04X%.*s",
-                  blockA,
-                  static_cast<int>(std::min<uint8_t>(blockAErr, 3)),
-                  "???");
-    if (m_rdsQueue.size() >= kMaxRdsQueue) {
-        m_rdsQueue.pop_front();
+    if (piDebounced) {
+        char piBuffer[16];
+        std::snprintf(piBuffer,
+                      sizeof(piBuffer),
+                      "P%04X%.*s",
+                      blockA,
+                      static_cast<int>(std::min<uint8_t>(blockAErr, 3)),
+                      "???");
+        if (m_rdsQueue.size() >= kMaxRdsQueue) {
+            m_rdsQueue.pop_front();
+        }
+        m_rdsQueue.emplace_back(m_rdsNextSeq++, std::string(piBuffer));
+        m_piLastValue = blockA;
     }
-    m_rdsQueue.emplace_back(m_rdsNextSeq++, std::string(piBuffer));
 
     if (m_rdsQueue.size() >= kMaxRdsQueue) {
         m_rdsQueue.pop_front();
     }
     m_rdsQueue.emplace_back(m_rdsNextSeq++, rLine);
     m_piLastState = piState;
-    m_piLastValue = blockA;
 }
 
 void XDRServer::setFrequencyState(uint32_t freqHz) {

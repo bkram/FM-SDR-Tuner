@@ -8,7 +8,15 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            artifact_suffix: x64
+          - runner: ubuntu-24.04-arm
+            artifact_suffix: arm64
 
     steps:
     - uses: actions/checkout@v4
@@ -16,15 +24,22 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev
+        sudo apt-get install -y cmake pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev
 
     - name: Build
       run: |
         cmake -S . -B build
         cmake --build build -j$(nproc)
 
+    - name: Package artifact
+      run: |
+        mkdir -p dist/linux
+        cp build/fm-sdr-tuner dist/linux/
+        cp README.md dist/linux/
+        cp fm-sdr-tuner.ini dist/linux/
+
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: fm-sdr-tuner-linux
-        path: build/fm-sdr-tuner
+        name: fm-sdr-tuner-linux-${{ matrix.artifact_suffix }}
+        path: dist/linux

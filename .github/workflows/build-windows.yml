@@ -7,62 +7,106 @@ on:
     branches: [main, master]
 
 jobs:
-  build:
+  build-mingw:
     runs-on: windows-latest
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install dependencies (vcpkg)
-      shell: pwsh
+    - name: Setup MSYS2 (MinGW-w64)
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          git
+          make
+          mingw-w64-x86_64-binutils
+          mingw-w64-x86_64-headers
+          mingw-w64-x86_64-crt
+          mingw-w64-x86_64-winpthreads
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-cmake
+          mingw-w64-x86_64-ninja
+          mingw-w64-x86_64-pkgconf
+          mingw-w64-x86_64-openssl
+          mingw-w64-x86_64-rtl-sdr
+
+    - name: Build and install liquid-dsp (MinGW-w64)
+      shell: msys2 {0}
       run: |
-        if (-not $env:VCPKG_INSTALLATION_ROOT) {
-          if (Test-Path "C:\vcpkg") {
-            $env:VCPKG_INSTALLATION_ROOT = "C:\vcpkg"
-          } else {
-            throw "VCPKG_INSTALLATION_ROOT is not set and C:\vcpkg was not found."
-          }
-        }
-        & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install portaudio:x64-windows openssl:x64-windows
+        git clone --depth 1 https://github.com/jgaeddert/liquid-dsp.git /tmp/liquid-dsp
+        cmake -S /tmp/liquid-dsp -B /tmp/liquid-dsp/build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_AUTOTESTS=OFF \
+          -DBUILD_BENCHMARKS=OFF \
+          -DBUILD_SANDBOX=OFF \
+          -DCMAKE_INSTALL_PREFIX=/mingw64
+        cmake --build /tmp/liquid-dsp/build -j$(nproc)
+        cmake --install /tmp/liquid-dsp/build
 
-    - name: Build
-      shell: pwsh
+    - name: Build (MinGW-w64)
+      shell: msys2 {0}
       run: |
-        $toolchain = "$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
-        cmake -S . -B build -DFM_TUNER_ENABLE_PORTAUDIO=ON -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DVCPKG_TARGET_TRIPLET=x64-windows
-        cmake --build build --config Release
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        cmake --build build -j$(nproc)
 
-    - name: Bundle runtime dependencies
-      shell: pwsh
+    - name: Smoke test CLI (MinGW-w64)
+      shell: msys2 {0}
       run: |
-        $dist = "dist/windows"
-        New-Item -ItemType Directory -Force -Path $dist | Out-Null
-        Copy-Item "build/Release/fm-sdr-tuner.exe" $dist -Force
+        ./build/fm-sdr-tuner.exe --help
 
-        $vcpkgBin = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin"
-        if (-not (Test-Path $vcpkgBin)) {
-          throw "vcpkg runtime bin directory not found: $vcpkgBin"
-        }
+    - name: Bundle runtime dependencies (MinGW-w64)
+      shell: msys2 {0}
+      run: |
+        mkdir -p dist/windows-mingw
+        cp build/fm-sdr-tuner.exe dist/windows-mingw/
+        cp README.md dist/windows-mingw/
+        cp fm-sdr-tuner.ini dist/windows-mingw/
 
-        Copy-Item (Join-Path $vcpkgBin "libssl-3-x64.dll") $dist -Force
-        Copy-Item (Join-Path $vcpkgBin "libcrypto-3-x64.dll") $dist -Force
+        mapfile -t deps < <(
+          ldd build/fm-sdr-tuner.exe \
+            | awk 'tolower($0) ~ /=> \/mingw64\/bin\/.*\.dll/ {print $3}' \
+            | sort -u
+        )
 
-        $portaudioDllCandidates = @("portaudio.dll", "portaudio_x64.dll")
-        $portaudioFound = $false
-        foreach ($dll in $portaudioDllCandidates) {
-          $src = Join-Path $vcpkgBin $dll
-          if (Test-Path $src) {
-            Copy-Item $src $dist -Force
-            $portaudioFound = $true
-            break
-          }
-        }
-        if (-not $portaudioFound) {
-          throw "Could not locate PortAudio runtime DLL in $vcpkgBin"
-        }
+        {
+          echo "Required MinGW DLL dependencies for build/fm-sdr-tuner.exe:"
+          ldd build/fm-sdr-tuner.exe
+          echo
+          echo "Copied DLL files:"
+        } > dist/windows-mingw/dependencies.txt
 
-    - name: Upload artifact
+        for dep in "${deps[@]}"; do
+          if [ -f "$dep" ]; then
+            cp "$dep" dist/windows-mingw/
+            echo "$(basename "$dep") <- $dep" >> dist/windows-mingw/dependencies.txt
+          fi
+        done
+
+        {
+          echo
+          echo "Packaged directory contents:"
+          ls -1 dist/windows-mingw
+        } >> dist/windows-mingw/dependencies.txt
+
+        cat dist/windows-mingw/dependencies.txt
+
+    - name: Smoke test packaged artifact (MinGW-w64)
+      shell: msys2 {0}
+      run: |
+        cd dist/windows-mingw
+        ./fm-sdr-tuner.exe --help
+        if ldd ./fm-sdr-tuner.exe | grep -qi "not found"; then
+          echo "ERROR: Packaged executable has missing shared library dependencies"
+          ldd ./fm-sdr-tuner.exe
+          exit 1
+        fi
+
+    - name: Upload artifact (MinGW-w64)
       uses: actions/upload-artifact@v4
       with:
-        name: fm-sdr-tuner-windows
-        path: dist/windows
+        name: fm-sdr-tuner-windows-mingw
+        path: dist/windows-mingw

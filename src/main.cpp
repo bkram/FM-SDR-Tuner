@@ -31,6 +31,7 @@
 #include "xdr_server.h"
 #include "audio_output.h"
 #include "config.h"
+#include "rtl_sdr_device.h"
 
 static std::atomic<bool> g_running(true);
 
@@ -161,6 +162,8 @@ void printUsage(const char* prog) {
               << "Options:\n"
               << "  -c, --config <file>    INI config file\n"
               << "  -t, --tcp <host:port>  rtl_tcp server address (default: localhost:1234)\n"
+              << "      --source <name>    Tuner source: rtl_tcp or rtl_sdr (default: rtl_sdr)\n"
+              << "      --rtl-device <id>  RTL-SDR device index for --source rtl_sdr (default: 0)\n"
               << "  -f, --freq <khz>      Frequency in kHz (default: 88600)\n"
               << "  -g, --gain <db>       RTL-SDR gain in dB (default: auto)\n"
               << "  -w, --wav <file>      Output WAV file\n"
@@ -217,14 +220,10 @@ int main(int argc, char* argv[]) {
         std::cout << "[Config] processing.demodulator='" << config.processing.demodulator << "'\n";
         std::cout << "[Config] processing.stereo_blend='" << config.processing.stereo_blend << "'\n";
     }
-    if (config.audio.output_rate != OUTPUT_RATE ||
-        config.audio.buffer_size != AudioOutput::FRAMES_PER_BUFFER) {
-        std::cerr << "Warning: audio.output_rate/audio.buffer_size are fixed at "
-                  << OUTPUT_RATE << "/" << AudioOutput::FRAMES_PER_BUFFER
-                  << " in current SDR architecture; INI values are ignored\n";
-    }
     std::string tcpHost = config.rtl_tcp.host;
     uint16_t tcpPort = config.rtl_tcp.port;
+    std::string tunerSource = config.tuner.source;
+    uint32_t rtlDeviceIndex = config.tuner.rtl_device;
     uint32_t freqKHz = config.tuner.default_freq;
     int gain = config.sdr.rtl_gain_db;
     const bool useSdrppGainStrategy = (config.sdr.gain_strategy == "sdrpp");
@@ -232,7 +231,7 @@ int main(int argc, char* argv[]) {
     bool allowClientGainOverride = config.processing.client_gain_allowed;
     std::string wavFile;
     std::string iqFile;
-    bool enableSpeaker = false;
+    bool enableSpeaker = config.audio.enable_audio;
     std::string audioDevice;
     std::string xdrPassword = config.xdr.password;
     bool xdrGuestMode = config.xdr.guest_mode;
@@ -285,6 +284,43 @@ int main(int argc, char* argv[]) {
         }
     };
 
+    auto parseSourceOption = [&](std::string value) -> bool {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (value == "rtl_tcp" || value == "tcp") {
+            tunerSource = "rtl_tcp";
+            return true;
+        }
+        if (value == "rtl_sdr" || value == "sdr") {
+            tunerSource = "rtl_sdr";
+            return true;
+        }
+        std::cerr << "Invalid source value: " << value << " (expected rtl_tcp or rtl_sdr)\n";
+        return false;
+    };
+
+    if (!parseSourceOption(tunerSource)) {
+        std::cerr << "Invalid tuner.source in config: " << config.tuner.source
+                  << " (expected rtl_tcp or rtl_sdr), using rtl_sdr\n";
+        tunerSource = "rtl_sdr";
+    }
+
+    auto parseDeviceIndexOption = [&](const std::string& value) -> bool {
+        try {
+            const int parsed = std::stoi(value);
+            if (parsed < 0) {
+                std::cerr << "Invalid --rtl-device value: " << value << "\n";
+                return false;
+            }
+            rtlDeviceIndex = static_cast<uint32_t>(parsed);
+            return true;
+        } catch (...) {
+            std::cerr << "Invalid --rtl-device value: " << value << "\n";
+            return false;
+        }
+    };
+
     auto readValue = [&](int& index, const std::string& current, const std::string& longName) -> std::string {
         const std::string prefix = "--" + longName + "=";
         if (current.rfind(prefix, 0) == 0) {
@@ -330,6 +366,20 @@ int main(int argc, char* argv[]) {
         if (arg == "-t" || arg == "--tcp" || arg.rfind("--tcp=", 0) == 0) {
             const std::string value = readValue(i, arg, "tcp");
             if (value.empty() || !parseTcpOption(value)) {
+                return 1;
+            }
+            continue;
+        }
+        if (arg == "--source" || arg.rfind("--source=", 0) == 0) {
+            const std::string value = readValue(i, arg, "source");
+            if (value.empty() || !parseSourceOption(value)) {
+                return 1;
+            }
+            continue;
+        }
+        if (arg == "--rtl-device" || arg.rfind("--rtl-device=", 0) == 0) {
+            const std::string value = readValue(i, arg, "rtl-device");
+            if (value.empty() || !parseDeviceIndexOption(value)) {
                 return 1;
             }
             continue;
@@ -399,7 +449,9 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
-    RTLTCPClient rtlClient(tcpHost, tcpPort);
+    RTLTCPClient rtlTcpClient(tcpHost, tcpPort);
+    RTLSDRDevice rtlSdrDevice(rtlDeviceIndex);
+    const bool useDirectRtlSdr = (tunerSource == "rtl_sdr");
     bool rtlConnected = false;
     std::atomic<uint32_t> requestedFrequencyHz(freqKHz * 1000);
     std::atomic<int> requestedCustomGain(defaultCustomGainFlags);
@@ -412,6 +464,38 @@ int main(int argc, char* argv[]) {
     std::atomic<bool> pendingGain(false);
     std::atomic<bool> pendingAGC(false);
     std::atomic<bool> pendingBandwidth(false);
+
+    auto tunerName = [&]() -> const char* {
+        return useDirectRtlSdr ? "rtl_sdr" : "rtl_tcp";
+    };
+    auto tunerConnect = [&]() -> bool {
+        return useDirectRtlSdr ? rtlSdrDevice.connect() : rtlTcpClient.connect();
+    };
+    auto tunerDisconnect = [&]() {
+        if (useDirectRtlSdr) {
+            rtlSdrDevice.disconnect();
+        } else {
+            rtlTcpClient.disconnect();
+        }
+    };
+    auto tunerSetFrequency = [&](uint32_t freqHz) -> bool {
+        return useDirectRtlSdr ? rtlSdrDevice.setFrequency(freqHz) : rtlTcpClient.setFrequency(freqHz);
+    };
+    auto tunerSetSampleRate = [&](uint32_t sampleRate) -> bool {
+        return useDirectRtlSdr ? rtlSdrDevice.setSampleRate(sampleRate) : rtlTcpClient.setSampleRate(sampleRate);
+    };
+    auto tunerSetGainMode = [&](bool manual) -> bool {
+        return useDirectRtlSdr ? rtlSdrDevice.setGainMode(manual) : rtlTcpClient.setGainMode(manual);
+    };
+    auto tunerSetGain = [&](uint32_t gainTenthsDb) -> bool {
+        return useDirectRtlSdr ? rtlSdrDevice.setGain(gainTenthsDb) : rtlTcpClient.setGain(gainTenthsDb);
+    };
+    auto tunerSetAgc = [&](bool enable) -> bool {
+        return useDirectRtlSdr ? rtlSdrDevice.setAGC(enable) : rtlTcpClient.setAGC(enable);
+    };
+    auto tunerReadIQ = [&](uint8_t* buffer, size_t maxSamples) -> size_t {
+        return useDirectRtlSdr ? rtlSdrDevice.readIQ(buffer, maxSamples) : rtlTcpClient.readIQ(buffer, maxSamples);
+    };
 
     auto formatCustomGain = [&](int custom) -> std::string {
         const int rf = ((custom / 10) % 10) ? 1 : 0;
@@ -462,13 +546,13 @@ int main(int argc, char* argv[]) {
             bool okAgc = false;
             bool okGain = true;
             if (gain >= 0) {
-                okGainMode = rtlClient.setGainMode(true);
-                okGain = rtlClient.setGain(static_cast<uint32_t>(std::clamp(gain, 0, 49) * 10));
+                okGainMode = tunerSetGainMode(true);
+                okGain = tunerSetGain(static_cast<uint32_t>(std::clamp(gain, 0, 49) * 10));
             } else {
-                okGainMode = rtlClient.setGainMode(true);
-                okGain = rtlClient.setGain(static_cast<uint32_t>(config.sdr.sdrpp_rtl_agc_gain_db * 10));
+                okGainMode = tunerSetGainMode(true);
+                okGain = tunerSetGain(static_cast<uint32_t>(config.sdr.sdrpp_rtl_agc_gain_db * 10));
             }
-            okAgc = rtlClient.setAGC(config.sdr.sdrpp_rtl_agc);
+            okAgc = tunerSetAgc(config.sdr.sdrpp_rtl_agc);
             if (verboseLogging) {
                 std::cout << "[RTL] " << reason
                           << " strategy=sdrpp"
@@ -497,12 +581,12 @@ int main(int argc, char* argv[]) {
         bool okGain = true;
 
         if (imsAgc) {
-            okGainMode = rtlClient.setGainMode(false);
-            okAgc = rtlClient.setAGC(true);
+            okGainMode = tunerSetGainMode(false);
+            okAgc = tunerSetAgc(true);
         } else {
-            okGainMode = rtlClient.setGainMode(true);
-            okAgc = rtlClient.setAGC(false);
-            okGain = rtlClient.setGain(static_cast<uint32_t>(gainDb * 10));
+            okGainMode = tunerSetGainMode(true);
+            okAgc = tunerSetAgc(false);
+            okGain = tunerSetGain(static_cast<uint32_t>(gainDb * 10));
         }
 
         if (verboseLogging) {
@@ -525,11 +609,22 @@ int main(int argc, char* argv[]) {
 
     auto connectTuner = [&]() {
         if (!rtlConnected) {
-            std::cout << "Connecting to rtl_tcp at " << tcpHost << ":" << tcpPort << "...\n";
-            if (rtlClient.connect()) {
+            if (useDirectRtlSdr) {
+                std::cout << "Connecting to rtl_sdr device " << rtlDeviceIndex << "...\n";
+            } else {
+                std::cout << "Connecting to rtl_tcp at " << tcpHost << ":" << tcpPort << "...\n";
+            }
+            if (tunerConnect()) {
                 std::cout << "Connected. Setting frequency to " << freqKHz << " kHz...\n";
-                rtlClient.setFrequency(requestedFrequencyHz.load());
-                rtlClient.setSampleRate(INPUT_RATE);
+                const bool okFreq = tunerSetFrequency(requestedFrequencyHz.load());
+                const bool okRate = tunerSetSampleRate(INPUT_RATE);
+                if (!okFreq || !okRate) {
+                    std::cerr << "Warning: Failed to initialize " << tunerName()
+                              << " stream (setFrequency=" << (okFreq ? 1 : 0)
+                              << ", setSampleRate=" << (okRate ? 1 : 0) << ")\n";
+                    tunerDisconnect();
+                    return;
+                }
                 if (verboseLogging) {
                     std::cout << "Applying TEF AGC mode " << requestedAGCMode.load()
                               << " and custom gain flags G" << requestedCustomGain.load() << "...\n";
@@ -537,16 +632,16 @@ int main(int argc, char* argv[]) {
                 rtlConnected = true;
                 applyRtlGainAndAgc("connect/apply");
             } else {
-                std::cerr << "Warning: Failed to connect to rtl_tcp server\n";
+                std::cerr << "Warning: Failed to connect to " << tunerName() << "\n";
             }
         }
     };
 
     auto disconnectTuner = [&]() {
         if (rtlConnected) {
-            rtlClient.disconnect();
+            tunerDisconnect();
             rtlConnected = false;
-            std::cout << "Disconnected from rtl_tcp\n";
+            std::cout << "Disconnected from " << tunerName() << "\n";
         }
     };
 
@@ -604,7 +699,7 @@ int main(int argc, char* argv[]) {
     const std::string& audioDeviceToUse = !audioDevice.empty() ? audioDevice : config.audio.device;
     if (!audioOut.init(enableSpeaker, wavFile, audioDeviceToUse, verboseLogging)) {
         std::cerr << "Failed to initialize audio output\n";
-        rtlClient.disconnect();
+        tunerDisconnect();
         return 1;
     }
     audioOut.setVolumePercent(requestedVolume.load());
@@ -618,7 +713,7 @@ int main(int argc, char* argv[]) {
         if (!iqHandle) {
             std::cerr << "Failed to open IQ output file: " << iqFile << "\n";
             audioOut.shutdown();
-            rtlClient.disconnect();
+            tunerDisconnect();
             return 1;
         }
         if (verboseLogging) {
@@ -634,6 +729,7 @@ int main(int argc, char* argv[]) {
 
     std::atomic<bool> tunerActive(false);
     const bool autoStartForIqCapture = !iqFile.empty();
+    const bool autoStartTuner = false;
 
     XDRServer xdrServer(xdrPort);
     xdrServer.setVerboseLogging(verboseLogging);
@@ -729,6 +825,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Tuner stopped by client\n";
         }
         tunerActive = false;
+        audioOut.clearRealtimeQueue();
         disconnectTuner();
     });
 
@@ -736,14 +833,14 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to start XDR server\n";
     }
 
-    if (autoStartForIqCapture) {
+    if (autoStartTuner) {
         if (verboseLogging) {
-            std::cout << "[IQ] auto-starting tuner for IQ capture mode\n";
+            std::cout << "[AUTO] auto-starting tuner for local mode\n";
         }
         connectTuner();
         tunerActive = rtlConnected;
         if (!rtlConnected) {
-            std::cerr << "[IQ] warning: auto-start requested but rtl_tcp connect failed\n";
+            std::cerr << "[AUTO] warning: auto-start requested but " << tunerName() << " connect failed\n";
         }
     }
 
@@ -833,7 +930,13 @@ int main(int argc, char* argv[]) {
         std::cout << "Press Ctrl+C to stop.\n";
     }
 
+    // Direct RTL-SDR async callback is configured to 16384 bytes (8192 IQ samples).
+    // Using 8192-sample reads avoids deterministic "short read" logs at 256 ksps.
     const size_t BUF_SAMPLES = 8192;
+    const auto noDataSleep = useDirectRtlSdr ? std::chrono::milliseconds(2)
+                                             : std::chrono::milliseconds(10);
+    const auto scanRetrySleep = useDirectRtlSdr ? std::chrono::milliseconds(2)
+                                                : std::chrono::milliseconds(5);
     std::vector<uint8_t> iqBufferStorage(BUF_SAMPLES * 2, 0);
     std::vector<float> demodBufferStorage(BUF_SAMPLES, 0.0f);
     std::vector<float> stereoLeftStorage(BUF_SAMPLES, 0.0f);
@@ -862,7 +965,7 @@ int main(int argc, char* argv[]) {
         requestedFrequencyHz.store(scanRestoreFreqHz, std::memory_order_relaxed);
         pendingFrequency.store(true, std::memory_order_release);
         if (rtlConnected) {
-            rtlClient.setFrequency(scanRestoreFreqHz);
+            tunerSetFrequency(scanRestoreFreqHz);
         }
         demod.reset();
         stereo.reset();
@@ -914,7 +1017,8 @@ int main(int argc, char* argv[]) {
         }
 
         if (rtlConnected && pendingFrequency.exchange(false)) {
-            rtlClient.setFrequency(requestedFrequencyHz.load());
+            tunerSetFrequency(requestedFrequencyHz.load());
+            audioOut.clearRealtimeQueue();
             // Clear pilot/stereo state on retune to avoid carrying lock across stations.
             demod.reset();
             stereo.reset();
@@ -961,16 +1065,16 @@ int main(int argc, char* argv[]) {
                     break;
                 }
 
-                rtlClient.setFrequency(static_cast<uint32_t>(f) * 1000U);
+                tunerSetFrequency(static_cast<uint32_t>(f) * 1000U);
 
                 double powerAccum = 0.0;
                 int validReads = 0;
                 for (int avg = 0; avg < 3; avg++) {
                     size_t samples = 0;
                     for (int retries = 0; retries < 2 && samples == 0; retries++) {
-                        samples = rtlClient.readIQ(iqBuffer, BUF_SAMPLES);
+                        samples = tunerReadIQ(iqBuffer, BUF_SAMPLES);
                         if (samples == 0) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                            std::this_thread::sleep_for(scanRetrySleep);
                         }
                     }
                     if (samples > 0) {
@@ -1030,7 +1134,7 @@ int main(int argc, char* argv[]) {
             appliedForceMono = targetForceMono;
         }
 
-        size_t samples = rtlClient.readIQ(iqBuffer, BUF_SAMPLES);
+        size_t samples = tunerReadIQ(iqBuffer, BUF_SAMPLES);
         if (samples == 0) {
             consecutiveReadFailures++;
             if (autoReconnect && rtlConnected && consecutiveReadFailures >= 20) {
@@ -1039,7 +1143,7 @@ int main(int argc, char* argv[]) {
                 connectTuner();
                 consecutiveReadFailures = 0;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(noDataSleep);
             continue;
         }
         writeIqCapture(iqBuffer, samples);
@@ -1104,7 +1208,9 @@ int main(int argc, char* argv[]) {
                 audioRight[i] = mono;
             }
         } else {
-            demod.processNoDownsample(iqBuffer, demodBuffer, samples);
+            // Feed RDS with full-rate discriminator MPX (includes 57 kHz RDS subcarrier).
+            // redsea expects composite MPX, not post-audio-filtered baseband.
+            demod.processSplit(iqBuffer, demodBuffer, nullptr, samples);
             queueRdsBlock(demodBuffer, samples);
             const size_t stereoSamples = stereo.processAudio(demodBuffer, stereoLeft, stereoRight, samples);
             outSamples = afPost.process(stereoLeft, stereoRight, stereoSamples, audioLeft, audioRight, BUF_SAMPLES);
@@ -1163,7 +1269,7 @@ int main(int argc, char* argv[]) {
         iqHandle = nullptr;
     }
     xdrServer.stop();
-    rtlClient.disconnect();
+    tunerDisconnect();
 
     std::cout << "Shutdown complete.\n";
     return 0;

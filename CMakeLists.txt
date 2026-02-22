@@ -8,8 +8,22 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 include(CheckCXXCompilerFlag)
 
 option(FM_TUNER_ENABLE_X86_AVX2 "Enable AVX2/FMA compile flags on x86 targets" ON)
-option(FM_TUNER_ENABLE_PORTAUDIO "Enable PortAudio for audio output (macOS/Windows)" OFF)
-option(FM_TUNER_ENABLE_ALSA "Enable ALSA for audio output (Linux)" OFF)
+set(FM_TUNER_DEFAULT_PORTAUDIO OFF)
+if(WIN32)
+    set(FM_TUNER_DEFAULT_PORTAUDIO OFF)
+endif()
+option(FM_TUNER_ENABLE_PORTAUDIO "Enable PortAudio for audio output (macOS/Windows)" ${FM_TUNER_DEFAULT_PORTAUDIO})
+set(FM_TUNER_ENABLE_ALSA OFF)
+if(UNIX AND NOT APPLE)
+    set(FM_TUNER_ENABLE_ALSA ON)
+endif()
+
+if(APPLE)
+    set(FM_TUNER_ENABLE_PORTAUDIO OFF CACHE BOOL "PortAudio is disabled on macOS (native Core Audio backend is used)" FORCE)
+endif()
+if(WIN32)
+    set(FM_TUNER_ENABLE_PORTAUDIO OFF CACHE BOOL "PortAudio is disabled on Windows (native WinMM backend is used)" FORCE)
+endif()
 
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
@@ -94,13 +108,56 @@ if(FM_TUNER_ENABLE_ALSA)
     endif()
 endif()
 
+if(APPLE)
+    find_library(COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
+    find_library(AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
+    find_library(AUDIOUNIT_FRAMEWORK AudioUnit REQUIRED)
+    find_library(COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+endif()
+if(WIN32)
+    find_library(WINMM_LIB winmm REQUIRED)
+endif()
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(PC_RTLSDR QUIET IMPORTED_TARGET librtlsdr)
+    pkg_check_modules(PC_LIQUID QUIET IMPORTED_TARGET liquid)
+endif()
+if(PC_RTLSDR_FOUND)
+    set(RTLSDR_INCLUDE_DIRS ${PC_RTLSDR_INCLUDE_DIRS})
+    set(RTLSDR_LIBRARIES ${PC_RTLSDR_LIBRARIES})
+else()
+    find_path(RTLSDR_INCLUDE_DIRS NAMES rtl-sdr.h)
+    find_library(RTLSDR_LIBRARIES NAMES rtlsdr)
+endif()
+if(NOT RTLSDR_INCLUDE_DIRS OR NOT RTLSDR_LIBRARIES)
+    message(FATAL_ERROR "librtlsdr not found. Install librtlsdr.")
+endif()
+
+if(PC_LIQUID_FOUND)
+    set(LIQUID_INCLUDE_DIRS ${PC_LIQUID_INCLUDE_DIRS})
+    set(LIQUID_LIBRARIES ${PC_LIQUID_LIBRARIES})
+else()
+    find_path(LIQUID_INCLUDE_DIRS NAMES liquid/liquid.h)
+    find_library(LIQUID_LIBRARIES NAMES liquid)
+endif()
+if(NOT LIQUID_INCLUDE_DIRS OR NOT LIQUID_LIBRARIES)
+    message(FATAL_ERROR "liquid-dsp not found. Install liquid-dsp (libliquid).")
+endif()
+
 set(SOURCES
     src/rtl_tcp_client.cpp
+    src/rtl_sdr_device.cpp
     src/fm_demod.cpp
     src/stereo_decoder.cpp
     src/af_post_processor.cpp
     src/cpu_features.cpp
     src/rds_decoder.cpp
+    src/redsea_port/block_sync.cpp
+    src/redsea_port/group.cpp
+    src/redsea_port/dsp/liquid_wrappers.cpp
+    src/redsea_port/dsp/subcarrier.cpp
+    src/redsea_port/util/util.cpp
     src/xdr_server.cpp
     src/audio_output.cpp
     src/config.cpp
@@ -115,6 +172,13 @@ endif()
 if(FM_TUNER_ENABLE_ALSA)
     target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_ALSA)
 endif()
+if(APPLE)
+    target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_COREAUDIO)
+endif()
+if(WIN32)
+    target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_WINMM)
+endif()
+target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_RTLSDR)
 
 if(FM_TUNER_ENABLE_X86_AVX2)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)$")
@@ -167,8 +231,28 @@ if(FM_TUNER_ENABLE_ALSA)
         target_link_libraries(fm-sdr-tuner PRIVATE ${ALSA_LIBRARIES})
     endif()
 endif()
+if(PC_RTLSDR_FOUND AND TARGET PkgConfig::PC_RTLSDR)
+    target_link_libraries(fm-sdr-tuner PRIVATE PkgConfig::PC_RTLSDR)
+else()
+    target_include_directories(fm-sdr-tuner PRIVATE ${RTLSDR_INCLUDE_DIRS})
+    target_link_libraries(fm-sdr-tuner PRIVATE ${RTLSDR_LIBRARIES})
+endif()
+if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
+    target_link_libraries(fm-sdr-tuner PRIVATE PkgConfig::PC_LIQUID)
+else()
+    target_include_directories(fm-sdr-tuner PRIVATE ${LIQUID_INCLUDE_DIRS})
+    target_link_libraries(fm-sdr-tuner PRIVATE ${LIQUID_LIBRARIES})
+endif()
 if(WIN32)
-    target_link_libraries(fm-sdr-tuner PRIVATE ws2_32)
+    target_link_libraries(fm-sdr-tuner PRIVATE ws2_32 ${WINMM_LIB})
+endif()
+if(APPLE)
+    target_link_libraries(fm-sdr-tuner PRIVATE
+        ${COREAUDIO_FRAMEWORK}
+        ${AUDIOTOOLBOX_FRAMEWORK}
+        ${AUDIOUNIT_FRAMEWORK}
+        ${COREFOUNDATION_FRAMEWORK}
+    )
 endif()
 
 install(TARGETS fm-sdr-tuner DESTINATION bin)
