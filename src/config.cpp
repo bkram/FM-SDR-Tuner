@@ -192,6 +192,11 @@ bool Config::loadFromFile(const std::string& filename) {
                 if (parseDouble(value, parsed)) {
                     sdr.signal_ceil_dbfs = parsed;
                 }
+            } else if (key == "dbf_compensation_factor") {
+                double parsed = 0.0;
+                if (parseDouble(value, parsed)) {
+                    sdr.dbf_compensation_factor = std::clamp(parsed, 0.1, 4.0);
+                }
             }
         } else if (section == "tuner") {
             if (key == "source") {
@@ -249,6 +254,11 @@ bool Config::loadFromFile(const std::string& filename) {
                 int parsed = 0;
                 if (parseInt(value, parsed)) {
                     processing.w0_bandwidth_hz = std::clamp(parsed, 0, 400000);
+                }
+            } else if (key == "dsp_agc") {
+                const std::string parsed = toLower(trim(value));
+                if (parsed == "off" || parsed == "fast" || parsed == "slow") {
+                    processing.dsp_agc = parsed;
                 }
             } else if (key == "stereo_blend") {
                 const std::string parsed = toLower(trim(value));

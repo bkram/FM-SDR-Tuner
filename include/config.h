@@ -23,6 +23,7 @@ struct Config {
         int sdrpp_rtl_agc_gain_db = 18;
         double signal_floor_dbfs = -55.0;
         double signal_ceil_dbfs = -19.0;
+        double dbf_compensation_factor = 1.0;
     } sdr;
 
     struct TunerSection {
@@ -43,6 +44,7 @@ struct Config {
         bool client_gain_allowed = true;
         int dsp_block_samples = 8192;
         int w0_bandwidth_hz = 194000;
+        std::string dsp_agc = "off"; // off|fast|slow
         std::string stereo_blend = "normal";
         bool stereo = true;
     } processing;

@@ -220,7 +220,9 @@ int main(int argc, char* argv[]) {
         std::cout << "[Config] audio.device='" << config.audio.device << "'\n";
         std::cout << "[Config] processing.dsp_block_samples=" << config.processing.dsp_block_samples << "\n";
         std::cout << "[Config] processing.w0_bandwidth_hz=" << config.processing.w0_bandwidth_hz << "\n";
+        std::cout << "[Config] processing.dsp_agc='" << config.processing.dsp_agc << "'\n";
         std::cout << "[Config] processing.stereo_blend='" << config.processing.stereo_blend << "'\n";
+        std::cout << "[Config] sdr.dbf_compensation_factor=" << config.sdr.dbf_compensation_factor << "\n";
     }
     std::string tcpHost = config.rtl_tcp.host;
     uint16_t tcpPort = config.rtl_tcp.port;
@@ -540,6 +542,7 @@ int main(int argc, char* argv[]) {
         return calculateAppliedGainDb();
     };
     constexpr double kSignalGainCompFactor = 0.5;
+    const double dbfCompFactor = std::clamp(config.sdr.dbf_compensation_factor, 0.1, 4.0);
 
     auto applyRtlGainAndAgc = [&](const char* reason) {
         if (!rtlConnected) {
@@ -651,6 +654,19 @@ int main(int argc, char* argv[]) {
 
     FMDemod demod(INPUT_RATE, OUTPUT_RATE);
     demod.setW0BandwidthHz(config.processing.w0_bandwidth_hz);
+    {
+        std::string dspAgc = config.processing.dsp_agc;
+        std::transform(dspAgc.begin(), dspAgc.end(), dspAgc.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (dspAgc == "fast") {
+            demod.setDspAgcMode(FMDemod::DspAgcMode::Fast);
+        } else if (dspAgc == "slow") {
+            demod.setDspAgcMode(FMDemod::DspAgcMode::Slow);
+        } else {
+            demod.setDspAgcMode(FMDemod::DspAgcMode::Off);
+        }
+    }
     StereoDecoder stereo(INPUT_RATE, OUTPUT_RATE);
     {
         std::string blendMode = config.processing.stereo_blend;
@@ -1076,7 +1092,7 @@ int main(int argc, char* argv[]) {
                 const double kRfFloorDbfs = config.sdr.signal_floor_dbfs;
                 const double kRfCeilDbfs = std::max(config.sdr.signal_ceil_dbfs, kRfFloorDbfs + 1.0);
                 const double norm = (compensatedDbfs - kRfFloorDbfs) / (kRfCeilDbfs - kRfFloorDbfs);
-                const float rfLevel = std::clamp(static_cast<float>(norm * 90.0), 0.0f, 90.0f);
+                const float rfLevel = std::clamp(static_cast<float>(norm * 120.0 * dbfCompFactor), 0.0f, 120.0f);
 
                 if (!firstPoint) {
                     scanLine << ",";
@@ -1165,7 +1181,7 @@ int main(int argc, char* argv[]) {
         const double kRfFloorDbfs = config.sdr.signal_floor_dbfs;
         const double kRfCeilDbfs = std::max(config.sdr.signal_ceil_dbfs, kRfFloorDbfs + 1.0);
         const double norm = (compensatedDbfs - kRfFloorDbfs) / (kRfCeilDbfs - kRfFloorDbfs);
-        const float rfLevel = std::clamp(static_cast<float>(norm * 90.0), 0.0f, 90.0f);
+        const float rfLevel = std::clamp(static_cast<float>(norm * 120.0 * dbfCompFactor), 0.0f, 120.0f);
         if (!rfLevelInitialized) {
             rfLevelFiltered = rfLevel;
             rfLevelInitialized = true;

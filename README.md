@@ -170,6 +170,7 @@ Supported sections/keys:
   - `sdrpp_rtl_agc_gain_db`
   - `signal_floor_dbfs`
   - `signal_ceil_dbfs`
+  - `dbf_compensation_factor` (multiplier applied to mapped dBf level before clamp)
 - `[tuner]`
   - `source` (`rtl_sdr` or `rtl_tcp`)
   - `rtl_device` (RTL-SDR index for direct mode)
@@ -182,6 +183,7 @@ Supported sections/keys:
   - `client_gain_allowed`
   - `dsp_block_samples` (fixed DSP block size, clamped to `1024..32768`)
   - `w0_bandwidth_hz` (fallback bandwidth for `W0` in Hz; set `0` for widest)
+  - `dsp_agc` (`off`, `fast`, `slow`; optional IQ-domain AGC before FM demod)
   - `stereo_blend` (`soft`, `normal`, `aggressive`)
   - `stereo`
 - `[debug]`

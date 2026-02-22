@@ -9,6 +9,12 @@
 
 class FMDemod {
 public:
+    enum class DspAgcMode {
+        Off = 0,
+        Fast = 1,
+        Slow = 2
+    };
+
     FMDemod(int inputRate, int outputRate);
     ~FMDemod();
 
@@ -23,6 +29,7 @@ public:
     void setBandwidthMode(int mode);
     void setBandwidthHz(int bwHz);
     void setW0BandwidthHz(int bwHz);
+    void setDspAgcMode(DspAgcMode mode);
     bool isClipping() const { return m_clipping; }
     float getClippingRatio() const { return m_clippingRatio; }
 
@@ -37,6 +44,7 @@ private:
     bool m_deemphasisEnabled;
     int m_bandwidthMode;
     int m_w0BandwidthHz;
+    DspAgcMode m_dspAgcMode;
 
     std::vector<float> m_demodScratch;
 
@@ -49,6 +57,7 @@ private:
     fm_tuner::dsp::liquid::IIRFilterReal m_liquidMonoDeemphasis;
     fm_tuner::dsp::liquid::IIRFilterReal m_liquidMonoDcBlock;
     fm_tuner::dsp::liquid::Resampler m_liquidMonoResampler;
+    fm_tuner::dsp::liquid::AGC m_liquidIqAgc;
     std::array<float, fm_tuner::dsp::liquid::Resampler::kMaxOutput> m_liquidResampleTmp{};
 };
 
