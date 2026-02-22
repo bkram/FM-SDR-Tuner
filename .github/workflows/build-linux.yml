@@ -87,3 +87,55 @@ jobs:
       with:
         name: fm-sdr-tuner-linux-deb-debian-trixie-${{ matrix.arch }}
         path: dist/linux
+
+  smoke-test-deb-install:
+    needs:
+      - build-ubuntu-24-04
+      - build-debian-trixie
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+
+    steps:
+    - name: Download Ubuntu package artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: fm-sdr-tuner-linux-deb-ubuntu-24.04-${{ matrix.arch }}
+        path: /tmp/artifacts/ubuntu
+
+    - name: Download Debian package artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: fm-sdr-tuner-linux-deb-debian-trixie-${{ matrix.arch }}
+        path: /tmp/artifacts/debian
+
+    - name: Smoke test package install in fresh containers
+      run: |
+        set -euxo pipefail
+        test_pkg_in_container() {
+          image="$1"
+          pkg_dir="$2"
+          docker pull "$image"
+          docker run --rm -v "$pkg_dir:/pkg:ro" "$image" sh -euxc '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y ca-certificates
+            apt-get install -y /pkg/*.deb
+            ldd /usr/bin/fm-sdr-tuner | tee /tmp/ldd.txt
+            if grep -q "not found" /tmp/ldd.txt; then
+              echo "Missing shared libraries detected"
+              exit 1
+            fi
+            /usr/bin/fm-sdr-tuner --help >/tmp/help.txt 2>&1 || true
+            grep -q "Usage:" /tmp/help.txt
+          '
+        }
+
+        test_pkg_in_container ubuntu:24.04 /tmp/artifacts/ubuntu
+        test_pkg_in_container debian:trixie /tmp/artifacts/debian
