@@ -104,105 +104,55 @@ Example dependency install (triplet/package names may vary by your vcpkg setup):
 vcpkg install openssl librtlsdr liquid-dsp
 ```
 
-## Important Runtime Behavior
+## Runtime Behavior
 
-- At least one output must be selected: `-s` and/or `-w <file>` and/or `-i <file>`.
-- The tuner does **not** auto-start by default. It starts when an XDR client sends a start command.
-- Default source is direct RTL-SDR (`--source rtl_sdr`).
-- You can fully select source/device via config (`[tuner] source`, `[tuner] rtl_device`) and run with only `-c`.
-- Audio output format is fixed in current architecture:
-  - sample rate: `32000`
-  - frames per buffer: `4096`
+- At least one output must be enabled (`audio`, `wav`, or `iq`).
+- The tuner does not auto-start by default; an XDR client start command activates it.
+- Default source is direct RTL-SDR (`rtl_sdr`).
+- Audio output is fixed at `32000 Hz`, buffer size `4096` frames.
 
-## Usage
+## Config-First Usage
+
+Primary workflow is config-driven:
 
 ```bash
-./fm-sdr-tuner [options]
+./build/fm-sdr-tuner -c fm-sdr-tuner.ini
 ```
 
-### CLI Options
+Recommended:
+- Put all normal runtime settings in `fm-sdr-tuner.ini`.
+- Use CLI only for temporary overrides during testing.
 
-| Option | Description | Default |
-|---|---|---|
-| `-c, --config <file>` | INI config file | none |
-| `-t, --tcp <host:port>` | rtl_tcp server address | `localhost:1234` |
-| `--source <rtl_tcp\|rtl_sdr>` | tuner source | `rtl_sdr` |
-| `--rtl-device <id>` | RTL-SDR device index for direct mode | `0` |
-| `-f, --freq <khz>` | frequency in kHz | `88600` |
-| `-g, --gain <db>` | RTL gain dB (`-1` = auto strategy) | from config |
-| `-w, --wav <file>` | write WAV output | off |
-| `-i, --iq <file>` | write raw IQ bytes | off |
-| `-s, --audio` | enable speaker output | from config (`[audio].enable_audio`) |
-| `-l, --list-audio` | list available audio devices | off |
-| `-d, --device <id/name>` | audio output device selector | system default |
-| `-P, --password <pwd>` | XDR server password | from config |
-| `-G, --guest` | allow guest mode | off |
-| `-h, --help` | show help | off |
-
-### Examples
-
-List audio devices:
+Useful override examples:
 
 ```bash
+# temporary frequency override
+./build/fm-sdr-tuner -c fm-sdr-tuner.ini -f 101100
+
+# list audio devices once, then keep device in config
 ./build/fm-sdr-tuner -l
-```
-
-Direct RTL-SDR, WAV capture:
-
-```bash
-./build/fm-sdr-tuner --source rtl_sdr --rtl-device 0 -f 88600 -w test.wav
-```
-
-rtl_tcp source + speaker:
-
-```bash
-rtl_tcp -p 1234 -f 88600000 -g 20 -s 512000
-./build/fm-sdr-tuner --source rtl_tcp -t localhost:1234 -f 88600 -s
-```
-
-Direct RTL-SDR + speaker + IQ capture:
-
-```bash
-./build/fm-sdr-tuner --source rtl_sdr -f 101100 -s -i capture.iq
 ```
 
 ## Configuration (`fm-sdr-tuner.ini`)
 
-Supported sections/keys:
+`fm-sdr-tuner.ini` is the primary control surface.
 
-- `[rtl_tcp]`
-  - `host`, `port`
-- `[audio]`
-  - `enable_audio` (start with speaker output enabled without `-s`)
-  - `device`
-- `[sdr]`
-  - `rtl_gain_db`
-  - `default_custom_gain_flags`
-  - `gain_strategy` (`tef` or `sdrpp`)
-  - `sdrpp_rtl_agc`
-  - `sdrpp_rtl_agc_gain_db`
-  - `signal_floor_dbfs`
-  - `signal_ceil_dbfs`
-  - `dbf_compensation_factor` (multiplier applied to mapped dBf level before clamp)
-- `[tuner]`
-  - `source` (`rtl_sdr` or `rtl_tcp`)
-  - `rtl_device` (RTL-SDR index for direct mode)
-  - `default_freq`
-  - `deemphasis` (`0=50us`, `1=75us`, `2=off`)
-- `[xdr]`
-  - `port`, `password`, `guest_mode`
-- `[processing]`
-  - `agc_mode`
-  - `client_gain_allowed`
-  - `dsp_block_samples` (fixed DSP block size, clamped to `1024..32768`)
-  - `w0_bandwidth_hz` (fallback bandwidth for `W0` in Hz; set `0` for widest)
-  - `dsp_agc` (`off`, `fast`, `slow`; optional IQ-domain AGC before FM demod)
-  - `stereo_blend` (`soft`, `normal`, `aggressive`)
-  - `stereo`
-- `[debug]`
-  - `log_level`
-- `[reconnection]`
-  - `auto_reconnect`
+Important sections:
+- `[tuner]`: source, device index, startup frequency, deemphasis
+- `[audio]`: enable speaker output and select output device
+- `[sdr]`: tuner gain strategy and dBf mapping window
+- `[processing]`: DSP block size, W0 bandwidth, stereo blend, optional DSP AGC
+- `[xdr]`: server port/password/guest mode
+
+Signal meter related keys (`[sdr]`):
+- `signal_floor_dbfs`
+- `signal_ceil_dbfs`
+- `dbf_compensation_factor`
+
+Weak-signal tuning keys:
+- `processing.w0_bandwidth_hz`
+- `processing.dsp_agc = off|fast|slow`
+- `processing.stereo_blend = soft|normal|aggressive`
 
 ## CMake Options
 
