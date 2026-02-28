@@ -947,7 +947,7 @@ void AudioOutput::runWinMMOutputThread() {
       for (size_t i = 0; i < copied; i++) {
         float v = m_outputQueue[m_outputReadIndex + i];
         v = std::clamp(v, -1.0f, 1.0f);
-        (*pcm)[i] = static_cast<int16_t>(v * kInt16Max);
+        (*pcm)[i] = static_cast<int16_t>(v * 32767.0f);
       }
       for (size_t i = copied; i < kSamplesPerBuffer; i++) {
         (*pcm)[i] = 0;
