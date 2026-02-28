@@ -138,6 +138,9 @@ private:
   std::condition_variable m_alsaCv;
   std::vector<float> m_alsaBuffer;
   size_t m_alsaReadIndex;
+  unsigned int m_alsaSampleRate;
+  float m_alsaSourcePerDest;
+  float m_alsaResamplePhase;
 #endif
 };
 

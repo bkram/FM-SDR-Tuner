@@ -628,16 +628,12 @@ bool AudioOutput::initAlsa(const std::string &deviceName) {
   snd_pcm_hw_params_set_format(m_alsaPcm, hwparams, SND_PCM_FORMAT_S16_LE);
   snd_pcm_hw_params_set_channels(m_alsaPcm, hwparams, CHANNELS);
 
-  // Keep the internal DSP/audio pipeline at fixed 32 kHz and let ALSA plug
-  // layer resample when needed.
   snd_pcm_hw_params_set_rate_resample(m_alsaPcm, hwparams, 1);
   unsigned int rate = SAMPLE_RATE;
-  err = snd_pcm_hw_params_set_rate(m_alsaPcm, hwparams, rate, 0);
+  int dir = 0;
+  err = snd_pcm_hw_params_set_rate_near(m_alsaPcm, hwparams, &rate, &dir);
   if (err < 0) {
-    std::cerr << "[AUDIO] ALSA exact " << SAMPLE_RATE
-              << " Hz rate not available on device '" << alsaDevice
-              << "': " << snd_strerror(err)
-              << ". Use 'default' or 'plughw:X,Y'.\n";
+    std::cerr << "[AUDIO] ALSA set_rate failed: " << snd_strerror(err) << "\n";
     snd_pcm_close(m_alsaPcm);
     m_alsaPcm = nullptr;
     return false;
@@ -647,7 +643,6 @@ bool AudioOutput::initAlsa(const std::string &deviceName) {
   snd_pcm_hw_params_set_buffer_size_near(m_alsaPcm, hwparams, &bufferSize);
 
   snd_pcm_uframes_t periodSize = 2048;
-  int dir = 0;
   snd_pcm_hw_params_set_period_size_near(m_alsaPcm, hwparams, &periodSize,
                                          &dir);
 
@@ -677,6 +672,10 @@ bool AudioOutput::initAlsa(const std::string &deviceName) {
               << " period=" << periodSize << "\n";
   }
 
+  m_alsaSampleRate = rate;
+  m_alsaSourcePerDest =
+      static_cast<float>(SAMPLE_RATE) / static_cast<float>(std::max(1u, rate));
+  m_alsaResamplePhase = 0.0f;
   m_alsaBuffer.reserve(static_cast<size_t>(rate) * 2);
   m_alsaReadIndex = 0;
   m_alsaThreadRunning = true;
@@ -717,20 +716,50 @@ void AudioOutput::runAlsaOutputThread() {
       const size_t available = (m_alsaBuffer.size() > m_alsaReadIndex)
                                    ? (m_alsaBuffer.size() - m_alsaReadIndex)
                                    : 0;
-      samplePairs = std::min(available / 2, kWriteFrames);
+      const size_t availablePairs = available / 2;
 
-      if (samplePairs > 0) {
-        for (size_t i = 0; i < samplePairs; i++) {
-          float l = m_alsaBuffer[m_alsaReadIndex + i * 2];
-          float r = m_alsaBuffer[m_alsaReadIndex + i * 2 + 1];
-          l = std::clamp(l, -1.0f, 1.0f);
-          r = std::clamp(r, -1.0f, 1.0f);
-          interleaved[i * 2] = static_cast<int16_t>(l * kInt16Max);
-          interleaved[i * 2 + 1] = static_cast<int16_t>(r * kInt16Max);
+      if (m_alsaSampleRate == SAMPLE_RATE) {
+        samplePairs = std::min(availablePairs, kWriteFrames);
+        if (samplePairs > 0) {
+          for (size_t i = 0; i < samplePairs; i++) {
+            float l = m_alsaBuffer[m_alsaReadIndex + i * 2];
+            float r = m_alsaBuffer[m_alsaReadIndex + i * 2 + 1];
+            l = std::clamp(l, -1.0f, 1.0f);
+            r = std::clamp(r, -1.0f, 1.0f);
+            interleaved[i * 2] = static_cast<int16_t>(l * kInt16Max);
+            interleaved[i * 2 + 1] = static_cast<int16_t>(r * kInt16Max);
+            lastL = l;
+            lastR = r;
+          }
+          m_alsaReadIndex += samplePairs * 2;
+        }
+      } else {
+        size_t produced = 0;
+        for (; produced < kWriteFrames; produced++) {
+          const size_t base = static_cast<size_t>(m_alsaResamplePhase);
+          if (base >= availablePairs) {
+            break;
+          }
+          const size_t next = std::min(base + 1, availablePairs - 1);
+          const float frac = m_alsaResamplePhase - static_cast<float>(base);
+          const float l0 = m_alsaBuffer[m_alsaReadIndex + base * 2];
+          const float r0 = m_alsaBuffer[m_alsaReadIndex + base * 2 + 1];
+          const float l1 = m_alsaBuffer[m_alsaReadIndex + next * 2];
+          const float r1 = m_alsaBuffer[m_alsaReadIndex + next * 2 + 1];
+          const float l = std::clamp(l0 + (l1 - l0) * frac, -1.0f, 1.0f);
+          const float r = std::clamp(r0 + (r1 - r0) * frac, -1.0f, 1.0f);
+          interleaved[produced * 2] = static_cast<int16_t>(l * kInt16Max);
+          interleaved[produced * 2 + 1] = static_cast<int16_t>(r * kInt16Max);
           lastL = l;
           lastR = r;
+          m_alsaResamplePhase += m_alsaSourcePerDest;
         }
-        m_alsaReadIndex += samplePairs * 2;
+        const size_t consumed = static_cast<size_t>(m_alsaResamplePhase);
+        if (consumed > 0) {
+          m_alsaReadIndex += std::min(consumed, availablePairs) * 2;
+          m_alsaResamplePhase -= static_cast<float>(consumed);
+        }
+        samplePairs = produced;
       }
 
       if (samplePairs < kWriteFrames) {
@@ -1003,7 +1032,9 @@ AudioOutput::AudioOutput()
 #endif
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
       ,
-      m_alsaPcm(nullptr), m_alsaThreadRunning(false), m_alsaReadIndex(0)
+      m_alsaPcm(nullptr), m_alsaThreadRunning(false), m_alsaReadIndex(0),
+      m_alsaSampleRate(SAMPLE_RATE), m_alsaSourcePerDest(1.0f),
+      m_alsaResamplePhase(0.0f)
 #endif
 {
   m_circularBuffer.resize(kCircularBufferSize * 2);
