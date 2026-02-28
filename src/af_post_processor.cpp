@@ -14,7 +14,7 @@ AFPostProcessor::AFPostProcessor(int inputRate, int outputRate)
   m_liquidLeftDcBlock.initDCBlocker(kDcBlockAlpha);
   m_liquidRightDcBlock.initDCBlocker(kDcBlockAlpha);
   reset();
-  setDeemphasis(75);
+  setDeemphasis(kDefaultDeemphasisUs);
 }
 
 void AFPostProcessor::reset() {
@@ -60,9 +60,9 @@ size_t AFPostProcessor::process(const float *inLeft, const float *inRight,
         m_liquidRightResampler.execute(inRight[i], m_liquidRightTmp);
     const uint32_t produced = std::min(leftProduced, rightProduced);
 
-    for (uint32_t p = 0; p < produced && outCount < outCapacity; p++) {
-      float left = m_liquidLeftTmp[p];
-      float right = m_liquidRightTmp[p];
+    for (uint32_t idx = 0; idx < produced && outCount < outCapacity; idx++) {
+      float left = m_liquidLeftTmp[idx];
+      float right = m_liquidRightTmp[idx];
       if (m_deemphasisEnabled) {
         left = m_liquidLeftDeemphasis.execute(left);
         right = m_liquidRightDeemphasis.execute(right);

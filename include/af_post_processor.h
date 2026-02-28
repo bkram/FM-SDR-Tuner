@@ -26,6 +26,7 @@ private:
 
     bool m_deemphasisEnabled;
     static constexpr float kDcBlockAlpha = 0.005f;
+    static constexpr int kDefaultDeemphasisUs = 75;
     fm_tuner::dsp::liquid::IIRFilterReal m_liquidLeftDeemphasis;
     fm_tuner::dsp::liquid::IIRFilterReal m_liquidRightDeemphasis;
     fm_tuner::dsp::liquid::IIRFilterReal m_liquidLeftDcBlock;
