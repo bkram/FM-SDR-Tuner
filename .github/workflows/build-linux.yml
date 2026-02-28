@@ -88,6 +88,52 @@ jobs:
         name: fm-sdr-tuner-linux-deb-debian-trixie-${{ matrix.arch }}
         path: dist/linux
 
+  build-fedora-40:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    container: fedora:40
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        dnf install -y cmake gcc-c++ make file pkgconfig
+        dnf install -y librtlsdr-devel libusb-devel openssl-devel alsa-lib-devel liquid-devel
+        dnf install -y rpm-build
+
+    - name: Build
+      run: |
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF
+        cmake --build build -j$(nproc)
+
+    - name: Run tests
+      run: |
+        cd build
+        ctest --output-on-failure || true
+
+    - name: Create RPM package
+      run: |
+        cd build
+        cpack -G RPM
+        mkdir -p ../dist/linux
+        cp ./*.rpm ../dist/linux/
+        cp ../README.md ../dist/linux/
+        cp ../fm-sdr-tuner.ini ../dist/linux/
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fm-sdr-tuner-linux-rpm-fedora-40-${{ matrix.arch }}
+        path: dist/linux
+
   smoke-test-deb-install:
     needs:
       - build-ubuntu-24-04
