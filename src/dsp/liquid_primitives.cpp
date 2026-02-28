@@ -5,6 +5,15 @@
 #include <cmath>
 #include <stdexcept>
 
+#if defined(LIQUID_VERSION_MAJOR) && defined(LIQUID_VERSION_MINOR)
+#define FM_TUNER_LIQUID_FIRDES_KAISER_RETURNS_VOID                                                   \
+    ((LIQUID_VERSION_MAJOR > 1) || (LIQUID_VERSION_MAJOR == 1 && LIQUID_VERSION_MINOR >= 4))
+#elif defined(LIQUID_VERSION_NUMBER)
+#define FM_TUNER_LIQUID_FIRDES_KAISER_RETURNS_VOID (LIQUID_VERSION_NUMBER >= 1004000)
+#else
+#define FM_TUNER_LIQUID_FIRDES_KAISER_RETURNS_VOID 0
+#endif
+
 namespace fm_tuner::dsp::liquid {
 
 AGC::~AGC() {
@@ -72,7 +81,7 @@ void FIRFilter::init(std::uint32_t length, float cutoff, float stopBandAtten, fl
     }
 
     m_taps.assign(length, 0.0f);
-#if LIQUID_VERSION_NUMBER >= 0x0400
+#if FM_TUNER_LIQUID_FIRDES_KAISER_RETURNS_VOID
     liquid_firdes_kaiser(length, cutoff, stopBandAtten, 0.0f, m_taps.data());
 #else
     if (liquid_firdes_kaiser(length, cutoff, stopBandAtten, 0.0f, m_taps.data()) != LIQUID_OK) {
@@ -379,7 +388,7 @@ void ComplexDecimator::init(std::uint32_t factor, std::uint32_t tapsPerPhase, fl
     const std::uint32_t hLen = m_factor * m_tapsPerPhase;
     m_taps.assign(hLen, 0.0f);
     const float cutoff = std::clamp(0.45f / static_cast<float>(m_factor), 0.01f, 0.45f);
-#if LIQUID_VERSION_NUMBER >= 0x0400
+#if FM_TUNER_LIQUID_FIRDES_KAISER_RETURNS_VOID
     liquid_firdes_kaiser(hLen, cutoff, m_stopBandAtten, 0.0f, m_taps.data());
 #else
     if (liquid_firdes_kaiser(hLen, cutoff, m_stopBandAtten, 0.0f, m_taps.data()) != LIQUID_OK) {

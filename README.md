@@ -172,6 +172,14 @@ Current workflows exist for:
 
 Linux CI publishes real `.deb` artifacts for Ubuntu x64 and arm64 runners.
 
+Run local arm64 Linux CI-equivalent builds with Docker:
+
+```bash
+./scripts/test-linux-arm-builds.sh
+```
+
+This script validates both `debian:trixie` and `fedora:40` arm64 container builds.
+
 If CI fails on dependencies, align workflow package installs with local requirements listed above.
 
 ## Based On / Dependencies
