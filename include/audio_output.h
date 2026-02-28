@@ -18,8 +18,11 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <mmsystem.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
+#include <mmsystem.h>
 #elif defined(__linux__)
 #if defined(FM_TUNER_HAS_ALSA)
 #include <alsa/asoundlib.h>

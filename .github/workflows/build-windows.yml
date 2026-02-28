@@ -21,11 +21,7 @@ jobs:
         install: >-
           git
           make
-          mingw-w64-x86_64-binutils
-          mingw-w64-x86_64-headers
-          mingw-w64-x86_64-crt
-          mingw-w64-x86_64-winpthreads
-          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-toolchain
           mingw-w64-x86_64-cmake
           mingw-w64-x86_64-ninja
           mingw-w64-x86_64-pkgconf
@@ -44,14 +40,16 @@ jobs:
           -DBUILD_BENCHMARKS=OFF \
           -DBUILD_SANDBOX=OFF \
           -DCMAKE_INSTALL_PREFIX=/mingw64
-        cmake --build /tmp/liquid-dsp/build -j$(nproc)
+        cmake --build /tmp/liquid-dsp/build --parallel
         cmake --install /tmp/liquid-dsp/build
 
     - name: Build (MinGW-w64)
       shell: msys2 {0}
       run: |
-        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-        cmake --build build -j$(nproc)
+        cmake -S . -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DFM_TUNER_ENABLE_X86_AVX2=OFF
+        cmake --build build --parallel
 
     - name: Smoke test CLI (MinGW-w64)
       shell: msys2 {0}
