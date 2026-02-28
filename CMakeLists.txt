@@ -164,6 +164,7 @@ set(SOURCES
     src/xdr_server.cpp
     src/audio_output.cpp
     src/config.cpp
+    src/signal_level.cpp
     src/main.cpp
 )
 
