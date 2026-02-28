@@ -29,6 +29,11 @@ jobs:
         cmake -S . -B build
         cmake --build build -j$(sysctl -n hw.ncpu)
 
+    - name: Run tests
+      run: |
+        cd build
+        ctest --output-on-failure
+
     - name: Package artifact
       run: |
         mkdir -p dist/macos
