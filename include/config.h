@@ -8,6 +8,7 @@ struct Config {
     struct RTLTCPSection {
         std::string host = "localhost";
         uint16_t port = 1234;
+        uint32_t sample_rate = 1024000;
     } rtl_tcp;
 
     struct AudioSection {

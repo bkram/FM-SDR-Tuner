@@ -163,6 +163,7 @@ void printUsage(const char* prog) {
               << "Options:\n"
               << "  -c, --config <file>    INI config file\n"
               << "  -t, --tcp <host:port>  rtl_tcp server address (default: localhost:1234)\n"
+              << "      --iq-rate <rate>   IQ sample rate: 1024000 or 2048000 (default: 1024000)\n"
               << "      --source <name>    Tuner source: rtl_tcp or rtl_sdr (default: rtl_sdr)\n"
               << "      --rtl-device <id>  RTL-SDR device index for --source rtl_sdr (default: 0)\n"
               << "  -f, --freq <khz>      Frequency in kHz (default: 88600)\n"
@@ -225,9 +226,11 @@ int main(int argc, char* argv[]) {
         std::cout << "[Config] processing.stereo_blend='" << config.processing.stereo_blend << "'\n";
         std::cout << "[Config] sdr.dbf_compensation_factor=" << config.sdr.dbf_compensation_factor << "\n";
         std::cout << "[Config] sdr.low_latency_iq=" << (config.sdr.low_latency_iq ? "true" : "false") << "\n";
+        std::cout << "[Config] rtl_tcp.sample_rate=" << config.rtl_tcp.sample_rate << "\n";
     }
     std::string tcpHost = config.rtl_tcp.host;
     uint16_t tcpPort = config.rtl_tcp.port;
+    uint32_t iqSampleRate = config.rtl_tcp.sample_rate;
     std::string tunerSource = config.tuner.source;
     uint32_t rtlDeviceIndex = config.tuner.rtl_device;
     uint32_t freqKHz = config.tuner.default_freq;
@@ -381,6 +384,22 @@ int main(int argc, char* argv[]) {
         if (arg == "-t" || arg == "--tcp" || arg.rfind("--tcp=", 0) == 0) {
             const std::string value = readValue(i, arg, "tcp");
             if (value.empty() || !parseTcpOption(value)) {
+                return 1;
+            }
+            continue;
+        }
+        if (arg == "--iq-rate" || arg.rfind("--iq-rate=", 0) == 0) {
+            const std::string value = readValue(i, arg, "iq-rate");
+            try {
+                const int parsed = std::stoi(value);
+                if (parsed == 1024000 || parsed == 2048000) {
+                    iqSampleRate = static_cast<uint32_t>(parsed);
+                } else {
+                    std::cerr << "[CLI] invalid --iq-rate value: " << value << " (expected 1024000 or 2048000)\n";
+                    return 1;
+                }
+            } catch (...) {
+                std::cerr << "[CLI] invalid --iq-rate value: " << value << "\n";
                 return 1;
             }
             continue;
@@ -697,6 +716,14 @@ int main(int argc, char* argv[]) {
         }
     }
     AFPostProcessor afPost(INPUT_RATE, OUTPUT_RATE);
+    if (verboseLogging) {
+        std::cout << "[SDR] iq_sample_rate=" << iqSampleRate
+                  << " dsp_input_rate=" << INPUT_RATE << "\n";
+        if (iqSampleRate != INPUT_RATE) {
+            std::cout << "[SDR] requested iq_sample_rate is currently ignored in DSP path; using "
+                      << INPUT_RATE << " for stable stereo decode\n";
+        }
+    }
     const std::size_t dspBlockSize = static_cast<std::size_t>(std::clamp(config.processing.dsp_block_samples, 1024, 32768));
     fm_tuner::dsp::Runtime dspRuntime(dspBlockSize, verboseLogging);
     if (verboseLogging) {
@@ -948,14 +975,15 @@ int main(int argc, char* argv[]) {
     }
 
     // Direct RTL-SDR async callback is configured to 16384 bytes (8192 IQ samples).
-    // Using 8192-sample reads avoids deterministic "short read" logs at 256 ksps.
+    // Using 8192-sample DSP blocks at 256 ksps keeps downstream timing stable.
     const size_t BUF_SAMPLES = dspRuntime.blockSize();
+    const size_t SDR_BUF_SAMPLES = BUF_SAMPLES;
     const auto noDataSleep = useDirectRtlSdr ? std::chrono::milliseconds(2)
                                              : std::chrono::milliseconds(10);
     const auto scanRetrySleep = useDirectRtlSdr ? std::chrono::milliseconds(2)
                                                 : std::chrono::milliseconds(5);
-    std::vector<uint8_t> iqBufferStorage(BUF_SAMPLES * 2, 0);
-    std::vector<float> demodBufferStorage(BUF_SAMPLES, 0.0f);
+    std::vector<uint8_t> iqBufferStorage(SDR_BUF_SAMPLES * 2, 0);
+    std::vector<float> demodBufferStorage(SDR_BUF_SAMPLES, 0.0f);
     std::vector<float> stereoLeftStorage(BUF_SAMPLES, 0.0f);
     std::vector<float> stereoRightStorage(BUF_SAMPLES, 0.0f);
     std::vector<float> audioLeftStorage(BUF_SAMPLES, 0.0f);
@@ -966,6 +994,7 @@ int main(int argc, char* argv[]) {
     float* stereoRight = stereoRightStorage.data();
     float* audioLeft = audioLeftStorage.data();
     float* audioRight = audioRightStorage.data();
+
     size_t retuneMuteSamplesRemaining = 0;
     size_t retuneMuteTotalSamples = 0;
 
@@ -1212,6 +1241,7 @@ int main(int argc, char* argv[]) {
         size_t outSamples = 0;
         bool stereoDetected = false;
         int pilotTenthsKHz = 0;
+
         if (!config.processing.stereo) {
             outSamples = demod.processSplit(iqBuffer, demodBuffer, audioLeft, samples);
             queueRdsBlock(demodBuffer, samples);
