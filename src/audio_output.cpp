@@ -623,10 +623,31 @@ bool AudioOutput::initAlsa(const std::string &deviceName) {
   snd_pcm_hw_params_alloca(&hwparams);
   snd_pcm_hw_params_any(m_alsaPcm, hwparams);
 
-  snd_pcm_hw_params_set_access(m_alsaPcm, hwparams,
-                               SND_PCM_ACCESS_RW_INTERLEAVED);
-  snd_pcm_hw_params_set_format(m_alsaPcm, hwparams, SND_PCM_FORMAT_S16_LE);
-  snd_pcm_hw_params_set_channels(m_alsaPcm, hwparams, CHANNELS);
+  err = snd_pcm_hw_params_set_access(m_alsaPcm, hwparams,
+                                     SND_PCM_ACCESS_RW_INTERLEAVED);
+  if (err < 0) {
+    std::cerr << "[AUDIO] ALSA set_access failed: " << snd_strerror(err)
+              << "\n";
+    snd_pcm_close(m_alsaPcm);
+    m_alsaPcm = nullptr;
+    return false;
+  }
+  err = snd_pcm_hw_params_set_format(m_alsaPcm, hwparams, SND_PCM_FORMAT_S16_LE);
+  if (err < 0) {
+    std::cerr << "[AUDIO] ALSA set_format failed: " << snd_strerror(err)
+              << "\n";
+    snd_pcm_close(m_alsaPcm);
+    m_alsaPcm = nullptr;
+    return false;
+  }
+  err = snd_pcm_hw_params_set_channels(m_alsaPcm, hwparams, CHANNELS);
+  if (err < 0) {
+    std::cerr << "[AUDIO] ALSA set_channels(" << CHANNELS
+              << ") failed: " << snd_strerror(err) << "\n";
+    snd_pcm_close(m_alsaPcm);
+    m_alsaPcm = nullptr;
+    return false;
+  }
 
   snd_pcm_hw_params_set_rate_resample(m_alsaPcm, hwparams, 1);
   unsigned int rate = SAMPLE_RATE;
@@ -655,6 +676,15 @@ bool AudioOutput::initAlsa(const std::string &deviceName) {
     return false;
   }
 
+  snd_pcm_hw_params_t *actualHw = nullptr;
+  snd_pcm_hw_params_alloca(&actualHw);
+  snd_pcm_hw_params_current(m_alsaPcm, actualHw);
+  unsigned int actualRate = 0;
+  int actualDir = 0;
+  snd_pcm_hw_params_get_rate(actualHw, &actualRate, &actualDir);
+  unsigned int actualChannels = 0;
+  snd_pcm_hw_params_get_channels(actualHw, &actualChannels);
+
   snd_pcm_sw_params_t *swparams = nullptr;
   snd_pcm_sw_params_alloca(&swparams);
   snd_pcm_sw_params_current(m_alsaPcm, swparams);
@@ -665,18 +695,27 @@ bool AudioOutput::initAlsa(const std::string &deviceName) {
 
   snd_pcm_get_params(m_alsaPcm, &bufferSize, &periodSize);
 
+  if (actualRate == 0) {
+    actualRate = rate;
+  }
+  if (actualChannels == 0) {
+    actualChannels = CHANNELS;
+  }
   if (m_verboseLogging) {
-    std::cout << "[AUDIO] ALSA initialized: rate=" << rate
-              << " buffer=" << bufferSize << " (" << (bufferSize * 1000 / rate)
+    std::cout << "[AUDIO] ALSA initialized: rate=" << actualRate
+              << " channels=" << actualChannels << " buffer=" << bufferSize
+              << " (" << (bufferSize * 1000 / std::max(1u, actualRate))
               << "ms)"
               << " period=" << periodSize << "\n";
   }
 
-  m_alsaSampleRate = rate;
+  m_alsaChannels = actualChannels;
+  m_alsaSampleRate = actualRate;
   m_alsaSourcePerDest =
-      static_cast<float>(SAMPLE_RATE) / static_cast<float>(std::max(1u, rate));
+      static_cast<float>(SAMPLE_RATE) /
+      static_cast<float>(std::max(1u, m_alsaSampleRate));
   m_alsaResamplePhase = 0.0f;
-  m_alsaBuffer.reserve(static_cast<size_t>(rate) * 2);
+  m_alsaBuffer.reserve(static_cast<size_t>(SAMPLE_RATE) * 2);
   m_alsaReadIndex = 0;
   m_alsaThreadRunning = true;
   m_alsaOutputThread = std::thread(&AudioOutput::runAlsaOutputThread, this);
@@ -689,7 +728,24 @@ void AudioOutput::runAlsaOutputThread() {
   snd_pcm_get_params(m_alsaPcm, &bufferSize, &periodSize);
 
   const size_t kWriteFrames = static_cast<size_t>(periodSize);
-  std::vector<int16_t> interleaved(kWriteFrames * CHANNELS, 0);
+  const size_t kDeviceChannels =
+      static_cast<size_t>(std::max(1u, m_alsaChannels));
+  std::vector<int16_t> interleaved(kWriteFrames * kDeviceChannels, 0);
+
+  auto writeFrame = [&](size_t frameIndex, float l, float r) {
+    l = std::clamp(l, -1.0f, 1.0f);
+    r = std::clamp(r, -1.0f, 1.0f);
+    const size_t base = frameIndex * kDeviceChannels;
+    if (kDeviceChannels == 1) {
+      interleaved[base] = static_cast<int16_t>(((l + r) * 0.5f) * kInt16Max);
+      return;
+    }
+    interleaved[base] = static_cast<int16_t>(l * kInt16Max);
+    interleaved[base + 1] = static_cast<int16_t>(r * kInt16Max);
+    for (size_t ch = 2; ch < kDeviceChannels; ch++) {
+      interleaved[base + ch] = 0;
+    }
+  };
 
   for (size_t i = 0; i < 4; i++) {
     snd_pcm_writei(m_alsaPcm, interleaved.data(), kWriteFrames);
@@ -724,10 +780,7 @@ void AudioOutput::runAlsaOutputThread() {
           for (size_t i = 0; i < samplePairs; i++) {
             float l = m_alsaBuffer[m_alsaReadIndex + i * 2];
             float r = m_alsaBuffer[m_alsaReadIndex + i * 2 + 1];
-            l = std::clamp(l, -1.0f, 1.0f);
-            r = std::clamp(r, -1.0f, 1.0f);
-            interleaved[i * 2] = static_cast<int16_t>(l * kInt16Max);
-            interleaved[i * 2 + 1] = static_cast<int16_t>(r * kInt16Max);
+            writeFrame(i, l, r);
             lastL = l;
             lastR = r;
           }
@@ -748,8 +801,7 @@ void AudioOutput::runAlsaOutputThread() {
           const float r1 = m_alsaBuffer[m_alsaReadIndex + next * 2 + 1];
           const float l = std::clamp(l0 + (l1 - l0) * frac, -1.0f, 1.0f);
           const float r = std::clamp(r0 + (r1 - r0) * frac, -1.0f, 1.0f);
-          interleaved[produced * 2] = static_cast<int16_t>(l * kInt16Max);
-          interleaved[produced * 2 + 1] = static_cast<int16_t>(r * kInt16Max);
+          writeFrame(produced, l, r);
           lastL = l;
           lastR = r;
           m_alsaResamplePhase += m_alsaSourcePerDest;
@@ -765,8 +817,10 @@ void AudioOutput::runAlsaOutputThread() {
       if (samplePairs < kWriteFrames) {
         const size_t missing = kWriteFrames - samplePairs;
         for (size_t i = 0; i < missing; i++) {
-          interleaved[(samplePairs + i) * 2] = 0;
-          interleaved[(samplePairs + i) * 2 + 1] = 0;
+          const size_t base = (samplePairs + i) * kDeviceChannels;
+          for (size_t ch = 0; ch < kDeviceChannels; ch++) {
+            interleaved[base + ch] = 0;
+          }
         }
       }
 
@@ -1033,8 +1087,8 @@ AudioOutput::AudioOutput()
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
       ,
       m_alsaPcm(nullptr), m_alsaThreadRunning(false), m_alsaReadIndex(0),
-      m_alsaSampleRate(SAMPLE_RATE), m_alsaSourcePerDest(1.0f),
-      m_alsaResamplePhase(0.0f)
+      m_alsaChannels(CHANNELS), m_alsaSampleRate(SAMPLE_RATE),
+      m_alsaSourcePerDest(1.0f), m_alsaResamplePhase(0.0f)
 #endif
 {
   m_circularBuffer.resize(kCircularBufferSize * 2);
