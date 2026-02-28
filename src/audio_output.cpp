@@ -724,8 +724,8 @@ void AudioOutput::runAlsaOutputThread() {
           float r = m_alsaBuffer[m_alsaReadIndex + i * 2 + 1];
           l = std::clamp(l, -1.0f, 1.0f);
           r = std::clamp(r, -1.0f, 1.0f);
-          interleaved[i * 2] = static_cast<int16_t>(l * 32767.0f);
-          interleaved[i * 2 + 1] = static_cast<int16_t>(r * 32767.0f);
+          interleaved[i * 2] = static_cast<int16_t>(l * kInt16Max);
+          interleaved[i * 2 + 1] = static_cast<int16_t>(r * kInt16Max);
           lastL = l;
           lastR = r;
         }
@@ -948,7 +948,7 @@ void AudioOutput::runWinMMOutputThread() {
       for (size_t i = 0; i < copied; i++) {
         float v = m_outputQueue[m_outputReadIndex + i];
         v = std::clamp(v, -1.0f, 1.0f);
-        (*pcm)[i] = static_cast<int16_t>(v * 32767.0f);
+        (*pcm)[i] = static_cast<int16_t>(v * kInt16Max);
       }
       for (size_t i = copied; i < kSamplesPerBuffer; i++) {
         (*pcm)[i] = 0;
@@ -985,7 +985,7 @@ void AudioOutput::runWinMMOutputThread() {
 AudioOutput::AudioOutput()
     : m_enableSpeaker(false), m_wavHandle(nullptr), m_running(false),
       m_wavDataSize(0), m_writeIndex(0), m_readIndex(0), m_verboseLogging(true),
-      m_requestedVolumePercent(100), m_currentVolumeScale(0.85f)
+      m_requestedVolumePercent(kMaxVolumePercent), m_currentVolumeScale(kDefaultVolumeScale)
 #if defined(FM_TUNER_HAS_PORTAUDIO)
       ,
       m_paStream(nullptr), m_portAudioInitialized(false),
@@ -1004,7 +1004,7 @@ AudioOutput::AudioOutput()
       m_alsaPcm(nullptr), m_alsaThreadRunning(false), m_alsaReadIndex(0)
 #endif
 {
-  m_circularBuffer.resize(65536 * 2);
+  m_circularBuffer.resize(kCircularBufferSize * 2);
 }
 
 AudioOutput::~AudioOutput() { shutdown(); }
@@ -1324,7 +1324,7 @@ void AudioOutput::shutdown() {
 }
 
 void AudioOutput::setVolumePercent(int volumePercent) {
-  m_requestedVolumePercent.store(std::clamp(volumePercent, 0, 100),
+  m_requestedVolumePercent.store(std::clamp(volumePercent, 0, kMaxVolumePercent),
                                  std::memory_order_relaxed);
 }
 
@@ -1382,8 +1382,8 @@ bool AudioOutput::writeWAVData(const float *left, const float *right,
   for (size_t i = 0; i < numSamples; i++) {
     float l = std::max(-1.0f, std::min(1.0f, left[i]));
     float r = std::max(-1.0f, std::min(1.0f, right[i]));
-    buffer[i * 2] = static_cast<int16_t>(l * 32767.0f);
-    buffer[i * 2 + 1] = static_cast<int16_t>(r * 32767.0f);
+    buffer[i * 2] = static_cast<int16_t>(l * kInt16Max);
+    buffer[i * 2 + 1] = static_cast<int16_t>(r * kInt16Max);
   }
 
   size_t written = fwrite(buffer.data(), sizeof(int16_t), numSamples * CHANNELS,
@@ -1441,14 +1441,14 @@ bool AudioOutput::write(const float *left, const float *right,
     const float targetVolumeScale =
         (static_cast<float>(
              m_requestedVolumePercent.load(std::memory_order_relaxed)) /
-         100.0f) *
-        0.85f;
+         static_cast<float>(kMaxVolumePercent)) *
+        kDefaultVolumeScale;
     const float rampSamples = static_cast<float>(SAMPLE_RATE) * 0.01f;
     const float step = (targetVolumeScale - m_currentVolumeScale) /
                        std::max(1.0f, rampSamples);
 
     for (size_t i = 0; i < numSamples; i++) {
-      if (std::abs(targetVolumeScale - m_currentVolumeScale) > 1e-6f) {
+      if (std::abs(targetVolumeScale - m_currentVolumeScale) > kVolumeEpsilon) {
         m_currentVolumeScale += step;
         if ((step > 0.0f && m_currentVolumeScale > targetVolumeScale) ||
             (step < 0.0f && m_currentVolumeScale < targetVolumeScale)) {

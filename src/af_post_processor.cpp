@@ -35,13 +35,13 @@ void AFPostProcessor::setDeemphasis(int tau_us) {
   }
 
   m_deemphasisEnabled = true;
-  const float tau = static_cast<float>(tau_us) * 1e-6f;
-  const float dt = 1.0f / static_cast<float>(m_outputRate);
-  const float alpha = dt / (tau + dt);
-  const std::vector<float> b = {alpha};
-  const std::vector<float> a = {1.0f, -(1.0f - alpha)};
-  m_liquidLeftDeemphasis.init(b, a);
-  m_liquidRightDeemphasis.init(b, a);
+  const float tau = static_cast<float>(tau_us) * kMicrosecondsToSeconds;
+  const float samplePeriod = 1.0f / static_cast<float>(m_outputRate);
+  const float alpha = samplePeriod / (tau + samplePeriod);
+  const std::vector<float> coeffs = {alpha};
+  const std::vector<float> feedback = {1.0f, -(1.0f - alpha)};
+  m_liquidLeftDeemphasis.init(coeffs, feedback);
+  m_liquidRightDeemphasis.init(coeffs, feedback);
 }
 
 size_t AFPostProcessor::process(const float *inLeft, const float *inRight,

@@ -33,6 +33,12 @@ public:
     static constexpr int BITS_PER_SAMPLE = 16;
     static constexpr int FRAMES_PER_BUFFER = 4096;
 
+    static constexpr int kMaxVolumePercent = 100;
+    static constexpr float kDefaultVolumeScale = 0.85f;
+    static constexpr float kInt16Max = 32767.0f;
+    static constexpr size_t kCircularBufferSize = 65536;
+    static constexpr float kVolumeEpsilon = 1e-6f;
+
     AudioOutput();
     ~AudioOutput();
 
