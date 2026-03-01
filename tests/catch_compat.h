@@ -11,3 +11,12 @@
 #else
 #include <catch2/catch_test_macros.hpp>
 #endif
+
+#if !defined(SKIP)
+#define SKIP(msg)                                                               \
+  do {                                                                          \
+    INFO(msg);                                                                  \
+    SUCCEED(msg);                                                               \
+    return;                                                                     \
+  } while (false)
+#endif

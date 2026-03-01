@@ -1,6 +1,18 @@
 cmake_minimum_required(VERSION 3.15)
 
+set(FM_TUNER_CATCH2_TARGET Catch2::Catch2WithMain)
+set(FM_TUNER_TEST_MAIN_SOURCE)
+if(NOT TARGET Catch2::Catch2WithMain)
+    if(TARGET Catch2::Catch2)
+        set(FM_TUNER_CATCH2_TARGET Catch2::Catch2)
+        set(FM_TUNER_TEST_MAIN_SOURCE ${CMAKE_SOURCE_DIR}/tests/catch_main.cpp)
+    else()
+        message(FATAL_ERROR "Catch2 target not available for tests")
+    endif()
+endif()
+
 add_executable(test_signal_level test_signal_level.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/signal_level.cpp
 )
 target_include_directories(test_signal_level PRIVATE
@@ -8,11 +20,12 @@ target_include_directories(test_signal_level PRIVATE
     ${Catch2_INCLUDE_DIRS}
 )
 target_link_libraries(test_signal_level PRIVATE
-    Catch2::Catch2WithMain
+    ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
 )
 
 add_executable(test_config test_config.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/config.cpp
 )
 target_include_directories(test_config PRIVATE
@@ -20,10 +33,11 @@ target_include_directories(test_config PRIVATE
     ${Catch2_INCLUDE_DIRS}
 )
 target_link_libraries(test_config PRIVATE
-    Catch2::Catch2WithMain
+    ${FM_TUNER_CATCH2_TARGET}
 )
 
 add_executable(test_app_options test_app_options.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/app_options.cpp
     ${CMAKE_SOURCE_DIR}/src/config.cpp
     ${CMAKE_SOURCE_DIR}/src/audio_output.cpp
@@ -33,11 +47,12 @@ target_include_directories(test_app_options PRIVATE
     ${Catch2_INCLUDE_DIRS}
 )
 target_link_libraries(test_app_options PRIVATE
-    Catch2::Catch2WithMain
+    ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
 )
 
 add_executable(test_dsp_chain test_dsp_chain.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/dsp/liquid_primitives.cpp
     ${CMAKE_SOURCE_DIR}/src/fm_demod.cpp
     ${CMAKE_SOURCE_DIR}/src/stereo_decoder.cpp
@@ -48,7 +63,7 @@ target_include_directories(test_dsp_chain PRIVATE
     ${Catch2_INCLUDE_DIRS}
 )
 target_link_libraries(test_dsp_chain PRIVATE
-    Catch2::Catch2WithMain
+    ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
 )
 if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
@@ -59,6 +74,7 @@ else()
 endif()
 
 add_executable(test_runtime test_runtime.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/dsp/liquid_primitives.cpp
     ${CMAKE_SOURCE_DIR}/src/dsp/runtime.cpp
 )
@@ -67,7 +83,7 @@ target_include_directories(test_runtime PRIVATE
     ${Catch2_INCLUDE_DIRS}
 )
 target_link_libraries(test_runtime PRIVATE
-    Catch2::Catch2WithMain
+    ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
 )
 if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
@@ -78,6 +94,7 @@ else()
 endif()
 
 add_executable(test_audio_output test_audio_output.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/audio_output.cpp
 )
 target_include_directories(test_audio_output PRIVATE
@@ -85,11 +102,12 @@ target_include_directories(test_audio_output PRIVATE
     ${Catch2_INCLUDE_DIRS}
 )
 target_link_libraries(test_audio_output PRIVATE
-    Catch2::Catch2WithMain
+    ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
 )
 
 add_executable(test_rtl_sdr_stub test_rtl_sdr_stub.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/rtl_sdr_device.cpp
 )
 target_include_directories(test_rtl_sdr_stub PRIVATE
@@ -97,11 +115,12 @@ target_include_directories(test_rtl_sdr_stub PRIVATE
     ${Catch2_INCLUDE_DIRS}
 )
 target_link_libraries(test_rtl_sdr_stub PRIVATE
-    Catch2::Catch2WithMain
+    ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
 )
 
 add_executable(test_protocol test_protocol.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/xdr_server.cpp
     ${CMAKE_SOURCE_DIR}/src/rtl_tcp_client.cpp
 )
@@ -110,7 +129,7 @@ target_include_directories(test_protocol PRIVATE
     ${Catch2_INCLUDE_DIRS}
 )
 target_link_libraries(test_protocol PRIVATE
-    Catch2::Catch2WithMain
+    ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
     OpenSSL::Crypto
 )
@@ -119,6 +138,7 @@ if(WIN32)
 endif()
 
 add_executable(test_xdr_unit test_xdr_unit.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/xdr_server.cpp
 )
 target_include_directories(test_xdr_unit PRIVATE
@@ -126,7 +146,7 @@ target_include_directories(test_xdr_unit PRIVATE
     ${Catch2_INCLUDE_DIRS}
 )
 target_link_libraries(test_xdr_unit PRIVATE
-    Catch2::Catch2WithMain
+    ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
     OpenSSL::Crypto
 )
@@ -135,6 +155,7 @@ if(WIN32)
 endif()
 
 add_executable(test_xdr_facade test_xdr_facade.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/xdr_facade.cpp
     ${CMAKE_SOURCE_DIR}/src/xdr_server.cpp
 )
@@ -143,7 +164,7 @@ target_include_directories(test_xdr_facade PRIVATE
     ${Catch2_INCLUDE_DIRS}
 )
 target_link_libraries(test_xdr_facade PRIVATE
-    Catch2::Catch2WithMain
+    ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
     OpenSSL::Crypto
 )
@@ -152,6 +173,7 @@ if(WIN32)
 endif()
 
 add_executable(test_scan_engine test_scan_engine.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/scan_engine.cpp
     ${CMAKE_SOURCE_DIR}/src/signal_level.cpp
     ${CMAKE_SOURCE_DIR}/src/xdr_server.cpp
@@ -162,7 +184,7 @@ target_include_directories(test_scan_engine PRIVATE
     ${Catch2_INCLUDE_DIRS}
 )
 target_link_libraries(test_scan_engine PRIVATE
-    Catch2::Catch2WithMain
+    ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
     OpenSSL::Crypto
 )
