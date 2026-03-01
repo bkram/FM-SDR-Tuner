@@ -938,6 +938,7 @@ std::string XDRServer::processCommand(const std::string &cmd,
   }
 
   case 'X': {
+    m_scanCancelPending = true;
     if (m_stopCallback) {
       m_stopCallback();
     }

@@ -28,6 +28,18 @@ jobs:
           mingw-w64-x86_64-openssl
           mingw-w64-x86_64-rtl-sdr
 
+    - name: Build and install Catch2 (MinGW-w64)
+      shell: msys2 {0}
+      run: |
+        git clone --depth 1 --branch v3.7.1 https://github.com/catchorg/Catch2.git /tmp/Catch2
+        cmake -S /tmp/Catch2 -B /tmp/Catch2/build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCATCH_BUILD_TESTING=OFF \
+          -DCATCH_INSTALL_DOCS=OFF \
+          -DCMAKE_INSTALL_PREFIX=/mingw64
+        cmake --build /tmp/Catch2/build --parallel
+        cmake --install /tmp/Catch2/build
+
     - name: Build and install liquid-dsp (MinGW-w64)
       shell: msys2 {0}
       run: |
@@ -55,6 +67,11 @@ jobs:
       shell: msys2 {0}
       run: |
         ./build/fm-sdr-tuner.exe --help
+
+    - name: Run tests (MinGW-w64)
+      shell: msys2 {0}
+      run: |
+        ctest --test-dir build --output-on-failure --no-tests=error
 
     - name: Bundle runtime dependencies (MinGW-w64)
       shell: msys2 {0}

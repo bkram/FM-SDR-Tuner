@@ -2,10 +2,24 @@
 
 FM broadcast tuner and XDR server built around RTL-SDR IQ input.
 
+## Project Status / Experiment
+
+This repository is an active experiment in AI-assisted software development.
+
+Goal:
+- Validate how a domain expert, aided by AI, can build a real SDR project that
+  works in practice and stays manageable over time.
+
+Implications:
+- Behavior can change quickly between releases while we iterate.
+- We prioritize working end-to-end functionality, measurable regressions
+  (tests/coverage), and maintainability.
+- Treat this as experimental software, not a finished product.
+
 Current architecture:
 - Input: `rtl_sdr` (default) or `rtl_tcp`
 - Demod/stereo/audio pipeline in-process
-- RDS decode path based on redsea components (`liquid-dsp` required)
+- DSP pipeline uses `liquid-dsp` primitives (FM chain + RDS-related paths)
 - XDR-compatible server on port `7373`
 - Native audio backends: Core Audio (macOS), ALSA (Linux), WinMM (Windows)
 
@@ -109,7 +123,8 @@ vcpkg install openssl librtlsdr liquid-dsp
 - At least one output must be enabled (`audio`, `wav`, or `iq`).
 - The tuner does not auto-start by default; an XDR client start command activates it.
 - Default source is direct RTL-SDR (`rtl_sdr`).
-- Audio output is fixed at `32000 Hz`, buffer size `4096` frames.
+- Audio output sample rate is fixed at `32000 Hz`.
+- Device/buffer latency is backend-specific (Core Audio / ALSA / WinMM).
 
 ## Config-First Usage
 
@@ -147,38 +162,231 @@ Important sections:
 Signal meter related keys (`[sdr]`):
 - `signal_floor_dbfs`
 - `signal_ceil_dbfs`
-- `dbf_compensation_factor`
+- `signal_bias_db`
 
 Weak-signal tuning keys:
 - `processing.w0_bandwidth_hz`
 - `processing.dsp_agc = off|fast|slow`
 - `processing.stereo_blend = soft|normal|aggressive`
 
+## Gain Setup Guide (Per Location)
+
+Most "bad reception" reports in FM SDR setups come from gain mismatch:
+- too much gain in strong-signal areas -> clipping, distortion, unstable scan
+- too little gain in weak-signal areas -> noisy audio, missing stereo/RDS
+
+Use this section to set gain for your specific RF environment.
+
+### 1. Understand The Gain Controls
+
+Main keys in `[sdr]` and `[processing]`:
+- `gain_strategy = tef|sdrpp`
+- `rtl_gain_db = -1` (strategy-managed) or fixed manual dB value
+- `default_custom_gain_flags` (TEF strategy only)
+- `sdrpp_rtl_agc`, `sdrpp_rtl_agc_gain_db` (SDR++ strategy only)
+- `agc_mode` in `[processing]` (TEF strategy only, 0..3)
+
+Practical meaning:
+- `tef`:
+  - best default for mixed conditions
+  - supports runtime AGC profile (`agc_mode`) and clip-protect behavior
+- `sdrpp`:
+  - predictable "set and hold" style
+  - easier when you want fixed behavior similar to SDR++ workflows
+- `rtl_gain_db`:
+  - `-1` = let selected strategy manage gain
+  - `>=0` = force fixed tuner gain (overrides strategy behavior)
+
+### 2. Pick A Baseline Profile
+
+Start with one of these, then adjust from there.
+
+Baseline A (recommended for most users):
+
+```ini
+[sdr]
+gain_strategy = tef
+rtl_gain_db = -1
+default_custom_gain_flags = 1
+
+[processing]
+agc_mode = 2
+```
+
+Baseline B (manual-like behavior):
+
+```ini
+[sdr]
+gain_strategy = sdrpp
+rtl_gain_db = -1
+sdrpp_rtl_agc = false
+sdrpp_rtl_agc_gain_db = 18
+```
+
+### 3. Choose By RF Density (Your Location Type)
+
+Use the profile that matches your area, then fine-tune.
+
+Dense urban / many strong locals / rooftop antenna:
+- Goal: prevent front-end overload and clipping
+- Use:
+  - `gain_strategy = tef`
+  - `rtl_gain_db = -1`
+  - `agc_mode = 3` (or `2` if too insensitive)
+  - keep `default_custom_gain_flags = 1`
+- If still overloaded:
+  - try fixed `rtl_gain_db = 8` to `16`
+  - lower antenna gain or add attenuation externally
+
+Suburban / mixed conditions (strong + medium stations):
+- Goal: stable all-round decode
+- Use:
+  - `gain_strategy = tef`
+  - `rtl_gain_db = -1`
+  - `agc_mode = 2` (default)
+- If weak stations are too noisy:
+  - try `agc_mode = 1`
+- If strong stations distort:
+  - move back to `agc_mode = 3` or set fixed `rtl_gain_db` around `12..20`
+
+Rural / weak-signal DX area:
+- Goal: maximize sensitivity without constant clipping
+- Use:
+  - `gain_strategy = tef`
+  - `rtl_gain_db = -1` first
+  - `agc_mode = 1` (or `0` for very weak environments)
+- If still too weak:
+  - try fixed `rtl_gain_db = 24` to `36`
+- If clipping appears on occasional strong locals:
+  - reduce fixed gain by 3..6 dB
+
+### 4. Validate With A 3-Station Check
+
+After each gain change, test:
+- one very strong local station
+- one medium station
+- one weak/distant station
+
+What to listen for:
+- strong station should be clean (no gritty distortion, pumping, crackle)
+- medium station should keep stable stereo if available
+- weak station should improve SNR without making strong station unusable
+
+If available in your client view, also watch clipping/level behavior:
+- frequent high clipping indicators = too much gain
+- constantly very low levels and noisy demod = too little gain
+
+### 5. Calibrate Signal Meter For Your Site
+
+These do not change RF performance directly, but they make meter/scan values
+meaningful for your installation:
+- `signal_floor_dbfs`
+- `signal_ceil_dbfs`
+- `signal_bias_db`
+
+Suggested process:
+1. Tune a no-signal frequency and note baseline.
+2. Tune a strong clean local station and note top-end.
+3. Set:
+   - `signal_floor_dbfs` near typical no-signal noise floor
+   - `signal_ceil_dbfs` near strong-local level
+   - `signal_bias_db` to align displayed values with your expected dBf-like range
+
+Starting point that works for many setups:
+
+```ini
+[sdr]
+signal_floor_dbfs = -55.0
+signal_ceil_dbfs = -12.0
+signal_bias_db = -6.0
+```
+
+If your scan looks mostly empty except spikes:
+- first fix gain/overload as above
+- then widen meter window slightly (for example lower `signal_floor_dbfs`)
+
+### 6. When To Use Fixed `rtl_gain_db`
+
+Use fixed manual gain when:
+- your antenna/system is stable and you want repeatable results
+- you are doing comparisons/logging and need reproducible levels
+
+Avoid fixed manual gain when:
+- traveling between locations
+- switching antennas frequently
+- local RF conditions vary widely over time
+
+### 7. Client Control Safety
+
+If users control gain from XDR clients and this causes confusion:
+- set `client_gain_allowed = false` in `[processing]`
+- keep gain policy only in `fm-sdr-tuner.ini`
+
+This prevents accidental client-side `A`/`G` changes from overriding your tuned
+site profile.
+
+### 8. Fast Troubleshooting
+
+Audio sounds distorted on strong stations:
+- lower gain (`agc_mode` higher number in TEF, or lower fixed `rtl_gain_db`)
+
+Weak stations vanish/no stereo anywhere:
+- increase gain (`agc_mode` lower number in TEF, or higher fixed `rtl_gain_db`)
+
+Behavior changes wildly when reconnecting client:
+- disable client gain control: `client_gain_allowed = false`
+
+Scan graph looks unrealistic:
+- verify gain first
+- then recalibrate `signal_floor_dbfs` / `signal_ceil_dbfs` / `signal_bias_db`
+
 ## CMake Options
 
-- `FM_TUNER_ENABLE_X86_AVX2=ON|OFF` (default `ON`)
-- `FM_TUNER_ENABLE_PORTAUDIO=ON|OFF`
+- `FM_TUNER_ENABLE_X86_AVX2=ON|OFF` (default `OFF`)
 
 Notes:
 - ALSA is always enabled on Linux builds.
-- On macOS and Windows, native audio backends are forced and PortAudio is disabled in CMake (the `FM_TUNER_ENABLE_PORTAUDIO` toggle is ignored there).
+- Audio backends in active use are native only: Core Audio (macOS), ALSA
+  (Linux), WinMM (Windows).
 
 ## CI Status Notes
 
 Current workflows exist for:
 - Linux (`x64`, `arm64`)
-- macOS
-- Windows
+- macOS (`macos-latest`)
+- Windows (`windows-latest`, MinGW-w64 via MSYS2)
 
-Linux CI publishes real package artifacts for Ubuntu, Debian, and Fedora on `x64` and `arm64`.
+Artifacts currently uploaded by CI:
+- Linux coverage job:
+  - `fm-sdr-tuner-coverage-ubuntu-24.04` (`coverage.xml`, `coverage.html`)
+- Linux package jobs:
+  - `fm-sdr-tuner-linux-deb-ubuntu-24.04-x64`
+  - `fm-sdr-tuner-linux-deb-ubuntu-24.04-arm64`
+  - `fm-sdr-tuner-linux-deb-debian-trixie-x64`
+  - `fm-sdr-tuner-linux-deb-debian-trixie-arm64`
+  - `fm-sdr-tuner-linux-rpm-fedora-40-x64`
+  - `fm-sdr-tuner-linux-rpm-fedora-40-arm64`
+- macOS build job:
+  - `fm-sdr-tuner-macos` (binary + `README.md` + `fm-sdr-tuner.ini`)
+- Windows MinGW job:
+  - `fm-sdr-tuner-windows-mingw` (`.exe` + required DLLs + `dependencies.txt`)
 
-Run local arm64 Linux CI-equivalent builds with Docker:
+Notes:
+- Linux smoke-test jobs validate package installability in fresh containers, but
+  they do not upload additional artifacts.
+- Artifact names and platform matrix are defined in:
+  - `.github/workflows/build-linux.yml`
+  - `.github/workflows/build-macos.yml`
+  - `.github/workflows/build-windows.yml`
+
+Run local Linux package checks with Docker:
 
 ```bash
 ./scripts/test-linux-arm-builds.sh
 ```
 
-This script runs arm64 container builds for `ubuntu:24.04`, `debian:trixie`, and `fedora:40`, then performs package-install smoke tests in fresh containers.
+This script runs container builds for `ubuntu:24.04`, `debian:trixie`, and
+`fedora:40`, then performs package-install smoke tests in fresh containers.
 
 It validates:
 - `.deb` build + install smoke test on Ubuntu and Debian
@@ -199,7 +407,7 @@ This software is based on or integrates ideas/components from:
 Core third-party runtime/build dependencies used by this project include:
 
 - `librtlsdr` (RTL-SDR device and rtl_tcp ecosystem support)
-- `liquid-dsp` (required for current redsea-based RDS decode path)
+- `liquid-dsp` (required DSP primitive dependency used across FM and RDS paths)
 - OpenSSL (authentication/security-related hashing/crypto usage)
 
 ### Component Table
@@ -208,7 +416,7 @@ Core third-party runtime/build dependencies used by this project include:
 |---|---|---|---|
 | SDRPlusPlus | https://github.com/AlexandreRouma/SDRPlusPlus | GPL-3.0 | FM demodulation/stereo/RDS DSP reference base |
 | redsea | https://github.com/windytan/redsea | ISC | RDS decoding pipeline (integrated/ported components) |
-| liquid-dsp | https://github.com/jgaeddert/liquid-dsp | MIT | DSP primitives used by redsea-based RDS path |
+| liquid-dsp | https://github.com/jgaeddert/liquid-dsp | MIT | DSP primitives used across FM and RDS processing paths |
 | XDR-GTK | https://github.com/kkonradpl/xdr-gtk | GPL-3.0 | XDR ecosystem/protocol behavior reference |
 | librdsparser | https://github.com/kkonradpl/librdsparser | GPL-3.0 | RDS/XDR parsing reference in ecosystem |
 | FM-DX-Tuner | https://github.com/kkonradpl/FM-DX-Tuner | GPL-3.0 | Protocol/tuner-control ecosystem reference |

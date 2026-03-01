@@ -12,3 +12,6 @@ __pycache__/
 .cache/
 *.egg-info/
 research/
+build-coverage-local
+build-linux/
+build-linux-amd64/

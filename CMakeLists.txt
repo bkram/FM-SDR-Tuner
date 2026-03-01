@@ -4,93 +4,33 @@ project(fm-sdr-tuner VERSION 1.3.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(FM_TUNER_ENABLE_COVERAGE "Enable compiler coverage instrumentation" OFF)
+
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include(CheckCXXCompilerFlag)
 include(GNUInstallDirs)
 
-option(FM_TUNER_ENABLE_X86_AVX2 "Enable AVX2/FMA compile flags on x86 targets" ON)
-set(FM_TUNER_DEFAULT_PORTAUDIO OFF)
-if(WIN32)
-    set(FM_TUNER_DEFAULT_PORTAUDIO OFF)
+if(FM_TUNER_ENABLE_COVERAGE)
+    if(MSVC)
+        message(FATAL_ERROR "FM_TUNER_ENABLE_COVERAGE is not supported with MSVC")
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        add_compile_options(-O0 -g --coverage)
+        add_link_options(--coverage)
+        message(STATUS "Coverage instrumentation enabled")
+    else()
+        message(FATAL_ERROR "Coverage is only supported with GCC/Clang")
+    endif()
 endif()
-option(FM_TUNER_ENABLE_PORTAUDIO "Enable PortAudio for audio output (macOS/Windows)" ${FM_TUNER_DEFAULT_PORTAUDIO})
+
+option(FM_TUNER_ENABLE_X86_AVX2 "Enable AVX2/FMA compile flags on x86 targets" OFF)
 set(FM_TUNER_ENABLE_ALSA OFF)
 if(UNIX AND NOT APPLE)
     set(FM_TUNER_ENABLE_ALSA ON)
 endif()
 
-if(APPLE)
-    set(FM_TUNER_ENABLE_PORTAUDIO OFF CACHE BOOL "PortAudio is disabled on macOS (native Core Audio backend is used)" FORCE)
-endif()
-if(WIN32)
-    set(FM_TUNER_ENABLE_PORTAUDIO OFF CACHE BOOL "PortAudio is disabled on Windows (native WinMM backend is used)" FORCE)
-endif()
-
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
-
-if(FM_TUNER_ENABLE_PORTAUDIO)
-    find_package(PkgConfig QUIET)
-    find_package(portaudio CONFIG QUIET)
-
-    set(PORTAUDIO_INCLUDE_DIR "")
-    set(PORTAUDIO_LIBRARY "")
-
-    find_path(PORTAUDIO_INCLUDE_DIR
-        NAMES portaudio.h
-        HINTS /opt/homebrew/include /usr/local/include
-    )
-
-    find_library(PORTAUDIO_LIBRARY
-        NAMES portaudio portaudio_static portaudio_x64 portaudio_x86
-        HINTS /opt/homebrew/lib /usr/local/lib
-    )
-
-    if((NOT PORTAUDIO_INCLUDE_DIR OR NOT PORTAUDIO_LIBRARY) AND PkgConfig_FOUND)
-        pkg_check_modules(PC_PORTAUDIO QUIET IMPORTED_TARGET portaudio-2.0)
-        if(PC_PORTAUDIO_FOUND)
-            if(NOT PORTAUDIO_INCLUDE_DIR)
-                set(PORTAUDIO_INCLUDE_DIR ${PC_PORTAUDIO_INCLUDE_DIRS})
-            endif()
-            if(NOT PORTAUDIO_LIBRARY)
-                if(DEFINED pkgcfg_lib_PC_PORTAUDIO_portaudio)
-                    set(PORTAUDIO_LIBRARY ${pkgcfg_lib_PC_PORTAUDIO_portaudio})
-                endif()
-            endif()
-        endif()
-    endif()
-
-    if(APPLE AND (NOT PORTAUDIO_INCLUDE_DIR OR NOT PORTAUDIO_LIBRARY))
-        execute_process(
-            COMMAND brew --prefix portaudio
-            OUTPUT_VARIABLE PORTAUDIO_BREW_PREFIX
-            RESULT_VARIABLE PORTAUDIO_BREW_RESULT
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        if(PORTAUDIO_BREW_RESULT EQUAL 0 AND PORTAUDIO_BREW_PREFIX)
-            if(NOT PORTAUDIO_INCLUDE_DIR)
-                find_path(PORTAUDIO_INCLUDE_DIR
-                    NAMES portaudio.h
-                    HINTS ${PORTAUDIO_BREW_PREFIX}/include
-                )
-            endif()
-            if(NOT PORTAUDIO_LIBRARY)
-                find_library(PORTAUDIO_LIBRARY
-                    NAMES portaudio portaudio_static
-                    HINTS ${PORTAUDIO_BREW_PREFIX}/lib
-                )
-            endif()
-        endif()
-    endif()
-
-    if((NOT PORTAUDIO_INCLUDE_DIR OR NOT PORTAUDIO_LIBRARY)
-       AND NOT TARGET PkgConfig::PC_PORTAUDIO
-       AND NOT TARGET portaudio
-       AND NOT TARGET PortAudio::PortAudio)
-        message(FATAL_ERROR "PortAudio not found. Install PortAudio or set PORTAUDIO_INCLUDE_DIR and PORTAUDIO_LIBRARY.")
-    endif()
-endif()
 
 if(FM_TUNER_ENABLE_ALSA)
     find_package(PkgConfig QUIET)
@@ -149,11 +89,21 @@ endif()
 set(SOURCES
     src/dsp/liquid_primitives.cpp
     src/dsp/runtime.cpp
+    src/app_options.cpp
+    src/application.cpp
+    src/tuner_controller.cpp
+    src/tuner_session.cpp
+    src/runtime_loop.cpp
+    src/processing_runner.cpp
+    src/scan_engine.cpp
     src/rtl_tcp_client.cpp
     src/rtl_sdr_device.cpp
     src/fm_demod.cpp
     src/stereo_decoder.cpp
     src/af_post_processor.cpp
+    src/dsp_pipeline.cpp
+    src/rds_worker.cpp
+    src/xdr_facade.cpp
     src/cpu_features.cpp
     src/rds_decoder.cpp
     src/redsea_port/block_sync.cpp
@@ -171,9 +121,6 @@ set(SOURCES
 add_executable(fm-sdr-tuner ${SOURCES})
 target_compile_definitions(fm-sdr-tuner PRIVATE FM_SDR_TUNER_VERSION="${PROJECT_VERSION}")
 target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_APP_LIQUID_BACKEND)
-if(FM_TUNER_ENABLE_PORTAUDIO)
-    target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_PORTAUDIO)
-endif()
 if(FM_TUNER_ENABLE_ALSA)
     target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_ALSA)
 endif()
@@ -208,26 +155,12 @@ endif()
 target_include_directories(fm-sdr-tuner PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
-if(FM_TUNER_ENABLE_PORTAUDIO AND PORTAUDIO_INCLUDE_DIR)
-    target_include_directories(fm-sdr-tuner PRIVATE ${PORTAUDIO_INCLUDE_DIR})
-endif()
 
 target_link_libraries(fm-sdr-tuner PRIVATE
     Threads::Threads
     OpenSSL::Crypto
     OpenSSL::SSL
 )
-if(FM_TUNER_ENABLE_PORTAUDIO)
-    if(TARGET portaudio)
-        target_link_libraries(fm-sdr-tuner PRIVATE portaudio)
-    elseif(TARGET PortAudio::PortAudio)
-        target_link_libraries(fm-sdr-tuner PRIVATE PortAudio::PortAudio)
-    elseif(TARGET PkgConfig::PC_PORTAUDIO)
-        target_link_libraries(fm-sdr-tuner PRIVATE PkgConfig::PC_PORTAUDIO)
-    elseif(PORTAUDIO_LIBRARY)
-        target_link_libraries(fm-sdr-tuner PRIVATE ${PORTAUDIO_LIBRARY})
-    endif()
-endif()
 if(FM_TUNER_ENABLE_ALSA)
     if(PC_ALSA_FOUND AND TARGET PkgConfig::PC_ALSA)
         target_link_libraries(fm-sdr-tuner PRIVATE PkgConfig::PC_ALSA)
@@ -287,9 +220,12 @@ include(CPack)
 # Tests
 enable_testing()
 find_package(Catch2 3 QUIET)
+if(NOT Catch2_FOUND)
+    find_package(Catch2 2 QUIET)
+endif()
 if(Catch2_FOUND)
     message(STATUS "Catch2 found, enabling tests")
     add_subdirectory(tests)
 else()
-    message(STATUS "Catch2 not found, tests disabled. Install with: brew install catch2")
+    message(STATUS "Catch2 not found, tests disabled. Install catch2 development package.")
 endif()
