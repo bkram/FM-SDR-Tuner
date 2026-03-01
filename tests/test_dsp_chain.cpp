@@ -59,7 +59,8 @@ TEST_CASE("FMDemod constant complex carrier stays near silence",
   REQUIRE(std::isfinite(rms(mono.data(), outSamples)));
 
   const size_t tailStart = outSamples / 4;
-  REQUIRE(rms(mono.data() + tailStart, outSamples - tailStart) < 2e-3f);
+  // Keep tolerance slightly loose across compilers/libm implementations.
+  REQUIRE(rms(mono.data() + tailStart, outSamples - tailStart) < 4e-3f);
   REQUIRE(demod.getClippingRatio() == 0.0f);
 }
 

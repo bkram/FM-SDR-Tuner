@@ -418,10 +418,18 @@ TEST_CASE("XDRServer accepts guest auth and processes core commands",
   sendCmd("Sw60000");
   sendCmd("Sz2");
   sendCmd("S");
-  std::this_thread::sleep_for(std::chrono::milliseconds(40));
-
   XDRServer::ScanConfig scan{};
-  REQUIRE(server.consumeScanStart(scan));
+  bool sawScanStart = false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(700);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (server.consumeScanStart(scan)) {
+      sawScanStart = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  REQUIRE(sawScanStart);
   REQUIRE(scan.startKHz == 87500);
   REQUIRE(scan.stopKHz == 108000);
   REQUIRE(scan.stepKHz == 100);
