@@ -26,8 +26,7 @@ jobs:
 
     - name: Run tests
       run: |
-        cd build-coverage
-        ctest --output-on-failure
+        ctest --test-dir build-coverage --output-on-failure --no-tests=error
 
     - name: Generate coverage report
       run: |
@@ -74,8 +73,7 @@ jobs:
 
     - name: Run tests
       run: |
-        cd build
-        ctest --output-on-failure
+        ctest --test-dir build --output-on-failure --no-tests=error
 
     - name: Build Debian package
       run: |
@@ -120,8 +118,7 @@ jobs:
 
     - name: Run tests
       run: |
-        cd build
-        ctest --output-on-failure
+        ctest --test-dir build --output-on-failure --no-tests=error
 
     - name: Build Debian package
       run: |
@@ -168,8 +165,7 @@ jobs:
 
     - name: Run tests
       run: |
-        cd build
-        ctest --output-on-failure
+        ctest --test-dir build --output-on-failure --no-tests=error
 
     - name: Create RPM package
       run: |
