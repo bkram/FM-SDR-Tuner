@@ -25,6 +25,7 @@ jobs:
           mingw-w64-x86_64-cmake
           mingw-w64-x86_64-ninja
           mingw-w64-x86_64-pkgconf
+          mingw-w64-x86_64-catch2
           mingw-w64-x86_64-openssl
           mingw-w64-x86_64-rtl-sdr
 
@@ -55,6 +56,12 @@ jobs:
       shell: msys2 {0}
       run: |
         ./build/fm-sdr-tuner.exe --help
+
+    - name: Run tests (MinGW-w64)
+      shell: msys2 {0}
+      run: |
+        cd build
+        ctest --output-on-failure
 
     - name: Bundle runtime dependencies (MinGW-w64)
       shell: msys2 {0}

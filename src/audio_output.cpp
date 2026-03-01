@@ -40,161 +40,6 @@ bool parseHwDeviceGlobal(const std::string &selector, int &card, int &device) {
 } // namespace
 #endif
 
-#if defined(FM_TUNER_HAS_PORTAUDIO)
-namespace {
-std::string trim(const std::string &value) {
-  size_t start = 0;
-  while (start < value.size() &&
-         std::isspace(static_cast<unsigned char>(value[start])) != 0) {
-    start++;
-  }
-  size_t end = value.size();
-  while (end > start &&
-         std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
-    end--;
-  }
-  return value.substr(start, end - start);
-}
-
-std::string normalizeSelector(const std::string &rawSelector) {
-  std::string selector = trim(rawSelector);
-  if (selector.size() >= 2) {
-    const char first = selector.front();
-    const char last = selector.back();
-    if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
-      selector = trim(selector.substr(1, selector.size() - 2));
-    }
-  }
-  return selector;
-}
-
-std::string toLower(std::string value) {
-  std::transform(
-      value.begin(), value.end(), value.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return value;
-}
-
-bool parseDeviceIndex(const std::string &selector, int &outIndex) {
-  if (selector.empty()) {
-    return false;
-  }
-  for (char c : selector) {
-    if (c < '0' || c > '9') {
-      return false;
-    }
-  }
-  outIndex = std::stoi(selector);
-  return true;
-}
-
-bool parseHwDevice(const std::string &selector, int &card, int &device) {
-  if (selector.size() < 5 || selector.substr(0, 3) != "hw:") {
-    return false;
-  }
-  size_t comma = selector.find(',', 3);
-  if (comma == std::string::npos) {
-    return false;
-  }
-  std::string cardStr = selector.substr(3, comma - 3);
-  std::string devStr = selector.substr(comma + 1);
-  if (cardStr.empty() || devStr.empty()) {
-    return false;
-  }
-  for (char c : cardStr) {
-    if (c < '0' || c > '9')
-      return false;
-  }
-  for (char c : devStr) {
-    if (c < '0' || c > '9')
-      return false;
-  }
-  card = std::stoi(cardStr);
-  device = std::stoi(devStr);
-  return true;
-}
-
-PaDeviceIndex selectOutputDevice(const std::string &selector) {
-  if (selector.empty()) {
-    return Pa_GetDefaultOutputDevice();
-  }
-
-  int requestedIndex = -1;
-  if (parseDeviceIndex(selector, requestedIndex)) {
-    const int deviceCount = Pa_GetDeviceCount();
-    if (requestedIndex >= 0 && requestedIndex < deviceCount) {
-      const PaDeviceInfo *info = Pa_GetDeviceInfo(requestedIndex);
-      if (info && info->maxOutputChannels > 0) {
-        return static_cast<PaDeviceIndex>(requestedIndex);
-      }
-    }
-    return paNoDevice;
-  }
-
-  int hwCard = -1, hwDev = -1;
-  if (parseHwDevice(selector, hwCard, hwDev)) {
-    char hwPattern[32];
-    std::snprintf(hwPattern, sizeof(hwPattern), "(hw:%d,%d)", hwCard, hwDev);
-    const int deviceCount = Pa_GetDeviceCount();
-    for (int i = 0; i < deviceCount; i++) {
-      const PaDeviceInfo *info = Pa_GetDeviceInfo(i);
-      if (!info || info->maxOutputChannels <= 0 || !info->name) {
-        continue;
-      }
-      if (std::strstr(info->name, hwPattern) != nullptr) {
-        return static_cast<PaDeviceIndex>(i);
-      }
-    }
-    return paNoDevice;
-  }
-
-  const std::string needle = toLower(selector);
-  const int deviceCount = Pa_GetDeviceCount();
-  for (int i = 0; i < deviceCount; i++) {
-    const PaDeviceInfo *info = Pa_GetDeviceInfo(i);
-    if (!info || info->maxOutputChannels <= 0 || !info->name) {
-      continue;
-    }
-    if (toLower(info->name).find(needle) != std::string::npos) {
-      return static_cast<PaDeviceIndex>(i);
-    }
-  }
-
-  return paNoDevice;
-}
-
-void printOutputDeviceList() {
-  const int deviceCount = Pa_GetDeviceCount();
-  std::cout << "Available audio output devices:\n";
-  for (int i = 0; i < deviceCount; i++) {
-    const PaDeviceInfo *info = Pa_GetDeviceInfo(i);
-    if (!info || info->maxOutputChannels <= 0 || !info->name) {
-      continue;
-    }
-    const char *name = info->name;
-    if (std::strstr(name, "lavrate") != nullptr ||
-        std::strstr(name, "samplerate") != nullptr ||
-        std::strstr(name, "speexrate") != nullptr ||
-        std::strstr(name, "upmix") != nullptr ||
-        std::strstr(name, "vdownmix") != nullptr ||
-        std::strstr(name, "dmix") != nullptr ||
-        std::strstr(name, "oss") != nullptr ||
-        std::strstr(name, "pipewire") != nullptr ||
-        std::strstr(name, "pulse") != nullptr) {
-      continue;
-    }
-    std::cout << "  [" << i << "] " << name;
-    const PaHostApiInfo *api = Pa_GetHostApiInfo(info->hostApi);
-    if (api) {
-      std::cout << " (API: " << api->name << ")";
-    }
-    std::cout << "\n";
-  }
-}
-} // namespace
-
-#endif
-
 #if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
 namespace {
 std::string trimCoreAudio(const std::string &value) {
@@ -450,25 +295,15 @@ UINT selectWinMMDevice(const std::string &selector) {
 
 bool AudioOutput::listDevices() {
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
-  listAlsaDevices();
+  return listAlsaDevices();
 #elif defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
   return listCoreAudioDevices();
 #elif defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
   return listWinMMDevices();
-#elif defined(FM_TUNER_HAS_PORTAUDIO)
-  PaError err = Pa_Initialize();
-  if (err != paNoError) {
-    std::cerr << "PortAudio init failed: " << Pa_GetErrorText(err) << std::endl;
-    return false;
-  }
-  printOutputDeviceList();
-  Pa_Terminate();
 #else
-  std::cerr << "Audio device listing is unavailable in this build "
-               "(enable PortAudio on macOS/Windows or ALSA on Linux)\n";
+  std::cerr << "Audio device listing is unavailable in this build\n";
   return false;
 #endif
-  return true;
 }
 
 #if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
@@ -798,102 +633,6 @@ void AudioOutput::shutdownAlsa() {
 }
 #endif
 
-#if defined(FM_TUNER_HAS_PORTAUDIO)
-void AudioOutput::runOutputThread() {
-  constexpr size_t kBlockSamples =
-      static_cast<size_t>(FRAMES_PER_BUFFER) * CHANNELS;
-  std::vector<float> block(kBlockSamples, 0.0f);
-  float lastL = 0.0f;
-  float lastR = 0.0f;
-
-  while (m_outputThreadRunning.load()) {
-    size_t copied = 0;
-    {
-      std::unique_lock<std::mutex> lock(m_outputMutex);
-      m_outputCv.wait_for(lock, std::chrono::milliseconds(10), [&]() {
-        const size_t available =
-            (m_outputQueue.size() > m_outputReadIndex)
-                ? (m_outputQueue.size() - m_outputReadIndex)
-                : 0;
-        return !m_outputThreadRunning.load() || available > 0;
-      });
-
-      if (!m_outputThreadRunning.load()) {
-        break;
-      }
-
-      const size_t available = (m_outputQueue.size() > m_outputReadIndex)
-                                   ? (m_outputQueue.size() - m_outputReadIndex)
-                                   : 0;
-      copied = std::min(available, kBlockSamples);
-      if (copied > 0) {
-        std::memcpy(block.data(), m_outputQueue.data() + m_outputReadIndex,
-                    copied * sizeof(float));
-        m_outputReadIndex += copied;
-      }
-
-      if (copied >= 2) {
-        lastL = block[copied - 2];
-        lastR = block[copied - 1];
-      }
-
-      if (copied == 0) {
-        std::fill(block.begin(), block.end(), 0.0f);
-        lastL = 0.0f;
-        lastR = 0.0f;
-      } else if (copied < kBlockSamples) {
-        const size_t missing = kBlockSamples - copied;
-        constexpr int kFadeMs = 5;
-        const size_t fadeSamples = std::min(
-            missing, static_cast<size_t>(
-                         SAMPLE_RATE * (static_cast<float>(kFadeMs) / 1000.0f) *
-                         CHANNELS));
-        for (size_t i = 0; i < fadeSamples; i += 2) {
-          const float t =
-              static_cast<float>(i / 2) /
-              static_cast<float>(std::max<size_t>(1, (fadeSamples / 2) - 1));
-          const float gain = 1.0f - t;
-          const size_t idx = copied + i;
-          block[idx] = lastL * gain;
-          if (idx + 1 < kBlockSamples) {
-            block[idx + 1] = lastR * gain;
-          }
-        }
-        for (size_t i = copied + fadeSamples; i < kBlockSamples; i++) {
-          block[i] = 0.0f;
-        }
-      }
-
-      if (m_outputReadIndex > 0 &&
-          (m_outputReadIndex >= 16384 ||
-           (m_outputReadIndex * 2) >= m_outputQueue.size())) {
-        m_outputQueue.erase(m_outputQueue.begin(),
-                            m_outputQueue.begin() +
-                                static_cast<std::ptrdiff_t>(m_outputReadIndex));
-        m_outputReadIndex = 0;
-      }
-    }
-
-    const PaError writeErr =
-        Pa_WriteStream(m_paStream, block.data(), FRAMES_PER_BUFFER);
-    if (writeErr == paOutputUnderflowed) {
-      static std::atomic<uint32_t> underflowCount{0};
-      const uint32_t count = ++underflowCount;
-      if (m_verboseLogging && (count <= 5 || (count % 50) == 0)) {
-        std::cerr << "[AUDIO] output underflow (" << count
-                  << ") - consider higher system audio buffer/less CPU load\n";
-      }
-    } else if (writeErr != paNoError) {
-      if (m_verboseLogging) {
-        std::cerr << "[AUDIO] write failed: " << Pa_GetErrorText(writeErr)
-                  << "\n";
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-  }
-}
-#endif
-
 #if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
 void AudioOutput::runWinMMOutputThread() {
   // Lower WinMM device buffering to reduce end-to-end output latency.
@@ -989,11 +728,6 @@ AudioOutput::AudioOutput()
       m_wavDataSize(0), m_writeIndex(0), m_readIndex(0), m_verboseLogging(true),
       m_requestedVolumePercent(kMaxVolumePercent),
       m_currentVolumeScale(kDefaultVolumeScale)
-#if defined(FM_TUNER_HAS_PORTAUDIO)
-      ,
-      m_paStream(nullptr), m_portAudioInitialized(false),
-      m_outputThreadRunning(false), m_outputReadIndex(0)
-#endif
 #if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
       ,
       m_audioUnit(nullptr), m_outputReadIndex(0)
@@ -1024,101 +758,6 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
       return false;
     }
   }
-
-#if defined(FM_TUNER_HAS_PORTAUDIO)
-  if (enableSpeaker) {
-    const std::string normalizedSelector = normalizeSelector(deviceSelector);
-    if (verboseLogging) {
-      std::cout << "[AUDIO] device selector raw='" << deviceSelector
-                << "' normalized='" << normalizedSelector << "'\n";
-    }
-
-    PaError err = Pa_Initialize();
-    if (err != paNoError) {
-      std::cerr << "PortAudio init failed: " << Pa_GetErrorText(err)
-                << std::endl;
-      return false;
-    } else {
-      m_portAudioInitialized = true;
-      PaStreamParameters outputParams;
-      outputParams.device = selectOutputDevice(normalizedSelector);
-      if (outputParams.device == paNoDevice) {
-        std::cerr << "PortAudio device not found for selector: "
-                  << normalizedSelector << std::endl;
-        printOutputDeviceList();
-        Pa_Terminate();
-        m_portAudioInitialized = false;
-        return false;
-      }
-      outputParams.channelCount = CHANNELS;
-      outputParams.sampleFormat = paFloat32;
-      const PaDeviceInfo *deviceInfo = Pa_GetDeviceInfo(outputParams.device);
-      if (!deviceInfo) {
-        std::cerr
-            << "PortAudio failed to get device info for selected output device"
-            << std::endl;
-        Pa_Terminate();
-        m_portAudioInitialized = false;
-        return false;
-      }
-      outputParams.suggestedLatency =
-          std::max(deviceInfo->defaultLowOutputLatency,
-                   deviceInfo->defaultHighOutputLatency);
-      outputParams.hostApiSpecificStreamInfo = nullptr;
-      if (verboseLogging) {
-        if (normalizedSelector.empty()) {
-          std::cerr << "Using default output device [" << outputParams.device
-                    << "]: " << deviceInfo->name << std::endl;
-        } else {
-          std::cerr << "Using selected output device [" << outputParams.device
-                    << "]: " << deviceInfo->name << std::endl;
-        }
-      }
-
-      err = Pa_OpenStream(&m_paStream, nullptr, &outputParams, SAMPLE_RATE,
-                          FRAMES_PER_BUFFER, paClipOff, nullptr, nullptr);
-      if (err != paNoError) {
-        std::cerr << "PortAudio open failed: " << Pa_GetErrorText(err)
-                  << std::endl;
-        Pa_Terminate();
-        m_portAudioInitialized = false;
-        return false;
-      } else {
-        err = Pa_StartStream(m_paStream);
-        if (err != paNoError) {
-          std::cerr << "PortAudio start failed: " << Pa_GetErrorText(err)
-                    << std::endl;
-          Pa_CloseStream(m_paStream);
-          m_paStream = nullptr;
-          Pa_Terminate();
-          m_portAudioInitialized = false;
-          return false;
-        } else if (verboseLogging) {
-          std::cout << "[AUDIO] PortAudio started successfully" << std::endl;
-        }
-
-        float primeBuffer[FRAMES_PER_BUFFER * CHANNELS] = {0.0f};
-        for (int i = 0; i < 2; i++) {
-          const PaError primeErr =
-              Pa_WriteStream(m_paStream, primeBuffer, FRAMES_PER_BUFFER);
-          if (primeErr != paNoError && primeErr != paOutputUnderflowed) {
-            std::cerr << "PortAudio prime failed: " << Pa_GetErrorText(primeErr)
-                      << std::endl;
-            Pa_StopStream(m_paStream);
-            Pa_CloseStream(m_paStream);
-            m_paStream = nullptr;
-            Pa_Terminate();
-            m_portAudioInitialized = false;
-            return false;
-          }
-        }
-
-        m_outputThreadRunning = true;
-        m_outputThread = std::thread(&AudioOutput::runOutputThread, this);
-      }
-    }
-  }
-#endif
 
 #if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
   if (enableSpeaker) {
@@ -1285,23 +924,6 @@ void AudioOutput::shutdown() {
   shutdownAlsa();
 #endif
 
-#if defined(FM_TUNER_HAS_PORTAUDIO)
-  m_outputThreadRunning = false;
-  m_outputCv.notify_all();
-  if (m_outputThread.joinable()) {
-    m_outputThread.join();
-  }
-  if (m_paStream) {
-    Pa_StopStream(m_paStream);
-    Pa_CloseStream(m_paStream);
-    m_paStream = nullptr;
-  }
-  if (m_portAudioInitialized) {
-    Pa_Terminate();
-    m_portAudioInitialized = false;
-  }
-#endif
-
 #if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
   if (m_audioUnit) {
     AudioOutputUnitStop(m_audioUnit);
@@ -1406,13 +1028,6 @@ void AudioOutput::closeWAV() {
 }
 
 void AudioOutput::clearRealtimeQueue() {
-#if defined(FM_TUNER_HAS_PORTAUDIO)
-  if (m_paStream) {
-    std::lock_guard<std::mutex> lock(m_outputMutex);
-    m_outputQueue.clear();
-    m_outputReadIndex = 0;
-  }
-#endif
 #if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
   if (m_audioUnit) {
     std::lock_guard<std::mutex> lock(m_outputMutex);
@@ -1499,50 +1114,6 @@ bool AudioOutput::write(const float *left, const float *right,
       m_alsaBuffer[base + i * 2 + 1] = writeRight[i];
     }
     m_alsaCv.notify_one();
-  }
-#endif
-
-#if defined(FM_TUNER_HAS_PORTAUDIO)
-  if (m_enableSpeaker && m_paStream) {
-    std::lock_guard<std::mutex> lock(m_outputMutex);
-    constexpr size_t kMaxQueuedSamples =
-        static_cast<size_t>(SAMPLE_RATE) * CHANNELS;
-    const size_t queuedSamples =
-        (m_outputQueue.size() > m_outputReadIndex)
-            ? (m_outputQueue.size() - m_outputReadIndex)
-            : 0;
-    const size_t incomingSamples = numSamples * CHANNELS;
-    if (queuedSamples + incomingSamples > kMaxQueuedSamples) {
-      const size_t drop = (queuedSamples + incomingSamples) - kMaxQueuedSamples;
-      const size_t samplesToRamp =
-          std::min(drop, static_cast<size_t>(FRAMES_PER_BUFFER * CHANNELS * 4));
-      if (samplesToRamp > 0) {
-        const size_t startIdx = m_outputQueue.size() - samplesToRamp;
-        const size_t channels = CHANNELS;
-        for (size_t i = 0; i < samplesToRamp; i++) {
-          const float ramp = static_cast<float>(samplesToRamp - i) /
-                             static_cast<float>(samplesToRamp);
-          m_outputQueue[startIdx + i] *= ramp;
-        }
-      }
-      m_outputReadIndex += std::min(drop, queuedSamples);
-      if (m_verboseLogging) {
-        static std::atomic<uint32_t> dropCount{0};
-        const uint32_t count = ++dropCount;
-        if (count <= 5 || (count % 50) == 0) {
-          std::cerr << "[AUDIO] queue overflow (" << count
-                    << ") - ramping out oldest samples to prevent clicks\n";
-        }
-      }
-    }
-
-    const size_t base = m_outputQueue.size();
-    m_outputQueue.resize(base + incomingSamples);
-    for (size_t i = 0; i < numSamples; i++) {
-      m_outputQueue[base + i * 2] = writeLeft[i];
-      m_outputQueue[base + i * 2 + 1] = writeRight[i];
-    }
-    m_outputCv.notify_one();
   }
 #endif
 

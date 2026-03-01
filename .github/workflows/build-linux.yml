@@ -7,6 +7,46 @@ on:
     branches: [main, master]
 
 jobs:
+  coverage-ubuntu-24-04:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
+        $SUDO apt-get update
+        $SUDO apt-get install -y cmake g++ pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev catch2 gcovr
+
+    - name: Build with coverage
+      run: |
+        cmake -S . -B build-coverage -DCMAKE_BUILD_TYPE=Debug -DFM_TUNER_ENABLE_X86_AVX2=OFF -DFM_TUNER_ENABLE_COVERAGE=ON
+        cmake --build build-coverage -j$(nproc)
+
+    - name: Run tests
+      run: |
+        cd build-coverage
+        ctest --output-on-failure
+
+    - name: Generate coverage report
+      run: |
+        gcovr --root . build-coverage \
+          --exclude 'build-coverage/.*' \
+          --exclude 'tests/.*' \
+          --exclude 'src/redsea_port/.*' \
+          --txt --txt-summary \
+          --xml-pretty --xml build-coverage/coverage.xml \
+          --html-details build-coverage/coverage.html
+
+    - name: Upload coverage artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fm-sdr-tuner-coverage-ubuntu-24.04
+        path: |
+          build-coverage/coverage.xml
+          build-coverage/coverage.html
+
   build-ubuntu-24-04:
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -25,12 +65,17 @@ jobs:
       run: |
         if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
         $SUDO apt-get update
-        $SUDO apt-get install -y cmake g++ file dpkg-dev pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev
+        $SUDO apt-get install -y cmake g++ file dpkg-dev pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev catch2
 
     - name: Build
       run: |
         cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF
         cmake --build build -j$(nproc)
+
+    - name: Run tests
+      run: |
+        cd build
+        ctest --output-on-failure
 
     - name: Build Debian package
       run: |
@@ -66,12 +111,17 @@ jobs:
       run: |
         if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
         $SUDO apt-get update
-        $SUDO apt-get install -y cmake g++ file dpkg-dev pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev
+        $SUDO apt-get install -y cmake g++ file dpkg-dev pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev catch2
 
     - name: Build
       run: |
         cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF
         cmake --build build -j$(nproc)
+
+    - name: Run tests
+      run: |
+        cd build
+        ctest --output-on-failure
 
     - name: Build Debian package
       run: |
@@ -108,7 +158,7 @@ jobs:
         dnf install -y cmake gcc-c++ make file pkgconfig
         dnf install -y openssl-devel alsa-lib-devel
         dnf install -y rtl-sdr-devel liquid-dsp-devel
-        dnf install -y catch2-devel || true
+        dnf install -y catch2-devel
         dnf install -y rpm-build || true
 
     - name: Build
@@ -119,7 +169,7 @@ jobs:
     - name: Run tests
       run: |
         cd build
-        ctest --output-on-failure || true
+        ctest --output-on-failure
 
     - name: Create RPM package
       run: |

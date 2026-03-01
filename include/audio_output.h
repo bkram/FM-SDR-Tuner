@@ -10,9 +10,7 @@
 #include <thread>
 #include <vector>
 
-#if defined(FM_TUNER_HAS_PORTAUDIO)
-#include <portaudio.h>
-#elif defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
 #include <AudioUnit/AudioUnit.h>
 #elif defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
 #ifndef NOMINMAX
@@ -57,7 +55,6 @@ private:
   void writeWAVHeader();
   bool writeWAVData(const float *left, const float *right, size_t numSamples);
   void closeWAV();
-  void runOutputThread();
   void runAlsaOutputThread();
   static bool listAlsaDevices();
 #if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
@@ -75,13 +72,6 @@ private:
   bool initAlsa(const std::string &deviceName);
   void shutdownAlsa();
 
-#if defined(FM_TUNER_HAS_PORTAUDIO)
-  static int paCallback(const void *inputBuffer, void *outputBuffer,
-                        unsigned long framesPerBuffer,
-                        const PaStreamInfo *timeInfo, PaStreamFlags statusFlags,
-                        void *userData);
-#endif
-
   bool m_enableSpeaker;
   std::string m_wavFile;
   FILE *m_wavHandle;
@@ -94,17 +84,6 @@ private:
   bool m_verboseLogging;
   std::atomic<int> m_requestedVolumePercent;
   float m_currentVolumeScale;
-
-#if defined(FM_TUNER_HAS_PORTAUDIO)
-  PaStream *m_paStream;
-  bool m_portAudioInitialized;
-  std::thread m_outputThread;
-  std::atomic<bool> m_outputThreadRunning;
-  std::mutex m_outputMutex;
-  std::condition_variable m_outputCv;
-  std::vector<float> m_outputQueue;
-  size_t m_outputReadIndex;
-#endif
 
 #if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
   AudioUnit m_audioUnit;
