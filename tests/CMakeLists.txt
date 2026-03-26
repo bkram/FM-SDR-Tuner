@@ -24,6 +24,12 @@ target_link_libraries(test_signal_level PRIVATE
     ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
 )
+if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
+    target_link_libraries(test_signal_level PRIVATE PkgConfig::PC_LIQUID)
+else()
+    target_include_directories(test_signal_level PRIVATE ${LIQUID_INCLUDE_DIRS})
+    target_link_libraries(test_signal_level PRIVATE ${LIQUID_LIBRARIES})
+endif()
 
 add_executable(test_config test_config.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
@@ -55,6 +61,7 @@ target_link_libraries(test_app_options PRIVATE
 add_executable(test_dsp_chain test_dsp_chain.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/dsp/liquid_primitives.cpp
+    ${CMAKE_SOURCE_DIR}/src/dsp_pipeline.cpp
     ${CMAKE_SOURCE_DIR}/src/fm_demod.cpp
     ${CMAKE_SOURCE_DIR}/src/stereo_decoder.cpp
     ${CMAKE_SOURCE_DIR}/src/af_post_processor.cpp
@@ -107,6 +114,19 @@ target_link_libraries(test_audio_output PRIVATE
     Threads::Threads
 )
 
+add_executable(test_wav_writer test_wav_writer.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/wav_writer.cpp
+)
+target_include_directories(test_wav_writer PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_wav_writer PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+    Threads::Threads
+)
+
 add_executable(test_rtl_sdr_stub test_rtl_sdr_stub.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/rtl_sdr_device.cpp
@@ -119,6 +139,39 @@ target_link_libraries(test_rtl_sdr_stub PRIVATE
     ${FM_TUNER_CATCH2_TARGET}
     Threads::Threads
 )
+
+add_executable(test_rtl_sdr_live test_rtl_sdr_live.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/rtl_sdr_device.cpp
+    ${CMAKE_SOURCE_DIR}/src/signal_level.cpp
+    ${CMAKE_SOURCE_DIR}/src/cpu_features.cpp
+    ${CMAKE_SOURCE_DIR}/src/dsp_pipeline.cpp
+    ${CMAKE_SOURCE_DIR}/src/fm_demod.cpp
+    ${CMAKE_SOURCE_DIR}/src/stereo_decoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/af_post_processor.cpp
+    ${CMAKE_SOURCE_DIR}/src/dsp/liquid_primitives.cpp
+)
+target_compile_definitions(test_rtl_sdr_live PRIVATE FM_TUNER_HAS_RTLSDR)
+target_include_directories(test_rtl_sdr_live PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_rtl_sdr_live PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+    Threads::Threads
+)
+if(PC_RTLSDR_FOUND AND TARGET PkgConfig::PC_RTLSDR)
+    target_link_libraries(test_rtl_sdr_live PRIVATE PkgConfig::PC_RTLSDR)
+else()
+    target_include_directories(test_rtl_sdr_live PRIVATE ${RTLSDR_INCLUDE_DIRS})
+    target_link_libraries(test_rtl_sdr_live PRIVATE ${RTLSDR_LIBRARIES})
+endif()
+if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
+    target_link_libraries(test_rtl_sdr_live PRIVATE PkgConfig::PC_LIQUID)
+else()
+    target_include_directories(test_rtl_sdr_live PRIVATE ${LIQUID_INCLUDE_DIRS})
+    target_link_libraries(test_rtl_sdr_live PRIVATE ${LIQUID_LIBRARIES})
+endif()
 
 add_executable(test_protocol test_protocol.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
@@ -206,7 +259,10 @@ add_test(NAME app_options COMMAND test_app_options)
 add_test(NAME dsp_chain COMMAND test_dsp_chain)
 add_test(NAME runtime COMMAND test_runtime)
 add_test(NAME audio_output COMMAND test_audio_output)
+add_test(NAME wav_writer COMMAND test_wav_writer)
 add_test(NAME rtl_sdr_stub COMMAND test_rtl_sdr_stub)
+add_test(NAME rtl_sdr_live COMMAND $<TARGET_FILE:test_rtl_sdr_live>)
+set_tests_properties(rtl_sdr_live PROPERTIES SKIP_RETURN_CODE 4)
 add_test(NAME protocol COMMAND test_protocol)
 add_test(NAME xdr_unit COMMAND test_xdr_unit)
 add_test(NAME xdr_facade COMMAND test_xdr_facade)

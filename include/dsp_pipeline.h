@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,9 @@ public:
     size_t demodSamples = 0;
     bool stereoDetected = false;
     int pilotTenthsKHz = 0;
+    float stereoBlend = 0.0f;
+    float stereoQuality = 0.0f;
+    double channelPowerDbfs = std::numeric_limits<double>::quiet_NaN();
   };
 
   DspPipeline(int inputRate, int outputRate,
@@ -52,13 +56,21 @@ private:
   AFPostProcessor m_afPost;
   fm_tuner::dsp::liquid::ComplexDecimator m_iqDecimator;
 
-  std::vector<uint8_t> m_iqStaging;
+  std::vector<uint8_t> m_iqStagingRing;
+  std::vector<uint8_t> m_iqLinearizedBlock;
+  size_t m_iqStagingReadPos = 0;
+  size_t m_iqStagingWritePos = 0;
+  size_t m_iqStagingSize = 0;
   std::vector<std::complex<float>> m_iqDecimatedComplex;
   std::vector<float> m_demodBuffer;
   std::vector<float> m_stereoLeft;
   std::vector<float> m_stereoRight;
   std::vector<float> m_audioLeft;
   std::vector<float> m_audioRight;
+
+  void clearIqStaging();
+  void appendIqToStaging(const uint8_t *iq, size_t sampleCount);
+  bool linearizeDecimatorBlock(size_t sampleCount);
 };
 
 #endif

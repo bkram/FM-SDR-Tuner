@@ -306,6 +306,75 @@ bool AudioOutput::listDevices() {
 #endif
 }
 
+void AudioOutput::clearSpeakerQueueLocked() {
+  m_speakerReadPos = 0;
+  m_speakerWritePos = 0;
+  m_speakerSize = 0;
+}
+
+void AudioOutput::logSpeakerOverflow(const char *backendLabel,
+                                     uint32_t count) const {
+  if (!m_verboseLogging) {
+    return;
+  }
+  if (count <= 5 || (count % 50) == 0) {
+    std::cerr << "[AUDIO] " << backendLabel << " queue overflow (" << count
+              << ")\n";
+  }
+}
+
+void AudioOutput::pushSpeakerSamples(const float *left, const float *right,
+                                     size_t numSamples,
+                                     const char *backendLabel) {
+  if (!left || !right || numSamples == 0 || m_speakerRing.empty()) {
+    return;
+  }
+  const size_t incomingSamples = numSamples * CHANNELS;
+  const size_t capacity = m_speakerRing.size();
+  size_t startSample = 0;
+  if (incomingSamples >= capacity) {
+    startSample = (incomingSamples - capacity) / CHANNELS;
+  }
+  const size_t keptSamples = (numSamples - startSample) * CHANNELS;
+
+  std::lock_guard<std::mutex> lock(m_speakerMutex);
+  if (keptSamples > capacity) {
+    clearSpeakerQueueLocked();
+    return;
+  }
+  if (m_speakerSize + keptSamples > capacity) {
+    size_t drop = m_speakerSize + keptSamples - capacity;
+    drop = std::min(drop, m_speakerSize);
+    m_speakerReadPos = (m_speakerReadPos + drop) % capacity;
+    m_speakerSize -= drop;
+    static std::atomic<uint32_t> overflowCount{0};
+    logSpeakerOverflow(backendLabel, ++overflowCount);
+  }
+
+  for (size_t i = startSample; i < numSamples; i++) {
+    m_speakerRing[m_speakerWritePos] = left[i];
+    m_speakerWritePos = (m_speakerWritePos + 1) % capacity;
+    m_speakerRing[m_speakerWritePos] = right[i];
+    m_speakerWritePos = (m_speakerWritePos + 1) % capacity;
+  }
+  m_speakerSize += keptSamples;
+  m_speakerCv.notify_one();
+}
+
+size_t AudioOutput::popSpeakerSamplesLocked(float *dest, size_t maxSamples) {
+  if (!dest || maxSamples == 0 || m_speakerRing.empty()) {
+    return 0;
+  }
+  const size_t toRead = std::min(maxSamples, m_speakerSize);
+  const size_t capacity = m_speakerRing.size();
+  for (size_t i = 0; i < toRead; i++) {
+    dest[i] = m_speakerRing[m_speakerReadPos];
+    m_speakerReadPos = (m_speakerReadPos + 1) % capacity;
+  }
+  m_speakerSize -= toRead;
+  return toRead;
+}
+
 #if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
 bool AudioOutput::listWinMMDevices() {
   const UINT num = waveOutGetNumDevs();
@@ -354,16 +423,16 @@ OSStatus AudioOutput::coreAudioRenderCallback(void *inRefCon,
     return noErr;
   }
 
-  std::lock_guard<std::mutex> lock(self->m_outputMutex);
-  const size_t available =
-      (self->m_outputQueue.size() > self->m_outputReadIndex)
-          ? (self->m_outputQueue.size() - self->m_outputReadIndex)
-          : 0;
-  const size_t samplePairs =
-      std::min(available / 2, static_cast<size_t>(inNumberFrames));
+  std::lock_guard<std::mutex> lock(self->m_speakerMutex);
+  const size_t samplePairs = std::min(self->m_speakerSize / 2,
+                                      static_cast<size_t>(inNumberFrames));
   for (size_t i = 0; i < samplePairs; i++) {
-    const float l = self->m_outputQueue[self->m_outputReadIndex + i * 2];
-    const float r = self->m_outputQueue[self->m_outputReadIndex + i * 2 + 1];
+    const float l = self->m_speakerRing[self->m_speakerReadPos];
+    self->m_speakerReadPos =
+        (self->m_speakerReadPos + 1) % self->m_speakerRing.size();
+    const float r = self->m_speakerRing[self->m_speakerReadPos];
+    self->m_speakerReadPos =
+        (self->m_speakerReadPos + 1) % self->m_speakerRing.size();
     if (outB) {
       outA[i] = l;
       outB[i] = r;
@@ -381,17 +450,7 @@ OSStatus AudioOutput::coreAudioRenderCallback(void *inRefCon,
       outA[i * 2 + 1] = 0.0f;
     }
   }
-
-  self->m_outputReadIndex += samplePairs * 2;
-  if (self->m_outputReadIndex > 0 &&
-      (self->m_outputReadIndex >= 16384 ||
-       (self->m_outputReadIndex * 2) >= self->m_outputQueue.size())) {
-    self->m_outputQueue.erase(
-        self->m_outputQueue.begin(),
-        self->m_outputQueue.begin() +
-            static_cast<std::ptrdiff_t>(self->m_outputReadIndex));
-    self->m_outputReadIndex = 0;
-  }
+  self->m_speakerSize -= samplePairs * 2;
   return noErr;
 }
 #endif
@@ -400,33 +459,68 @@ OSStatus AudioOutput::coreAudioRenderCallback(void *inRefCon,
 bool AudioOutput::listAlsaDevices() {
   std::cout << "ALSA hardware devices:\n";
   int card = -1;
-  while (snd_card_next(&card) >= 0 && card >= 0) {
+  bool hadErrors = false;
+  bool listedAny = false;
+  int rc = snd_card_next(&card);
+  while (rc >= 0 && card >= 0) {
     char name[32];
     std::snprintf(name, sizeof(name), "hw:%d", card);
     snd_ctl_t *handle = nullptr;
-    if (snd_ctl_open(&handle, name, 0) >= 0) {
+    rc = snd_ctl_open(&handle, name, 0);
+    if (rc >= 0) {
       snd_ctl_card_info_t *info = nullptr;
       snd_ctl_card_info_alloca(&info);
-      if (snd_ctl_card_info(handle, info) >= 0) {
+      rc = snd_ctl_card_info(handle, info);
+      if (rc >= 0) {
         const char *cardName = snd_ctl_card_info_get_name(info);
         int device = -1;
-        while (snd_ctl_pcm_next_device(handle, &device) >= 0 && device >= 0) {
+        rc = snd_ctl_pcm_next_device(handle, &device);
+        while (rc >= 0 && device >= 0) {
           snd_pcm_info_t *pcminfo = nullptr;
           snd_pcm_info_alloca(&pcminfo);
           snd_pcm_info_set_device(pcminfo, device);
           snd_pcm_info_set_subdevice(pcminfo, 0);
           snd_pcm_info_set_stream(pcminfo, SND_PCM_STREAM_PLAYBACK);
-          if (snd_ctl_pcm_info(handle, pcminfo) >= 0) {
+          rc = snd_ctl_pcm_info(handle, pcminfo);
+          if (rc >= 0) {
             const char *devName = snd_pcm_info_get_name(pcminfo);
             std::cout << "  [hw:" << card << "," << device << "] " << cardName
                       << ": " << devName << "\n";
+            listedAny = true;
+          } else {
+            hadErrors = true;
+            std::cerr << "[AUDIO] ALSA snd_ctl_pcm_info(hw:" << card << ","
+                      << device << ") failed: " << snd_strerror(rc) << "\n";
           }
+          rc = snd_ctl_pcm_next_device(handle, &device);
         }
+        if (rc < 0) {
+          hadErrors = true;
+          std::cerr << "[AUDIO] ALSA snd_ctl_pcm_next_device(" << name
+                    << ") failed: " << snd_strerror(rc) << "\n";
+        }
+      } else {
+        hadErrors = true;
+        std::cerr << "[AUDIO] ALSA snd_ctl_card_info(" << name
+                  << ") failed: " << snd_strerror(rc) << "\n";
       }
       snd_ctl_close(handle);
+    } else {
+      hadErrors = true;
+      std::cerr << "[AUDIO] ALSA snd_ctl_open(" << name
+                << ") failed: " << snd_strerror(rc) << "\n";
     }
+    rc = snd_card_next(&card);
   }
-  return true;
+  if (rc < 0) {
+    hadErrors = true;
+    std::cerr << "[AUDIO] ALSA snd_card_next failed: " << snd_strerror(rc)
+              << "\n";
+  }
+  if (!listedAny) {
+    std::cout << "  (no playback hardware devices found)\n";
+  }
+  return !hadErrors;
 }
 
 bool AudioOutput::initAlsa(const std::string &deviceName) {
@@ -512,8 +606,6 @@ bool AudioOutput::initAlsa(const std::string &deviceName) {
               << " period=" << periodSize << "\n";
   }
 
-  m_alsaBuffer.reserve(static_cast<size_t>(rate) * 2);
-  m_alsaReadIndex = 0;
   m_alsaThreadRunning = true;
   m_alsaOutputThread = std::thread(&AudioOutput::runAlsaOutputThread, this);
   return true;
@@ -535,29 +627,23 @@ void AudioOutput::runAlsaOutputThread() {
   float lastR = 0.0f;
 
   while (m_alsaThreadRunning.load()) {
-    size_t samplePairs = 0;
     {
-      std::unique_lock<std::mutex> lock(m_alsaMutex);
-      m_alsaCv.wait_for(lock, std::chrono::milliseconds(50), [&]() {
-        const size_t available = (m_alsaBuffer.size() > m_alsaReadIndex)
-                                     ? (m_alsaBuffer.size() - m_alsaReadIndex)
-                                     : 0;
-        return !m_alsaThreadRunning.load() || available >= kWriteFrames * 2;
+      std::unique_lock<std::mutex> lock(m_speakerMutex);
+      m_speakerCv.wait_for(lock, std::chrono::milliseconds(50), [&]() {
+        return !m_alsaThreadRunning.load() || m_speakerSize >= kWriteFrames * 2;
       });
 
       if (!m_alsaThreadRunning.load()) {
         break;
       }
 
-      const size_t available = (m_alsaBuffer.size() > m_alsaReadIndex)
-                                   ? (m_alsaBuffer.size() - m_alsaReadIndex)
-                                   : 0;
-      samplePairs = std::min(available / 2, kWriteFrames);
-
+      const size_t sampleCount = popSpeakerSamplesLocked(
+          m_speakerScratch.data(), kWriteFrames * CHANNELS);
+      const size_t samplePairs = sampleCount / 2;
       if (samplePairs > 0) {
         for (size_t i = 0; i < samplePairs; i++) {
-          float l = m_alsaBuffer[m_alsaReadIndex + i * 2];
-          float r = m_alsaBuffer[m_alsaReadIndex + i * 2 + 1];
+          float l = m_speakerScratch[i * 2];
+          float r = m_speakerScratch[i * 2 + 1];
           l = std::clamp(l, -1.0f, 1.0f);
           r = std::clamp(r, -1.0f, 1.0f);
           interleaved[i * 2] = static_cast<int16_t>(l * kInt16Max);
@@ -565,7 +651,6 @@ void AudioOutput::runAlsaOutputThread() {
           lastL = l;
           lastR = r;
         }
-        m_alsaReadIndex += samplePairs * 2;
       }
 
       if (samplePairs < kWriteFrames) {
@@ -574,20 +659,6 @@ void AudioOutput::runAlsaOutputThread() {
           interleaved[(samplePairs + i) * 2] = 0;
           interleaved[(samplePairs + i) * 2 + 1] = 0;
         }
-      }
-
-      const size_t cleanupThreshold = std::max<size_t>(32768, kWriteFrames * 8);
-      if (m_alsaReadIndex > 0 &&
-          (m_alsaReadIndex >= cleanupThreshold ||
-           (m_alsaReadIndex * 2) >= m_alsaBuffer.size())) {
-        if (m_alsaReadIndex < m_alsaBuffer.size()) {
-          m_alsaBuffer.erase(m_alsaBuffer.begin(),
-                             m_alsaBuffer.begin() +
-                                 static_cast<std::ptrdiff_t>(m_alsaReadIndex));
-        } else {
-          m_alsaBuffer.clear();
-        }
-        m_alsaReadIndex = 0;
       }
     }
 
@@ -621,7 +692,7 @@ void AudioOutput::runAlsaOutputThread() {
 
 void AudioOutput::shutdownAlsa() {
   m_alsaThreadRunning = false;
-  m_alsaCv.notify_all();
+  m_speakerCv.notify_all();
   if (m_alsaOutputThread.joinable()) {
     m_alsaOutputThread.join();
   }
@@ -669,39 +740,23 @@ void AudioOutput::runWinMMOutputThread() {
 
     size_t copied = 0;
     {
-      std::unique_lock<std::mutex> lock(m_outputMutex);
-      m_outputCv.wait_for(lock, std::chrono::milliseconds(10), [&]() {
-        const size_t available =
-            (m_outputQueue.size() > m_outputReadIndex)
-                ? (m_outputQueue.size() - m_outputReadIndex)
-                : 0;
-        return !m_winmmThreadRunning.load() || available > 0;
+      std::unique_lock<std::mutex> lock(m_speakerMutex);
+      m_speakerCv.wait_for(lock, std::chrono::milliseconds(10), [&]() {
+        return !m_winmmThreadRunning.load() || m_speakerSize > 0;
       });
 
       if (!m_winmmThreadRunning.load()) {
         break;
       }
 
-      const size_t available = (m_outputQueue.size() > m_outputReadIndex)
-                                   ? (m_outputQueue.size() - m_outputReadIndex)
-                                   : 0;
-      copied = std::min(available, kSamplesPerBuffer);
+      copied = popSpeakerSamplesLocked(m_speakerScratch.data(), kSamplesPerBuffer);
       for (size_t i = 0; i < copied; i++) {
-        float v = m_outputQueue[m_outputReadIndex + i];
+        float v = m_speakerScratch[i];
         v = std::clamp(v, -1.0f, 1.0f);
         (*pcm)[i] = static_cast<int16_t>(v * 32767.0f);
       }
       for (size_t i = copied; i < kSamplesPerBuffer; i++) {
         (*pcm)[i] = 0;
-      }
-      m_outputReadIndex += copied;
-      if (m_outputReadIndex > 0 &&
-          (m_outputReadIndex >= 16384 ||
-           (m_outputReadIndex * 2) >= m_outputQueue.size())) {
-        m_outputQueue.erase(m_outputQueue.begin(),
-                            m_outputQueue.begin() +
-                                static_cast<std::ptrdiff_t>(m_outputReadIndex));
-        m_outputReadIndex = 0;
       }
     }
 
@@ -725,23 +780,28 @@ void AudioOutput::runWinMMOutputThread() {
 
 AudioOutput::AudioOutput()
     : m_enableSpeaker(false), m_wavHandle(nullptr), m_running(false),
-      m_wavDataSize(0), m_writeIndex(0), m_readIndex(0), m_verboseLogging(true),
+      m_wavThreadRunning(false), m_wavDataSize(0), m_verboseLogging(true),
       m_requestedVolumePercent(kMaxVolumePercent),
-      m_currentVolumeScale(kDefaultVolumeScale)
+      m_currentVolumeScale(kDefaultVolumeScale), m_speakerReadPos(0),
+      m_speakerWritePos(0), m_speakerSize(0), m_wavReadPos(0), m_wavWritePos(0),
+      m_wavSize(0)
 #if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
       ,
-      m_audioUnit(nullptr), m_outputReadIndex(0)
+      m_audioUnit(nullptr)
 #endif
 #if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
       ,
-      m_waveOut(nullptr), m_winmmThreadRunning(false), m_outputReadIndex(0)
+      m_waveOut(nullptr), m_winmmThreadRunning(false)
 #endif
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
       ,
-      m_alsaPcm(nullptr), m_alsaThreadRunning(false), m_alsaReadIndex(0)
+      m_alsaPcm(nullptr), m_alsaThreadRunning(false)
 #endif
 {
-  m_circularBuffer.resize(kCircularBufferSize * 2);
+  m_speakerRing.resize(kSpeakerQueueSamples, 0.0f);
+  m_wavRing.resize(kWavQueueSamples, 0);
+  m_speakerScratch.resize(FRAMES_PER_BUFFER * CHANNELS, 0.0f);
+  m_wavEncodeScratch.resize(FRAMES_PER_BUFFER * CHANNELS, 0);
 }
 
 AudioOutput::~AudioOutput() { shutdown(); }
@@ -751,6 +811,10 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
   m_enableSpeaker = enableSpeaker;
   m_wavFile = wavFile;
   m_verboseLogging = verboseLogging;
+  {
+    std::lock_guard<std::mutex> lock(m_speakerMutex);
+    clearSpeakerQueueLocked();
+  }
 
   if (!wavFile.empty()) {
     if (!initWAV(wavFile)) {
@@ -890,7 +954,6 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
       return false;
     }
 
-    m_outputReadIndex = 0;
     m_winmmThreadRunning = true;
     m_winmmThread = std::thread(&AudioOutput::runWinMMOutputThread, this);
     if (verboseLogging) {
@@ -935,7 +998,7 @@ void AudioOutput::shutdown() {
 
 #if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
   m_winmmThreadRunning = false;
-  m_outputCv.notify_all();
+  m_speakerCv.notify_all();
   if (m_winmmThread.joinable()) {
     m_winmmThread.join();
   }
@@ -960,8 +1023,16 @@ bool AudioOutput::initWAV(const std::string &filename) {
     return false;
   }
 
-  m_wavDataSize = 0;
+  {
+    std::lock_guard<std::mutex> lock(m_wavMutex);
+    m_wavDataSize = 0;
+    m_wavReadPos = 0;
+    m_wavWritePos = 0;
+    m_wavSize = 0;
+  }
   writeWAVHeader();
+  m_wavThreadRunning = true;
+  m_wavThread = std::thread(&AudioOutput::runWavWriterThread, this);
   return true;
 }
 
@@ -998,29 +1069,93 @@ void AudioOutput::writeWAVHeader() {
   fwrite(&dataSize, 4, 1, m_wavHandle);
 }
 
-bool AudioOutput::writeWAVData(const float *left, const float *right,
-                               size_t numSamples) {
-  if (!m_wavHandle)
+bool AudioOutput::writeWAVData(const int16_t *samples, size_t sampleCount) {
+  if (!m_wavHandle || !samples || sampleCount == 0)
     return false;
 
-  std::vector<int16_t> buffer(numSamples * CHANNELS);
+  size_t written = fwrite(samples, sizeof(int16_t), sampleCount, m_wavHandle);
+  m_wavDataSize += written * sizeof(int16_t);
+  return written == sampleCount;
+}
 
+bool AudioOutput::enqueueWavSamples(const float *left, const float *right,
+                                    size_t numSamples) {
+  if (!m_wavHandle || !left || !right || numSamples == 0 || m_wavRing.empty()) {
+    return false;
+  }
+  const size_t sampleCount = numSamples * CHANNELS;
+  if (m_wavEncodeScratch.size() < sampleCount) {
+    m_wavEncodeScratch.resize(sampleCount);
+  }
   for (size_t i = 0; i < numSamples; i++) {
-    float l = std::max(-1.0f, std::min(1.0f, left[i]));
-    float r = std::max(-1.0f, std::min(1.0f, right[i]));
-    buffer[i * 2] = static_cast<int16_t>(l * kInt16Max);
-    buffer[i * 2 + 1] = static_cast<int16_t>(r * kInt16Max);
+    const float l = std::clamp(left[i], -1.0f, 1.0f);
+    const float r = std::clamp(right[i], -1.0f, 1.0f);
+    m_wavEncodeScratch[i * 2] = static_cast<int16_t>(l * kInt16Max);
+    m_wavEncodeScratch[i * 2 + 1] = static_cast<int16_t>(r * kInt16Max);
   }
 
-  size_t written = fwrite(buffer.data(), sizeof(int16_t), numSamples * CHANNELS,
-                          m_wavHandle);
-  m_wavDataSize += written * sizeof(int16_t);
+  std::lock_guard<std::mutex> lock(m_wavMutex);
+  const size_t capacity = m_wavRing.size();
+  size_t start = 0;
+  if (sampleCount >= capacity) {
+    start = sampleCount - capacity;
+  }
+  const size_t kept = sampleCount - start;
+  if (m_wavSize + kept > capacity) {
+    size_t drop = m_wavSize + kept - capacity;
+    drop = std::min(drop, m_wavSize);
+    m_wavReadPos = (m_wavReadPos + drop) % capacity;
+    m_wavSize -= drop;
+    if (m_verboseLogging) {
+      static std::atomic<uint32_t> overflowCount{0};
+      const uint32_t count = ++overflowCount;
+      if (count <= 5 || (count % 50) == 0) {
+        std::cerr << "[AUDIO] WAV queue overflow (" << count << ")\n";
+      }
+    }
+  }
+  for (size_t i = start; i < sampleCount; i++) {
+    m_wavRing[m_wavWritePos] = m_wavEncodeScratch[i];
+    m_wavWritePos = (m_wavWritePos + 1) % capacity;
+  }
+  m_wavSize += kept;
+  m_wavCv.notify_one();
+  return true;
+}
 
-  return written == numSamples * CHANNELS;
+void AudioOutput::runWavWriterThread() {
+  std::vector<int16_t> localBuffer(FRAMES_PER_BUFFER * CHANNELS, 0);
+  while (true) {
+    size_t copied = 0;
+    {
+      std::unique_lock<std::mutex> lock(m_wavMutex);
+      m_wavCv.wait_for(lock, std::chrono::milliseconds(50), [&]() {
+        return !m_wavThreadRunning.load() || m_wavSize > 0;
+      });
+      if (!m_wavThreadRunning.load() && m_wavSize == 0) {
+        break;
+      }
+      if (m_wavSize == 0) {
+        continue;
+      }
+      copied = std::min(localBuffer.size(), m_wavSize);
+      for (size_t i = 0; i < copied; i++) {
+        localBuffer[i] = m_wavRing[m_wavReadPos];
+        m_wavReadPos = (m_wavReadPos + 1) % m_wavRing.size();
+      }
+      m_wavSize -= copied;
+    }
+    (void)writeWAVData(localBuffer.data(), copied);
+  }
 }
 
 void AudioOutput::closeWAV() {
   if (m_wavHandle) {
+    m_wavThreadRunning = false;
+    m_wavCv.notify_all();
+    if (m_wavThread.joinable()) {
+      m_wavThread.join();
+    }
     writeWAVHeader();
     fclose(m_wavHandle);
     m_wavHandle = nullptr;
@@ -1028,20 +1163,8 @@ void AudioOutput::closeWAV() {
 }
 
 void AudioOutput::clearRealtimeQueue() {
-#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
-  if (m_audioUnit) {
-    std::lock_guard<std::mutex> lock(m_outputMutex);
-    m_outputQueue.clear();
-    m_outputReadIndex = 0;
-  }
-#endif
-#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
-  if (m_waveOut) {
-    std::lock_guard<std::mutex> lock(m_outputMutex);
-    m_outputQueue.clear();
-    m_outputReadIndex = 0;
-  }
-#endif
+  std::lock_guard<std::mutex> lock(m_speakerMutex);
+  clearSpeakerQueueLocked();
 }
 
 bool AudioOutput::write(const float *left, const float *right,
@@ -1049,14 +1172,16 @@ bool AudioOutput::write(const float *left, const float *right,
   if (!m_running)
     return false;
 
-  std::vector<float> scaledLeft;
-  std::vector<float> scaledRight;
   const float *writeLeft = left;
   const float *writeRight = right;
 
   if (left && right && numSamples > 0) {
-    scaledLeft.resize(numSamples);
-    scaledRight.resize(numSamples);
+    if (m_scaledLeftScratch.size() < numSamples) {
+      m_scaledLeftScratch.resize(numSamples);
+    }
+    if (m_scaledRightScratch.size() < numSamples) {
+      m_scaledRightScratch.resize(numSamples);
+    }
     const float targetVolumeScale =
         (static_cast<float>(
              m_requestedVolumePercent.load(std::memory_order_relaxed)) /
@@ -1074,108 +1199,31 @@ bool AudioOutput::write(const float *left, const float *right,
           m_currentVolumeScale = targetVolumeScale;
         }
       }
-      scaledLeft[i] = left[i] * m_currentVolumeScale;
-      scaledRight[i] = right[i] * m_currentVolumeScale;
+      m_scaledLeftScratch[i] = left[i] * m_currentVolumeScale;
+      m_scaledRightScratch[i] = right[i] * m_currentVolumeScale;
     }
-    writeLeft = scaledLeft.data();
-    writeRight = scaledRight.data();
+    writeLeft = m_scaledLeftScratch.data();
+    writeRight = m_scaledRightScratch.data();
   }
 
   if (m_wavHandle) {
-    writeWAVData(writeLeft, writeRight, numSamples);
+    (void)enqueueWavSamples(writeLeft, writeRight, numSamples);
   }
 
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
   if (m_enableSpeaker && m_alsaPcm) {
-    std::lock_guard<std::mutex> lock(m_alsaMutex);
-    // App-side queue cap of ~0.5 s to prevent large latency buildup.
-    constexpr size_t kMaxQueuedSamples =
-        (static_cast<size_t>(SAMPLE_RATE) * CHANNELS) / 2;
-    const size_t queuedSamples = (m_alsaBuffer.size() > m_alsaReadIndex)
-                                     ? (m_alsaBuffer.size() - m_alsaReadIndex)
-                                     : 0;
-    const size_t incomingSamples = numSamples * CHANNELS;
-    if (queuedSamples + incomingSamples > kMaxQueuedSamples) {
-      const size_t drop = (queuedSamples + incomingSamples) - kMaxQueuedSamples;
-      m_alsaReadIndex += std::min(drop, queuedSamples);
-      if (m_verboseLogging) {
-        static std::atomic<uint32_t> dropCount{0};
-        const uint32_t count = ++dropCount;
-        if (count <= 5 || (count % 50) == 0) {
-          std::cerr << "[AUDIO] ALSA queue overflow (" << count << ")\n";
-        }
-      }
-    }
-
-    const size_t base = m_alsaBuffer.size();
-    m_alsaBuffer.resize(base + incomingSamples);
-    for (size_t i = 0; i < numSamples; i++) {
-      m_alsaBuffer[base + i * 2] = writeLeft[i];
-      m_alsaBuffer[base + i * 2 + 1] = writeRight[i];
-    }
-    m_alsaCv.notify_one();
+    pushSpeakerSamples(writeLeft, writeRight, numSamples, "ALSA");
   }
 #endif
 
 #if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
   if (m_enableSpeaker && m_audioUnit) {
-    std::lock_guard<std::mutex> lock(m_outputMutex);
-    // Match Linux app-queue target: cap to ~0.5 s.
-    constexpr size_t kMaxQueuedSamples =
-        (static_cast<size_t>(SAMPLE_RATE) * CHANNELS) / 2;
-    const size_t queuedSamples =
-        (m_outputQueue.size() > m_outputReadIndex)
-            ? (m_outputQueue.size() - m_outputReadIndex)
-            : 0;
-    const size_t incomingSamples = numSamples * CHANNELS;
-    if (queuedSamples + incomingSamples > kMaxQueuedSamples) {
-      const size_t drop = (queuedSamples + incomingSamples) - kMaxQueuedSamples;
-      m_outputReadIndex += std::min(drop, queuedSamples);
-      if (m_verboseLogging) {
-        static std::atomic<uint32_t> dropCount{0};
-        const uint32_t count = ++dropCount;
-        if (count <= 5 || (count % 50) == 0) {
-          std::cerr << "[AUDIO] CoreAudio queue overflow (" << count << ")\n";
-        }
-      }
-    }
-    const size_t base = m_outputQueue.size();
-    m_outputQueue.resize(base + incomingSamples);
-    for (size_t i = 0; i < numSamples; i++) {
-      m_outputQueue[base + i * 2] = writeLeft[i];
-      m_outputQueue[base + i * 2 + 1] = writeRight[i];
-    }
+    pushSpeakerSamples(writeLeft, writeRight, numSamples, "CoreAudio");
   }
 #endif
 #if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
   if (m_enableSpeaker && m_waveOut) {
-    std::lock_guard<std::mutex> lock(m_outputMutex);
-    // Match Linux app-queue target: cap to ~0.5 s.
-    constexpr size_t kMaxQueuedSamples =
-        (static_cast<size_t>(SAMPLE_RATE) * CHANNELS) / 2;
-    const size_t queuedSamples =
-        (m_outputQueue.size() > m_outputReadIndex)
-            ? (m_outputQueue.size() - m_outputReadIndex)
-            : 0;
-    const size_t incomingSamples = numSamples * CHANNELS;
-    if (queuedSamples + incomingSamples > kMaxQueuedSamples) {
-      const size_t drop = (queuedSamples + incomingSamples) - kMaxQueuedSamples;
-      m_outputReadIndex += std::min(drop, queuedSamples);
-      if (m_verboseLogging) {
-        static std::atomic<uint32_t> dropCount{0};
-        const uint32_t count = ++dropCount;
-        if (count <= 5 || (count % 50) == 0) {
-          std::cerr << "[AUDIO] WinMM queue overflow (" << count << ")\n";
-        }
-      }
-    }
-    const size_t base = m_outputQueue.size();
-    m_outputQueue.resize(base + incomingSamples);
-    for (size_t i = 0; i < numSamples; i++) {
-      m_outputQueue[base + i * 2] = writeLeft[i];
-      m_outputQueue[base + i * 2 + 1] = writeRight[i];
-    }
-    m_outputCv.notify_one();
+    pushSpeakerSamples(writeLeft, writeRight, numSamples, "WinMM");
   }
 #endif
 

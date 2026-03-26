@@ -45,6 +45,9 @@ private:
   size_t m_ringWritePos;
   bool m_ringFull;
   std::atomic<bool> m_lowLatencyMode;
+  std::atomic<uint32_t> m_lowLatencyDropEvents;
+  std::atomic<uint32_t> m_lowLatencyDeadlineEvents;
+  std::atomic<uint32_t> m_lowLatencyShortReads;
 };
 
 #endif

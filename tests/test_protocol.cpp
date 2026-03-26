@@ -1,6 +1,7 @@
 #include "catch_compat.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -169,6 +170,31 @@ bool waitForExactLine(int sock, const std::string &expected,
   return false;
 }
 
+bool waitForSocketClose(int sock, std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  char ch = '\0';
+  while (std::chrono::steady_clock::now() < deadline) {
+    const int n = recv(sock, &ch, 1, 0);
+    if (n == 0) {
+      return true;
+    }
+    if (n < 0) {
+#if defined(_WIN32)
+      const int err = WSAGetLastError();
+      if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT) {
+        continue;
+      }
+#else
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
+      }
+#endif
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 TEST_CASE("Protocol test harness baseline", "[protocol]") {
@@ -330,6 +356,66 @@ TEST_CASE("RTLTCPClient command and IQ handling with mock rtl_tcp server",
   REQUIRE(serverOk.load());
 }
 
+TEST_CASE("RTLTCPClient rejects malformed rtl_tcp header",
+          "[protocol][rtl_tcp]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  std::atomic<bool> serverReady{false};
+
+  std::thread server([&]() {
+    int listenSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenSock < 0) {
+      return;
+    }
+    const int opt = 1;
+#if defined(_WIN32)
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char *>(&opt), sizeof(opt));
+#else
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
+
+    sockaddr_in addr{};
+#if defined(__APPLE__)
+    addr.sin_len = sizeof(addr);
+#endif
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (bind(listenSock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
+        listen(listenSock, 1) != 0) {
+      closeSock(listenSock);
+      return;
+    }
+    serverReady = true;
+
+    sockaddr_in clientAddr{};
+    SocketLen clientLen = sizeof(clientAddr);
+    int clientSock =
+        accept(listenSock, reinterpret_cast<sockaddr *>(&clientAddr), &clientLen);
+    if (clientSock >= 0) {
+      const uint8_t header[12] = {'B', 'A', 'D', '0', 0, 0, 0, 0, 0, 0, 0, 0};
+      (void)sendAll(clientSock, header, sizeof(header));
+      closeSock(clientSock);
+    }
+    closeSock(listenSock);
+  });
+
+  for (int i = 0; i < 50 && !serverReady.load(); i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  REQUIRE(serverReady.load());
+
+  RTLTCPClient client("127.0.0.1", port);
+  REQUIRE_FALSE(client.connect());
+  server.join();
+}
+
 TEST_CASE("XDRServer accepts guest auth and processes core commands",
           "[protocol][xdr]") {
 #if defined(_WIN32)
@@ -475,6 +561,126 @@ TEST_CASE("XDRServer RDS forwarding requires error-free block B",
   server.updateRDS(0x3333, 0xBBBB, 0x3333, 0x4444, 0x10);
   REQUIRE_FALSE(waitForExactLine(sock, "RBBBB3333444410",
                                  std::chrono::milliseconds(400)));
+
+  closeSock(sock);
+  server.stop();
+}
+
+TEST_CASE("XDRServer disconnects clients that send oversized unterminated lines",
+          "[protocol][xdr]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  server.setGuestMode(true);
+  REQUIRE(server.start());
+
+  int sock = connectLoopback(port);
+  setRecvTimeoutMs(sock, 250);
+
+  std::string line;
+  REQUIRE(recvLine(sock, line));
+  REQUIRE(line.size() == XDRServer::SALT_LENGTH);
+  const std::string badHash = "P0000000000000000000000000000000000000000\n";
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(badHash.data()),
+                  badHash.size()));
+  REQUIRE(waitForPrefixLine(sock, "a1", std::chrono::milliseconds(500)));
+  REQUIRE(waitForPrefixLine(sock, "o0,1", std::chrono::milliseconds(500)));
+  REQUIRE(waitForPrefixLine(sock, "I", std::chrono::milliseconds(500)));
+
+  const std::string oversized(1500, 'A');
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(oversized.data()),
+                  oversized.size()));
+  REQUIRE(waitForSocketClose(sock, std::chrono::milliseconds(1000)));
+
+  closeSock(sock);
+  server.stop();
+}
+
+TEST_CASE("XDRServer disconnects FM-DX clients that send oversized unterminated lines",
+          "[protocol][xdr][fmdx]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  REQUIRE(server.start());
+
+  int sock = connectLoopback(port);
+  setRecvTimeoutMs(sock, 250);
+
+  const std::string handshake = "x\n";
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(handshake.data()),
+                  handshake.size()));
+  REQUIRE(waitForExactLine(sock, "1", std::chrono::milliseconds(500)));
+
+  const std::string oversized(1500, 'x');
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(oversized.data()),
+                  oversized.size()));
+  REQUIRE(waitForSocketClose(sock, std::chrono::milliseconds(1000)));
+
+  closeSock(sock);
+  server.stop();
+}
+
+TEST_CASE("XDRServer rejects oversized FM-DX handshake lines",
+          "[protocol][xdr][fmdx]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  REQUIRE(server.start());
+
+  int sock = connectLoopback(port);
+  setRecvTimeoutMs(sock, 250);
+
+  const std::string oversizedHandshake(20, 'x');
+  const std::string payload = oversizedHandshake + "\n";
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(payload.data()),
+                  payload.size()));
+  REQUIRE(waitForSocketClose(sock, std::chrono::milliseconds(1000)));
+
+  closeSock(sock);
+  server.stop();
+}
+
+TEST_CASE("XDRServer rejects oversized XDR auth lines", "[protocol][xdr]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  REQUIRE(server.start());
+
+  int sock = connectLoopback(port);
+  setRecvTimeoutMs(sock, 250);
+
+  std::string line;
+  REQUIRE(recvLine(sock, line));
+  REQUIRE(line.size() == XDRServer::SALT_LENGTH);
+
+  const std::string oversizedAuth = "P" + std::string(80, 'A') + "\n";
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(oversizedAuth.data()),
+                  oversizedAuth.size()));
+  REQUIRE(waitForSocketClose(sock, std::chrono::milliseconds(1000)));
 
   closeSock(sock);
   server.stop();

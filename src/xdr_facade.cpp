@@ -1,5 +1,4 @@
 #include "xdr_facade.h"
-
 #include <algorithm>
 #include <iostream>
 
@@ -43,6 +42,12 @@ void XdrFacade::installCallbacks(
       }
       return false;
     }
+    if (m_options.fixedLocalGain) {
+      if (m_options.verboseLogging) {
+        std::cout << "[XDR] G command ignored (fixed local gain)\n";
+      }
+      return false;
+    }
     if (!m_options.allowClientGainOverride) {
       if (m_options.verboseLogging) {
         std::cout << "[XDR] G command ignored (client_gain_allowed=false)\n";
@@ -64,6 +69,12 @@ void XdrFacade::installCallbacks(
     if (m_options.useSdrppGainStrategy) {
       if (m_options.verboseLogging) {
         std::cout << "[XDR] A command ignored (gain_strategy=sdrpp)\n";
+      }
+      return false;
+    }
+    if (m_options.fixedLocalGain) {
+      if (m_options.verboseLogging) {
+        std::cout << "[XDR] A command ignored (fixed local gain)\n";
       }
       return false;
     }
@@ -89,7 +100,7 @@ void XdrFacade::installCallbacks(
   });
 
   m_server.setBandwidthCallback([&](int bandwidth) {
-    m_state.requestedBandwidthHz = std::clamp(bandwidth, 0, 400000);
+    m_state.requestedBandwidthHz = bandwidth;
     m_state.pendingBandwidth = true;
     if (m_options.verboseLogging) {
       std::cout << "[XDR] W" << m_state.requestedBandwidthHz.load()

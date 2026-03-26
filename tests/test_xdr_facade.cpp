@@ -54,6 +54,10 @@ TEST_CASE("XdrFacade wires callbacks into command state", "[xdr_facade]") {
   REQUIRE(state.requestedBandwidthHz.load(std::memory_order_relaxed) == 150000);
   REQUIRE(state.pendingBandwidth.load(std::memory_order_relaxed));
 
+  REQUIRE(server.processCommand("W250000", true, false) == "W250000");
+  REQUIRE(state.requestedBandwidthHz.load(std::memory_order_relaxed) == 250000);
+  REQUIRE(state.pendingBandwidth.load(std::memory_order_relaxed));
+
   REQUIRE(server.processCommand("D2", true, false) == "D2");
   REQUIRE(state.requestedDeemphasis.load(std::memory_order_relaxed) == 2);
 
@@ -73,6 +77,31 @@ TEST_CASE("XdrFacade respects gain override policy", "[xdr_facade]") {
                    {.verboseLogging = false,
                     .useSdrppGainStrategy = false,
                     .allowClientGainOverride = false});
+
+  facade.configureServer("", false);
+  facade.installCallbacks(
+      [&](int) {}, [&]() {}, [&]() {},
+      [&](int custom) {
+        return std::to_string((custom / 10) % 10) + std::to_string(custom % 10);
+      });
+
+  REQUIRE(server.processCommand("G10", true, false) == "G00");
+  REQUIRE(server.processCommand("A3", true, false) == "A2");
+  REQUIRE_FALSE(state.pendingGain.load(std::memory_order_relaxed));
+  REQUIRE_FALSE(state.pendingAGC.load(std::memory_order_relaxed));
+  REQUIRE(state.requestedCustomGain.load(std::memory_order_relaxed) == 11);
+  REQUIRE(state.requestedAGCMode.load(std::memory_order_relaxed) == 2);
+}
+
+TEST_CASE("XdrFacade ignores client gain commands when fixed local gain is set",
+          "[xdr_facade]") {
+  XDRServer server(7382);
+  XdrCommandState state(88600000u, 11, 2, 0, 55, 1, false);
+  XdrFacade facade(server, state,
+                   {.verboseLogging = false,
+                    .useSdrppGainStrategy = false,
+                    .allowClientGainOverride = true,
+                    .fixedLocalGain = true});
 
   facade.configureServer("", false);
   facade.installCallbacks(

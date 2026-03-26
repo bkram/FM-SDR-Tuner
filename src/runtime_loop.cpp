@@ -7,6 +7,15 @@
 
 namespace runtime_loop {
 
+namespace {
+
+int tefAgcGainDb(int agcMode) {
+  static constexpr int kAgcToGainDb[4] = {44, 36, 30, 24};
+  return kAgcToGainDb[std::clamp(agcMode, 0, 3)];
+}
+
+} // namespace
+
 bool handleControlAndScan(
     ScanEngine &scanEngine, XDRServer &xdrServer,
     std::atomic<uint32_t> &requestedFrequencyHz,
@@ -18,7 +27,7 @@ bool handleControlAndScan(
     DspPipeline &dspPipeline, size_t kRetuneMuteSamples,
     size_t &retuneMuteSamplesRemaining, size_t &retuneMuteTotalSamples,
     const std::function<void(const char *reason)> &applyRtlGainAndAgc,
-    const std::function<void(uint32_t)> &tunerSetFrequency,
+    const std::function<bool(uint32_t)> &tunerSetFrequency,
     const std::function<size_t(uint8_t *, size_t)> &tunerReadIQ,
     const std::function<void(const uint8_t *, size_t)> &writeIqCapture,
     const std::chrono::milliseconds &scanRetrySleep, uint8_t *iqBuffer,
@@ -32,12 +41,17 @@ bool handleControlAndScan(
                            restoreAfterScan);
 
   if (rtlConnected && pendingFrequency.exchange(false)) {
-    tunerSetFrequency(requestedFrequencyHz.load());
-    audioOut.clearRealtimeQueue();
-    dspRuntime.reset(fm_tuner::dsp::ResetReason::Retune);
-    retuneMuteSamplesRemaining = kRetuneMuteSamples;
-    retuneMuteTotalSamples = kRetuneMuteSamples;
-    rdsWorker.requestReset();
+    const uint32_t targetFrequencyHz = requestedFrequencyHz.load();
+    if (tunerSetFrequency(targetFrequencyHz)) {
+      audioOut.clearRealtimeQueue();
+      dspRuntime.reset(fm_tuner::dsp::ResetReason::Retune);
+      retuneMuteSamplesRemaining = kRetuneMuteSamples;
+      retuneMuteTotalSamples = kRetuneMuteSamples;
+      rdsWorker.requestReset();
+    } else {
+      std::cerr << "[SDR] warning: failed to retune to "
+                << (targetFrequencyHz / 1000U) << " kHz\n";
+    }
   }
 
   const bool gainChanged = pendingGain.exchange(false);
@@ -92,7 +106,8 @@ void maybeAdjustAutoGain(
       lastGainDown = now;
       if (verboseLogging) {
         std::cout << "[GAIN] clip-protect: A" << current << " -> A"
-                  << (current + 1) << " (dbfs=" << std::fixed
+                  << (current + 1) << " (" << tefAgcGainDb(current) << " dB -> "
+                  << tefAgcGainDb(current + 1) << " dB, dbfs=" << std::fixed
                   << std::setprecision(2) << signal.dbfs
                   << ", clip=" << std::setprecision(4) << clipRatio << ")\n";
       }
@@ -105,7 +120,8 @@ void maybeAdjustAutoGain(
       lastGainUp = now;
       if (verboseLogging) {
         std::cout << "[GAIN] sensitivity-up: A" << current << " -> A"
-                  << (current - 1) << " (comp=" << std::fixed
+                  << (current - 1) << " (" << tefAgcGainDb(current) << " dB -> "
+                  << tefAgcGainDb(current - 1) << " dB, comp=" << std::fixed
                   << std::setprecision(2) << signal.compensatedDbfs
                   << ", clip=" << std::setprecision(4) << clipRatio << ")\n";
       }

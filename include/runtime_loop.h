@@ -29,7 +29,7 @@ bool handleControlAndScan(
     DspPipeline &dspPipeline, size_t kRetuneMuteSamples,
     size_t &retuneMuteSamplesRemaining, size_t &retuneMuteTotalSamples,
     const std::function<void(const char *reason)> &applyRtlGainAndAgc,
-    const std::function<void(uint32_t)> &tunerSetFrequency,
+    const std::function<bool(uint32_t)> &tunerSetFrequency,
     const std::function<size_t(uint8_t *, size_t)> &tunerReadIQ,
     const std::function<void(const uint8_t *, size_t)> &writeIqCapture,
     const std::chrono::milliseconds &scanRetrySleep, uint8_t *iqBuffer,

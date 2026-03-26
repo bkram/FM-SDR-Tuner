@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "af_post_processor.h"
+#include "config.h"
+#include "dsp_pipeline.h"
 #include "fm_demod.h"
 #include "stereo_decoder.h"
 
@@ -34,6 +36,24 @@ float meanAbsDiff(const float *a, const float *b, size_t count) {
     acc += std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
   }
   return static_cast<float>(acc / static_cast<double>(count));
+}
+
+float toneMagnitude(const float *data, size_t count, int sampleRate,
+                    float toneHz) {
+  if (!data || count == 0 || sampleRate <= 0 || toneHz <= 0.0f) {
+    return 0.0f;
+  }
+  constexpr float kTwoPi = 6.2831853071795864769f;
+  double accI = 0.0;
+  double accQ = 0.0;
+  for (size_t i = 0; i < count; i++) {
+    const float phase =
+        kTwoPi * toneHz * (static_cast<float>(i) / static_cast<float>(sampleRate));
+    accI += static_cast<double>(data[i]) * std::cos(phase);
+    accQ += static_cast<double>(data[i]) * std::sin(phase);
+  }
+  return static_cast<float>(
+      std::sqrt((accI * accI) + (accQ * accQ)) / static_cast<double>(count));
 }
 
 } // namespace
@@ -289,4 +309,396 @@ TEST_CASE("Stereo decoder force-stereo recovers channel separation on synthetic 
   const size_t settle = kSamples / 4;
   const float sep = meanAbsDiff(left.data() + settle, right.data() + settle, out - settle);
   REQUIRE(sep > 0.03f);
+}
+
+TEST_CASE("Stereo decoder reduces blend when stereo difference path gets noisy",
+          "[dsp][stereo]") {
+  constexpr int kInputRate = 256000;
+  constexpr size_t kSamples = 65536;
+  constexpr size_t kBlock = 4096;
+  constexpr float kPilotHz = 19000.0f;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  auto makeMpx = [](float noiseAmplitude) {
+    std::vector<float> mpx(kSamples, 0.0f);
+    uint32_t state = 0x2468ace1u;
+    auto nextNoise = [&]() -> float {
+      state = state * 1664525u + 1013904223u;
+      const uint32_t bits = (state >> 8) & 0x00ffffffu;
+      return (static_cast<float>(bits) / 8388607.5f) - 1.0f;
+    };
+    for (size_t i = 0; i < kSamples; i++) {
+      const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+      const float l = 0.45f * std::sin(kTwoPi * 1000.0f * t);
+      const float r = 0.45f * std::sin(kTwoPi * 2800.0f * t);
+      const float lr = l - r;
+      const float mono = l + r;
+      const float pilot = 0.08f * std::sin(kTwoPi * kPilotHz * t);
+      const float dsb = 0.25f * lr * std::sin(kTwoPi * (2.0f * kPilotHz) * t);
+      const float noise = noiseAmplitude * nextNoise();
+      mpx[i] = mono + pilot + dsb + noise;
+    }
+    return mpx;
+  };
+
+  StereoDecoder clean(kInputRate, 32000);
+  StereoDecoder noisy(kInputRate, 32000);
+
+  const std::vector<float> cleanMpx = makeMpx(0.0f);
+  const std::vector<float> noisyMpx = makeMpx(0.22f);
+
+  std::vector<float> cleanLeft(kSamples, 0.0f);
+  std::vector<float> cleanRight(kSamples, 0.0f);
+  std::vector<float> noisyLeft(kSamples, 0.0f);
+  std::vector<float> noisyRight(kSamples, 0.0f);
+
+  size_t cleanOut = 0;
+  size_t noisyOut = 0;
+  for (size_t offset = 0; offset < kSamples; offset += kBlock) {
+    const size_t count = std::min(kBlock, kSamples - offset);
+    cleanOut += clean.processAudio(cleanMpx.data() + offset, cleanLeft.data() + offset,
+                                   cleanRight.data() + offset, count);
+    noisyOut += noisy.processAudio(noisyMpx.data() + offset, noisyLeft.data() + offset,
+                                   noisyRight.data() + offset, count);
+  }
+
+  REQUIRE(cleanOut == kSamples);
+  REQUIRE(noisyOut == kSamples);
+
+  const size_t settle = kSamples / 4;
+  const float cleanSep =
+      meanAbsDiff(cleanLeft.data() + settle, cleanRight.data() + settle,
+                  kSamples - settle);
+  const float noisySep =
+      meanAbsDiff(noisyLeft.data() + settle, noisyRight.data() + settle,
+                  kSamples - settle);
+
+  REQUIRE(clean.isStereo());
+  REQUIRE(clean.getStereoQuality() > noisy.getStereoQuality());
+  REQUIRE(clean.getStereoBlend() > noisy.getStereoBlend());
+  REQUIRE(cleanSep > noisySep);
+}
+
+TEST_CASE("Stereo decoder releases blend quickly when quality degrades",
+          "[dsp][stereo]") {
+  constexpr int kInputRate = 256000;
+  constexpr size_t kBlock = 4096;
+  constexpr size_t kWarmBlocks = 20;
+  constexpr size_t kNoisyBlocks = 3;
+  constexpr float kPilotHz = 19000.0f;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  auto makeBlock = [](float noiseAmplitude, uint32_t seedBase, size_t sampleOffset) {
+    std::vector<float> mpx(kBlock, 0.0f);
+    uint32_t state = seedBase;
+    auto nextNoise = [&]() -> float {
+      state = state * 1664525u + 1013904223u;
+      const uint32_t bits = (state >> 8) & 0x00ffffffu;
+      return (static_cast<float>(bits) / 8388607.5f) - 1.0f;
+    };
+    for (size_t i = 0; i < kBlock; i++) {
+      const float t = static_cast<float>(sampleOffset + i) /
+                      static_cast<float>(kInputRate);
+      const float l = 0.45f * std::sin(kTwoPi * 1000.0f * t);
+      const float r = 0.45f * std::sin(kTwoPi * 2800.0f * t);
+      const float lr = l - r;
+      const float mono = l + r;
+      const float pilot = 0.08f * std::sin(kTwoPi * kPilotHz * t);
+      const float dsb = 0.25f * lr * std::sin(kTwoPi * (2.0f * kPilotHz) * t);
+      mpx[i] = mono + pilot + dsb + (noiseAmplitude * nextNoise());
+    }
+    return mpx;
+  };
+
+  StereoDecoder stereo(kInputRate, 32000);
+  std::vector<float> left(kBlock, 0.0f);
+  std::vector<float> right(kBlock, 0.0f);
+
+  for (size_t block = 0; block < kWarmBlocks; ++block) {
+    const std::vector<float> clean =
+        makeBlock(0.0f, 0x1000u + static_cast<uint32_t>(block), block * kBlock);
+    REQUIRE(stereo.processAudio(clean.data(), left.data(), right.data(), kBlock) == kBlock);
+  }
+
+  const float warmBlend = stereo.getStereoBlend();
+  REQUIRE(stereo.isStereo());
+  REQUIRE(warmBlend > 0.75f);
+
+  float lastNoisyBlend = warmBlend;
+  for (size_t block = 0; block < kNoisyBlocks; ++block) {
+    const std::vector<float> noisy = makeBlock(
+        0.30f, 0x2000u + static_cast<uint32_t>(block),
+        (kWarmBlocks + block) * kBlock);
+    REQUIRE(stereo.processAudio(noisy.data(), left.data(), right.data(), kBlock) == kBlock);
+    lastNoisyBlend = stereo.getStereoBlend();
+  }
+
+  REQUIRE(lastNoisyBlend < warmBlend - 0.10f);
+}
+
+TEST_CASE("Stereo decoder acquires lock through brief marginal pilot blocks",
+          "[dsp][stereo]") {
+  constexpr int kInputRate = 256000;
+  constexpr size_t kBlock = 4096;
+  constexpr float kPilotHz = 19000.0f;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  auto makeBlock = [](float pilotAmp, size_t sampleOffset) {
+    std::vector<float> mpx(kBlock, 0.0f);
+    for (size_t i = 0; i < kBlock; i++) {
+      const float t = static_cast<float>(sampleOffset + i) /
+                      static_cast<float>(kInputRate);
+      const float l = 0.45f * std::sin(kTwoPi * 1000.0f * t);
+      const float r = 0.45f * std::sin(kTwoPi * 2800.0f * t);
+      const float lr = l - r;
+      const float mono = l + r;
+      const float pilot = pilotAmp * std::sin(kTwoPi * kPilotHz * t);
+      const float dsb = 0.25f * lr * std::sin(kTwoPi * (2.0f * kPilotHz) * t);
+      mpx[i] = mono + pilot + dsb;
+    }
+    return mpx;
+  };
+
+  StereoDecoder stereo(kInputRate, 32000);
+  std::vector<float> left(kBlock, 0.0f);
+  std::vector<float> right(kBlock, 0.0f);
+
+  const float pilotSequence[] = {0.08f, 0.08f, 0.05f, 0.08f, 0.08f};
+  for (size_t block = 0; block < (sizeof(pilotSequence) / sizeof(pilotSequence[0]));
+       ++block) {
+    const std::vector<float> mpx =
+        makeBlock(pilotSequence[block], block * kBlock);
+    REQUIRE(stereo.processAudio(mpx.data(), left.data(), right.data(), kBlock) ==
+            kBlock);
+  }
+
+  REQUIRE(stereo.isStereo());
+}
+
+TEST_CASE("Stereo decoder does not treat clean high-frequency stereo content as noise",
+          "[dsp][stereo]") {
+  constexpr int kInputRate = 256000;
+  constexpr size_t kSamples = 65536;
+  constexpr size_t kBlock = 4096;
+  constexpr float kPilotHz = 19000.0f;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  auto makeMpx = [&](float rightHz) {
+    std::vector<float> mpx(kSamples, 0.0f);
+    for (size_t i = 0; i < kSamples; i++) {
+      const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+      const float l = 0.45f * std::sin(kTwoPi * 1000.0f * t);
+      const float r = 0.45f * std::sin(kTwoPi * rightHz * t);
+      const float lr = l - r;
+      const float mono = l + r;
+      const float pilot = 0.08f * std::sin(kTwoPi * kPilotHz * t);
+      const float dsb = 0.25f * lr * std::sin(kTwoPi * (2.0f * kPilotHz) * t);
+      mpx[i] = mono + pilot + dsb;
+    }
+    return mpx;
+  };
+
+  StereoDecoder lowFreq(kInputRate, 32000);
+  StereoDecoder highFreq(kInputRate, 32000);
+
+  const std::vector<float> lowFreqMpx = makeMpx(2800.0f);
+  const std::vector<float> highFreqMpx = makeMpx(9500.0f);
+  std::vector<float> left(kBlock, 0.0f);
+  std::vector<float> right(kBlock, 0.0f);
+
+  for (size_t offset = 0; offset < kSamples; offset += kBlock) {
+    const size_t count = std::min(kBlock, kSamples - offset);
+    REQUIRE(lowFreq.processAudio(lowFreqMpx.data() + offset, left.data(), right.data(),
+                                 count) == count);
+    REQUIRE(highFreq.processAudio(highFreqMpx.data() + offset, left.data(), right.data(),
+                                  count) == count);
+  }
+
+  REQUIRE(lowFreq.isStereo());
+  REQUIRE(highFreq.isStereo());
+  REQUIRE(highFreq.getStereoQuality() > 0.65f);
+  REQUIRE(highFreq.getStereoBlend() > 0.75f);
+  REQUIRE(std::abs(highFreq.getStereoBlend() - lowFreq.getStereoBlend()) < 0.15f);
+}
+
+TEST_CASE("Stereo decoder reconstructs left and right channels with correct dominance",
+          "[dsp][stereo]") {
+  constexpr int kInputRate = 256000;
+  constexpr size_t kSamples = 65536;
+  constexpr size_t kBlock = 4096;
+  constexpr float kPilotHz = 19000.0f;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+  constexpr float kLeftHz = 1000.0f;
+  constexpr float kRightHz = 2800.0f;
+
+  std::vector<float> mpx(kSamples, 0.0f);
+  for (size_t i = 0; i < kSamples; i++) {
+    const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+    const float l = 0.45f * std::sin(kTwoPi * kLeftHz * t);
+    const float r = 0.45f * std::sin(kTwoPi * kRightHz * t);
+    const float lr = l - r;
+    const float mono = l + r;
+    const float pilot = 0.08f * std::sin(kTwoPi * kPilotHz * t);
+    const float dsb = 0.25f * lr * std::sin(kTwoPi * (2.0f * kPilotHz) * t);
+    mpx[i] = mono + pilot + dsb;
+  }
+
+  StereoDecoder stereo(kInputRate, 32000);
+  std::vector<float> left(kSamples, 0.0f);
+  std::vector<float> right(kSamples, 0.0f);
+
+  size_t out = 0;
+  for (size_t offset = 0; offset < kSamples; offset += kBlock) {
+    const size_t count = std::min(kBlock, kSamples - offset);
+    out += stereo.processAudio(mpx.data() + offset, left.data() + offset,
+                               right.data() + offset, count);
+  }
+
+  REQUIRE(out == kSamples);
+  REQUIRE(stereo.isStereo());
+  REQUIRE(stereo.getStereoBlend() > 0.75f);
+
+  const size_t settle = kSamples / 4;
+  const float leftAtLeftHz =
+      toneMagnitude(left.data() + settle, kSamples - settle, kInputRate, kLeftHz);
+  const float leftAtRightHz =
+      toneMagnitude(left.data() + settle, kSamples - settle, kInputRate, kRightHz);
+  const float rightAtRightHz = toneMagnitude(right.data() + settle, kSamples - settle,
+                                             kInputRate, kRightHz);
+  const float rightAtLeftHz =
+      toneMagnitude(right.data() + settle, kSamples - settle, kInputRate, kLeftHz);
+
+  REQUIRE(leftAtLeftHz > leftAtRightHz);
+  REQUIRE(rightAtRightHz > rightAtLeftHz);
+}
+
+TEST_CASE("Stereo decoder matrix keeps normal stereo program material out of hard clip range",
+          "[dsp][stereo]") {
+  constexpr int kInputRate = 256000;
+  constexpr size_t kSamples = 65536;
+  constexpr size_t kBlock = 4096;
+  constexpr float kPilotHz = 19000.0f;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  std::vector<float> mpx(kSamples, 0.0f);
+  for (size_t i = 0; i < kSamples; i++) {
+    const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+    const float l = 0.70f * std::sin(kTwoPi * 1000.0f * t);
+    const float r = 0.70f * std::sin(kTwoPi * 2800.0f * t);
+    const float lr = l - r;
+    const float mono = l + r;
+    const float pilot = 0.08f * std::sin(kTwoPi * kPilotHz * t);
+    const float dsb = 0.25f * lr * std::sin(kTwoPi * (2.0f * kPilotHz) * t);
+    mpx[i] = mono + pilot + dsb;
+  }
+
+  StereoDecoder stereo(kInputRate, 32000);
+  std::vector<float> left(kSamples, 0.0f);
+  std::vector<float> right(kSamples, 0.0f);
+
+  size_t out = 0;
+  float maxAbs = 0.0f;
+  for (size_t offset = 0; offset < kSamples; offset += kBlock) {
+    const size_t count = std::min(kBlock, kSamples - offset);
+    out += stereo.processAudio(mpx.data() + offset, left.data() + offset,
+                               right.data() + offset, count);
+    for (size_t i = 0; i < count; i++) {
+      maxAbs = std::max(maxAbs, std::abs(left[offset + i]));
+      maxAbs = std::max(maxAbs, std::abs(right[offset + i]));
+    }
+  }
+
+  REQUIRE(out == kSamples);
+  REQUIRE(maxAbs < 0.95f);
+}
+
+TEST_CASE("Stereo decoder locks and separates channels with rotated pilot phase",
+          "[dsp][stereo]") {
+  constexpr int kInputRate = 256000;
+  constexpr size_t kSamples = 65536;
+  constexpr size_t kBlock = 4096;
+  constexpr float kPilotHz = 19000.0f;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+  constexpr float kPilotPhase = 0.85f;
+
+  std::vector<float> mpx(kSamples, 0.0f);
+  for (size_t i = 0; i < kSamples; i++) {
+    const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+    const float l = 0.45f * std::sin(kTwoPi * 1000.0f * t);
+    const float r = 0.45f * std::sin(kTwoPi * 3200.0f * t);
+    const float lr = l - r;
+    const float mono = l + r;
+    const float pilot = 0.08f * std::sin((kTwoPi * kPilotHz * t) + kPilotPhase);
+    const float dsb =
+        0.25f * lr * std::sin((kTwoPi * (2.0f * kPilotHz) * t) + (2.0f * kPilotPhase));
+    mpx[i] = mono + pilot + dsb;
+  }
+
+  StereoDecoder stereo(kInputRate, 32000);
+  std::vector<float> left(kSamples, 0.0f);
+  std::vector<float> right(kSamples, 0.0f);
+
+  size_t out = 0;
+  for (size_t offset = 0; offset < kSamples; offset += kBlock) {
+    const size_t count = std::min(kBlock, kSamples - offset);
+    out += stereo.processAudio(mpx.data() + offset, left.data() + offset,
+                               right.data() + offset, count);
+  }
+
+  REQUIRE(out == kSamples);
+  REQUIRE(stereo.isStereo());
+  REQUIRE(stereo.getStereoBlend() > 0.70f);
+
+  const size_t settle = kSamples / 4;
+  const float sep =
+      meanAbsDiff(left.data() + settle, right.data() + settle, kSamples - settle);
+  REQUIRE(sep > 0.03f);
+}
+
+TEST_CASE("DspPipeline decimation staging handles fragmented high-rate IQ without shuffling semantics",
+          "[dsp][pipeline]") {
+  Config::ProcessingSection processing;
+  processing.stereo = false;
+  processing.w0_bandwidth_hz = 194000;
+
+  constexpr int kInputRate = 256000;
+  constexpr int kOutputRate = 32000;
+  constexpr size_t kBlockSamples = 8192;
+  constexpr size_t kIqDecimation = 4;
+
+  DspPipeline pipeline(kInputRate, kOutputRate, processing, false,
+                       kBlockSamples, kIqDecimation);
+  REQUIRE(pipeline.sdrBlockSamples() == kBlockSamples * kIqDecimation);
+
+  const size_t totalIqSamples = pipeline.sdrBlockSamples() * 2;
+  std::vector<uint8_t> iq(totalIqSamples * 2, 0);
+  for (size_t i = 0; i < totalIqSamples; i++) {
+    iq[i * 2] = 140;
+    iq[i * 2 + 1] = 110;
+  }
+
+  const size_t fragments[] = {3000, 5000, 7000, 9000, 8768, 1000, 2000, 5000, 6768};
+  size_t offset = 0;
+  size_t producedBlocks = 0;
+  size_t fragmentIndex = 0;
+  while (offset < totalIqSamples) {
+    const size_t fragmentSamples =
+        fragments[fragmentIndex % (sizeof(fragments) / sizeof(fragments[0]))];
+    const size_t chunk = std::min(fragmentSamples, totalIqSamples - offset);
+    DspPipeline::Result out;
+    const bool have = pipeline.process(
+        iq.data() + (offset * 2), chunk,
+        [](const float *, size_t) {}, out);
+    if (have) {
+      REQUIRE(out.demodSamples == kBlockSamples);
+      REQUIRE(out.outSamples > 900);
+      REQUIRE(std::isfinite(out.left[std::min<size_t>(10, out.outSamples - 1)]));
+      producedBlocks++;
+    }
+    offset += chunk;
+    fragmentIndex++;
+  }
+
+  REQUIRE(offset == totalIqSamples);
+  REQUIRE(producedBlocks == 2);
 }

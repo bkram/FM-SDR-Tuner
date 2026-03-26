@@ -31,6 +31,8 @@ void AFPostProcessor::reset() {
 void AFPostProcessor::setDeemphasis(int tau_us) {
   if (tau_us <= 0) {
     m_deemphasisEnabled = false;
+    m_liquidLeftDeemphasis.reset();
+    m_liquidRightDeemphasis.reset();
     return;
   }
 

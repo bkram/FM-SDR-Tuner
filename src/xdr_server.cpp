@@ -1,4 +1,5 @@
 #include "xdr_server.h"
+#include "tuning_limits.h"
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -32,6 +33,8 @@ using SocketLen = int;
 using SocketLen = socklen_t;
 #endif
 
+constexpr size_t kMaxClientCommandLen = 1024;
+
 uint64_t steadyNowMs() {
   return static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -49,6 +52,25 @@ void setRecvTimeoutMs(int clientSocket, int timeoutMs) {
   tv.tv_sec = timeoutMs / 1000;
   tv.tv_usec = (timeoutMs % 1000) * 1000;
   setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+void configureSendNoSigPipe(int sock) {
+#if defined(SO_NOSIGPIPE)
+  const int opt = 1;
+  setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+#else
+  (void)sock;
+#endif
+}
+
+int sendSocket(int sock, const char *data, size_t len) {
+#if defined(_WIN32)
+  return send(sock, data, static_cast<int>(len), 0);
+#elif defined(MSG_NOSIGNAL)
+  return static_cast<int>(send(sock, data, len, MSG_NOSIGNAL));
+#else
+  return static_cast<int>(send(sock, data, len, 0));
 #endif
 }
 
@@ -107,7 +129,7 @@ bool recvLine(int clientSocket, std::string &line, size_t maxLen) {
     char ch = '\0';
     const auto n = recv(clientSocket, &ch, 1, 0);
     if (n <= 0) {
-      return !line.empty();
+      return false;
     }
 
     if (ch == '\n') {
@@ -119,7 +141,16 @@ bool recvLine(int clientSocket, std::string &line, size_t maxLen) {
     }
   }
 
-  return true;
+  line.clear();
+  return false;
+}
+
+bool commandBufferOverflowed(const std::string &commandBuffer) {
+  const size_t newlinePos = commandBuffer.find('\n');
+  if (newlinePos != std::string::npos) {
+    return newlinePos > kMaxClientCommandLen;
+  }
+  return commandBuffer.size() > kMaxClientCommandLen;
 }
 
 bool parseIntValue(const std::string &arg, int &out) {
@@ -242,13 +273,26 @@ void XDRServer::removeClientSocket(int clientSocket) {
   }
 }
 
+void XDRServer::joinClientThreads() {
+  std::vector<std::thread> threads;
+  {
+    std::lock_guard<std::mutex> lock(m_clientThreadsMutex);
+    threads.swap(m_clientThreads);
+  }
+  for (std::thread &thread : threads) {
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+}
+
 XDRServer::XDRServer(uint16_t port)
     : m_port(port), m_serverSocket(-1), m_running(false),
-      m_activeClientThreads(0), m_guestMode(false), m_verboseLogging(true),
-      m_mode(0), m_frequency(88500000), m_volume(100), m_deemphasis(0),
-      m_filter(-1), m_bandwidth(0), m_antenna(0), m_gain(0), m_agcMode(2),
-      m_daa(0), m_squelch(0), m_rotator(0), m_samplingInterval(66),
-      m_detector(0), m_forceMono(false), m_signalDeci(0), m_signalStereo(false),
+      m_guestMode(false), m_verboseLogging(true), m_mode(0),
+      m_frequency(88500000), m_volume(100), m_deemphasis(0), m_filter(-1),
+      m_bandwidth(0), m_antenna(0), m_gain(0), m_agcMode(2), m_daa(0),
+      m_squelch(0), m_rotator(0), m_samplingInterval(66), m_detector(0),
+      m_forceMono(false), m_signalDeci(0), m_signalStereo(false),
       m_signalForcedMono(false), m_cci(-1), m_aci(-1), m_pilotTenthsKHz(0) {
   m_scanStartKHz = 87500;
   m_scanStopKHz = 108000;
@@ -556,14 +600,12 @@ bool XDRServer::start() {
 
       if (clientSocket >= 0) {
         addClientSocket(clientSocket);
-        m_activeClientThreads.fetch_add(1, std::memory_order_relaxed);
-        std::thread([this, clientSocket]() {
+        std::lock_guard<std::mutex> lock(m_clientThreadsMutex);
+        m_clientThreads.emplace_back([this, clientSocket]() {
           handleClient(clientSocket);
           removeClientSocket(clientSocket);
           closeSocket(clientSocket);
-          m_activeClientThreads.fetch_sub(1, std::memory_order_relaxed);
-          m_clientThreadWaitCv.notify_all();
-        }).detach();
+        });
       } else if (m_running && socketInterrupted(lastSocketError())) {
         continue;
       }
@@ -601,14 +643,11 @@ void XDRServer::stop() {
   if (m_acceptThread.joinable()) {
     m_acceptThread.join();
   }
-
-  std::unique_lock<std::mutex> lock(m_clientThreadWaitMutex);
-  m_clientThreadWaitCv.wait_for(lock, std::chrono::seconds(2), [&]() {
-    return m_activeClientThreads.load(std::memory_order_relaxed) == 0;
-  });
+  joinClientThreads();
 }
 
 void XDRServer::handleClient(int clientSocket) {
+  configureSendNoSigPipe(clientSocket);
   char clientIP[INET_ADDRSTRLEN];
   struct sockaddr_in clientAddr;
   SocketLen clientLen = sizeof(clientAddr);
@@ -637,7 +676,7 @@ void XDRServer::handleClient(int clientSocket) {
     if (m_verboseLogging.load()) {
       std::cout << "[XDR] detected FM-DX protocol handshake" << std::endl;
     }
-    send(clientSocket, "1\n", 2, 0);
+    sendSocket(clientSocket, "1\n", 2);
     handleFmdxClient(clientSocket);
   } else {
     if (m_verboseLogging.load()) {
@@ -670,9 +709,24 @@ void XDRServer::handleFmdxClient(int clientSocket) {
 
     cmdBuffer[n] = '\0';
     command += cmdBuffer;
+    if (commandBufferOverflowed(command)) {
+      if (m_verboseLogging.load()) {
+        std::cout << "[XDR] closing FM-DX client due to oversized command line"
+                  << std::endl;
+      }
+      break;
+    }
 
     size_t pos;
     while ((pos = command.find('\n')) != std::string::npos) {
+      if (pos > kMaxClientCommandLen) {
+        if (m_verboseLogging.load()) {
+          std::cout << "[XDR] closing FM-DX client due to oversized command line"
+                    << std::endl;
+        }
+        setRecvTimeoutMs(clientSocket, 0);
+        return;
+      }
       std::string line = command.substr(0, pos);
       command = command.substr(pos + 1);
 
@@ -685,22 +739,22 @@ void XDRServer::handleFmdxClient(int clientSocket) {
         if (m_startCallback) {
           m_startCallback();
         }
-        send(clientSocket, "1\n", 2, 0);
+        sendSocket(clientSocket, "1\n", 2);
       } else if (line == "X") {
         tunerStarted = false;
         if (m_stopCallback) {
           m_stopCallback();
         }
-        send(clientSocket, "1\n", 2, 0);
+        sendSocket(clientSocket, "1\n", 2);
       } else if (tunerStarted) {
         std::string response = processFmdxCommand(line);
         response += "\n";
-        if (send(clientSocket, response.c_str(), response.length(), 0) <= 0) {
+        if (sendSocket(clientSocket, response.c_str(), response.length()) <= 0) {
           disconnectRequested = true;
           break;
         }
       } else {
-        if (send(clientSocket, "ER\n", 3, 0) <= 0) {
+        if (sendSocket(clientSocket, "ER\n", 3) <= 0) {
           disconnectRequested = true;
           break;
         }
@@ -728,7 +782,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
   }
 
   std::string msg = salt + "\n";
-  send(clientSocket, msg.c_str(), msg.length(), 0);
+  sendSocket(clientSocket, msg.c_str(), msg.length());
 
   std::string authMsg;
   if (!recvLine(clientSocket, authMsg, HASH_LENGTH + 2)) {
@@ -758,15 +812,15 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
   }
 
   if (!authSuccess && !m_guestMode) {
-    send(clientSocket, "a0\n", 3, 0);
+    sendSocket(clientSocket, "a0\n", 3);
     return;
   }
 
   if (!authSuccess && m_guestMode) {
-    send(clientSocket, "a1\n", 3, 0);
+    sendSocket(clientSocket, "a1\n", 3);
     guestSession = true;
   } else {
-    send(clientSocket, "a2\n", 3, 0);
+    sendSocket(clientSocket, "a2\n", 3);
     guestSession = false;
   }
 
@@ -787,11 +841,11 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
       }
     }
     std::string online = guestSession ? "o0,1\n" : "o1,0\n";
-    send(clientSocket, online.c_str(), online.length(), 0);
+    sendSocket(clientSocket, online.c_str(), online.length());
 
     std::string snapshot = buildXdrStateSnapshot();
     snapshot += "\n";
-    send(clientSocket, snapshot.c_str(), snapshot.length(), 0);
+    sendSocket(clientSocket, snapshot.c_str(), snapshot.length());
   }
 
   char cmdBuffer[256];
@@ -816,7 +870,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
         }
         for (const std::string &rdsLineBase : rdsLines) {
           std::string rdsLine = rdsLineBase + "\n";
-          if (send(clientSocket, rdsLine.c_str(), rdsLine.length(), 0) <= 0) {
+          if (sendSocket(clientSocket, rdsLine.c_str(), rdsLine.length()) <= 0) {
             sendFailed = true;
             break;
           }
@@ -837,7 +891,8 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
         }
         for (const std::string &scanLineBase : scanLines) {
           std::string scanLine = scanLineBase + "\n";
-          if (send(clientSocket, scanLine.c_str(), scanLine.length(), 0) <= 0) {
+          if (sendSocket(clientSocket, scanLine.c_str(), scanLine.length()) <=
+              0) {
             sendFailed = true;
             break;
           }
@@ -867,7 +922,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
             if (piValue != 0xFFFF) {
               char piLine[16];
               std::snprintf(piLine, sizeof(piLine), "P%04X\n", piValue);
-              if (send(clientSocket, piLine, std::strlen(piLine), 0) <= 0) {
+              if (sendSocket(clientSocket, piLine, std::strlen(piLine)) <= 0) {
                 break;
               }
             }
@@ -875,7 +930,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
 
           std::string signalMsg = buildSignalLine();
           signalMsg += "\n";
-          if (send(clientSocket, signalMsg.c_str(), signalMsg.length(), 0) <=
+          if (sendSocket(clientSocket, signalMsg.c_str(), signalMsg.length()) <=
               0) {
             break;
           }
@@ -891,9 +946,24 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
 
     cmdBuffer[n] = '\0';
     command += cmdBuffer;
+    if (commandBufferOverflowed(command)) {
+      if (m_verboseLogging.load()) {
+        std::cout << "[XDR] closing XDR client due to oversized command line"
+                  << std::endl;
+      }
+      break;
+    }
 
     size_t pos;
     while ((pos = command.find('\n')) != std::string::npos) {
+      if (pos > kMaxClientCommandLen) {
+        if (m_verboseLogging.load()) {
+          std::cout << "[XDR] closing XDR client due to oversized command line"
+                    << std::endl;
+        }
+        setRecvTimeoutMs(clientSocket, 0);
+        return;
+      }
       std::string line = command.substr(0, pos);
       command = command.substr(pos + 1);
 
@@ -904,7 +974,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
       std::string response = processCommand(line, authenticated, guestSession);
       if (!response.empty()) {
         response += "\n";
-        send(clientSocket, response.c_str(), response.length(), 0);
+        sendSocket(clientSocket, response.c_str(), response.length());
       }
     }
   }
@@ -967,10 +1037,14 @@ std::string XDRServer::processCommand(const std::string &cmd,
       if (parseIntValue(arg.substr(1), value)) {
         switch (sub) {
         case 'a':
-          m_scanStartKHz = std::clamp(value, 64000, 120000);
+          m_scanStartKHz =
+              std::clamp(value, static_cast<int>(fm_tuner::kFmBroadcastMinFreqKHz),
+                         static_cast<int>(fm_tuner::kFmBroadcastMaxFreqKHz));
           break;
         case 'b':
-          m_scanStopKHz = std::clamp(value, 64000, 120000);
+          m_scanStopKHz =
+              std::clamp(value, static_cast<int>(fm_tuner::kFmBroadcastMinFreqKHz),
+                         static_cast<int>(fm_tuner::kFmBroadcastMaxFreqKHz));
           break;
         case 'c':
           m_scanStepKHz = std::clamp(value, 5, 1000);
@@ -993,6 +1067,9 @@ std::string XDRServer::processCommand(const std::string &cmd,
   case 'T': {
     uint32_t freqHz = 0;
     if (!parseFrequencyHz(arg, freqHz)) {
+      return "";
+    }
+    if (!fm_tuner::isValidFmBroadcastFreqHz(freqHz)) {
       return "";
     }
     m_frequency = freqHz;
@@ -1342,3 +1419,4 @@ std::string XDRServer::processFmdxCommand(const std::string &cmd) {
     return "ER";
   }
 }
+constexpr size_t kMaxClientCommandLen = 1024;

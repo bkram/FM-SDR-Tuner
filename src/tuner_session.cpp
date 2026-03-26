@@ -32,9 +32,10 @@ void TunerSession::connect() {
     return;
   }
 
-  std::cout << "[SDR] connected; setting frequency to " << m_params.initialFreqKHz
-            << " kHz...\n";
-  const bool okFreq = m_tuner.setFrequency(m_requestedFrequencyHz());
+  const uint32_t requestedFrequencyHz = m_requestedFrequencyHz();
+  std::cout << "[SDR] connected; setting frequency to "
+            << (requestedFrequencyHz / 1000U) << " kHz...\n";
+  const bool okFreq = m_tuner.setFrequency(requestedFrequencyHz);
   const bool okRate = m_tuner.setSampleRate(m_params.iqSampleRate);
   bool okPpm = true;
   if (m_params.freqCorrectionPpm != 0) {

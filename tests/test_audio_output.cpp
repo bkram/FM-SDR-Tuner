@@ -83,3 +83,37 @@ TEST_CASE("AudioOutput write fails when not running and volume clamps",
   out.setVolumePercent(250);
   REQUIRE(out.m_requestedVolumePercent.load() == AudioOutput::kMaxVolumePercent);
 }
+
+TEST_CASE("AudioOutput speaker ring keeps newest samples and clears cleanly",
+          "[audio_output]") {
+  AudioOutput out;
+  out.m_speakerRing.assign(8, 0.0f);
+
+  const float leftA[3] = {1.0f, 2.0f, 3.0f};
+  const float rightA[3] = {10.0f, 20.0f, 30.0f};
+  out.pushSpeakerSamples(leftA, rightA, 3, "test");
+  REQUIRE(out.m_speakerSize == 6);
+
+  const float leftB[3] = {4.0f, 5.0f, 6.0f};
+  const float rightB[3] = {40.0f, 50.0f, 60.0f};
+  out.pushSpeakerSamples(leftB, rightB, 3, "test");
+  REQUIRE(out.m_speakerSize == out.m_speakerRing.size());
+
+  std::vector<float> popped(out.m_speakerRing.size(), 0.0f);
+  {
+    std::lock_guard<std::mutex> lock(out.m_speakerMutex);
+    const size_t copied = out.popSpeakerSamplesLocked(popped.data(), popped.size());
+    REQUIRE(copied == popped.size());
+  }
+  const std::vector<float> expected = {3.0f, 30.0f, 4.0f, 40.0f,
+                                       5.0f, 50.0f, 6.0f, 60.0f};
+  REQUIRE(popped == expected);
+
+  {
+    std::lock_guard<std::mutex> lock(out.m_speakerMutex);
+    out.clearSpeakerQueueLocked();
+    REQUIRE(out.m_speakerSize == 0);
+    REQUIRE(out.m_speakerReadPos == 0);
+    REQUIRE(out.m_speakerWritePos == 0);
+  }
+}

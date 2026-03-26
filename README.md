@@ -118,6 +118,110 @@ Example dependency install (triplet/package names may vary by your vcpkg setup):
 vcpkg install openssl librtlsdr liquid-dsp
 ```
 
+## Tests
+
+Run the normal test suite:
+
+```bash
+ctest --test-dir build --output-on-failure --no-tests=error
+```
+
+### RTL-SDR Live Hardware Tests
+
+There is now a gated hardware-in-the-loop test target for a real RTL-SDR dongle.
+It is skipped by default and only runs when explicitly enabled.
+
+Smoke test with a connected dongle:
+
+```bash
+FM_TUNER_RUN_RTL_SDR_LIVE=1 \
+ctest --test-dir build --output-on-failure -R rtl_sdr_live -V
+```
+
+Supported environment overrides:
+
+- `FM_TUNER_RTL_DEVICE_INDEX` default `0`
+- `FM_TUNER_RTL_FREQ_KHZ` default `101100`
+- `FM_TUNER_RTL_SAMPLE_RATE` default `256000`
+- `FM_TUNER_RTL_GAIN_TENTHS_DB` optional, if unset the smoke test uses tuner AGC
+- `FM_TUNER_RTL_PPM` optional, only applied if explicitly set
+
+The live test binary contains two hardware checks:
+
+1. Smoke test:
+   - open device
+   - set sample rate and tune
+   - read live IQ
+   - compute signal level from real samples
+   - exercise low-latency read mode
+   - retune and verify reads still succeed
+
+2. Strong-vs-weak comparison test:
+   - fixed manual tuner gain for both frequencies
+   - average several live reads per frequency
+   - verify the stronger station reports higher level than the weaker one
+
+Default comparison frequencies:
+
+- strong: `105.9 MHz`
+- weak: `88.2 MHz`
+
+The comparison test is intentionally gated separately because it depends on your
+actual RF environment and antenna setup.
+
+Override them if your local RF environment is different:
+
+```bash
+FM_TUNER_RUN_RTL_SDR_COMPARE=1 \
+FM_TUNER_RTL_STRONG_FREQ_KHZ=105900 \
+FM_TUNER_RTL_WEAK_FREQ_KHZ=88200 \
+FM_TUNER_RTL_COMPARE_GAIN_TENTHS_DB=180 \
+ctest --test-dir build --output-on-failure -R rtl_sdr_live -V
+```
+
+### Quick XDR Launch (macOS / local testing)
+
+To start the tuner with a connected RTL-SDR and expose the XDR server on
+`127.0.0.1:7373` with password `test123`:
+
+```bash
+./scripts/run_rtl_xdr_test.sh
+```
+
+Defaults used by the script:
+
+- source: `rtl_sdr`
+- device index: `0`
+- frequency: `101.1 MHz`
+- IQ rate: `256000`
+- speaker output: enabled, but playback starts when the XDR client sends start
+- XDR password: `test123`
+
+Useful overrides:
+
+```bash
+RTL_DEVICE_INDEX=0 \
+FREQ_KHZ=105900 \
+IQ_RATE=256000 \
+XDR_PASSWORD=test123 \
+./scripts/run_rtl_xdr_test.sh
+```
+
+Then connect your XDR client to:
+
+- host: `127.0.0.1`
+- port: `7373`
+- password: `test123`
+
+If you want immediate local speaker audio without waiting for an XDR client:
+
+```bash
+./scripts/run_rtl_local_audio.sh
+```
+
+That launcher uses `--auto-start` and is intended for manual local listening,
+not for testing XDR client-controlled start/stop behavior.
+
 ## Runtime Behavior
 
 - At least one output must be enabled (`audio`, `wav`, or `iq`).
@@ -169,176 +273,491 @@ Weak-signal tuning keys:
 - `processing.dsp_agc = off|fast|slow`
 - `processing.stereo_blend = soft|normal|aggressive`
 
-## Gain Setup Guide (Per Location)
+## Setup And Tuning Guide
 
-Most "bad reception" reports in FM SDR setups come from gain mismatch:
-- too much gain in strong-signal areas -> clipping, distortion, unstable scan
-- too little gain in weak-signal areas -> noisy audio, missing stereo/RDS
+This project behaves best when it is tuned like a real radio front end. Most
+bad behavior comes from getting the order wrong.
 
-Use this section to set gain for your specific RF environment.
+Correct tuning order:
+1. get the hardware stable
+2. reduce clipping
+3. verify stereo behavior
+4. calibrate the meter
+5. only then investigate wrong-frequency / ghosting issues
 
-### 1. Understand The Gain Controls
+Do not tune by the meter alone. Do not judge stereo while the tuner is still
+clipping.
 
-Main keys in `[sdr]` and `[processing]`:
-- `gain_strategy = tef|sdrpp`
-- `rtl_gain_db = -1` (strategy-managed) or fixed manual dB value
-- `default_custom_gain_flags` (TEF strategy only)
-- `sdrpp_rtl_agc`, `sdrpp_rtl_agc_gain_db` (SDR++ strategy only)
-- `agc_mode` in `[processing]` (TEF strategy only, 0..3)
+### 1. Start From A Known-Good Baseline
 
-Practical meaning:
-- `tef`:
-  - best default for mixed conditions
-  - supports runtime AGC profile (`agc_mode`) and clip-protect behavior
-- `sdrpp`:
-  - predictable "set and hold" style
-  - easier when you want fixed behavior similar to SDR++ workflows
-- `rtl_gain_db`:
-  - `-1` = let selected strategy manage gain
-  - `>=0` = force fixed tuner gain (overrides strategy behavior)
-
-### 2. Pick A Baseline Profile
-
-Start with one of these, then adjust from there.
-
-Baseline A (recommended for most users):
+Recommended baseline for most users:
 
 ```ini
 [sdr]
 gain_strategy = tef
 rtl_gain_db = -1
 default_custom_gain_flags = 1
+freq_correction_ppm = 0
+signal_floor_dbfs = -55.0
+signal_ceil_dbfs = -12.0
+signal_bias_db = -6.0
 
 [processing]
 agc_mode = 2
+w0_bandwidth_hz = 194000
+dsp_agc = off
+stereo_blend = normal
+stereo = true
+client_gain_allowed = false
 ```
 
-Baseline B (manual-like behavior):
+Why this baseline:
+- `tef` is the best default when local RF conditions are not yet known
+- `agc_mode = 2` is a stable middle ground
+- `w0_bandwidth_hz = 194000` is the correct starting point for normal WFM stereo
+- `client_gain_allowed = false` prevents XDR clients from changing gain while you tune the site profile
 
-```ini
-[sdr]
-gain_strategy = sdrpp
-rtl_gain_db = -1
-sdrpp_rtl_agc = false
-sdrpp_rtl_agc_gain_db = 18
+### 2. Validate Basic Hardware First
+
+Before tuning quality, make sure the setup is fundamentally correct.
+
+Check:
+- the dongle is detected
+- you can tune and hear audio
+- XDR client control works if you use `xdr-gtk`
+- there are no repeated USB errors, disconnects, or device resets
+
+Useful quick paths:
+
+```bash
+./scripts/run_rtl_xdr_test.sh
 ```
 
-### 3. Choose By RF Density (Your Location Type)
+or for local audio without a client:
 
-Use the profile that matches your area, then fine-tune.
+```bash
+./scripts/run_rtl_local_audio.sh
+```
 
-Dense urban / many strong locals / rooftop antenna:
-- Goal: prevent front-end overload and clipping
-- Use:
-  - `gain_strategy = tef`
-  - `rtl_gain_db = -1`
-  - `agc_mode = 3` (or `2` if too insensitive)
-  - keep `default_custom_gain_flags = 1`
-- If still overloaded:
-  - try fixed `rtl_gain_db = 8` to `16`
-  - lower antenna gain or add attenuation externally
+If the system is not stable here, stop. Fix USB, antenna, audio device, or
+driver issues before adjusting gain.
 
-Suburban / mixed conditions (strong + medium stations):
-- Goal: stable all-round decode
-- Use:
-  - `gain_strategy = tef`
-  - `rtl_gain_db = -1`
-  - `agc_mode = 2` (default)
-- If weak stations are too noisy:
-  - try `agc_mode = 1`
-- If strong stations distort:
-  - move back to `agc_mode = 3` or set fixed `rtl_gain_db` around `12..20`
+### 3. Pick Three Reference Frequencies
 
-Rural / weak-signal DX area:
-- Goal: maximize sensitivity without constant clipping
-- Use:
-  - `gain_strategy = tef`
-  - `rtl_gain_db = -1` first
-  - `agc_mode = 1` (or `0` for very weak environments)
-- If still too weak:
-  - try fixed `rtl_gain_db = 24` to `36`
-- If clipping appears on occasional strong locals:
-  - reduce fixed gain by 3..6 dB
+For your location, identify:
+- one strong clean local station
+- one medium-strength usable station
+- one weak station or an empty frequency
 
-### 4. Validate With A 3-Station Check
+You need all three because one station alone cannot tell you whether the system
+is overloaded, too insensitive, or simply mis-calibrated.
 
-After each gain change, test:
-- one very strong local station
-- one medium station
-- one weak/distant station
+The best empty frequency is one with no local station and no obvious adjacent
+spillover in your area.
 
-What to listen for:
-- strong station should be clean (no gritty distortion, pumping, crackle)
-- medium station should keep stable stereo if available
-- weak station should improve SNR without making strong station unusable
+### 4. Tune RF Gain Before Anything Else
 
-If available in your client view, also watch clipping/level behavior:
-- frequent high clipping indicators = too much gain
-- constantly very low levels and noisy demod = too little gain
+The primary gain-health signal is:
+- `[SIG] clip`
 
-### 5. Calibrate Signal Meter For Your Site
+Interpretation:
+- `clip = 0.0000` or near zero: healthy
+- occasional tiny values on strong stations: usually acceptable
+- sustained clipping such as `0.0500`, `0.2000`, or `1.0000`: gain is too high
 
-These do not change RF performance directly, but they make meter/scan values
-meaningful for your installation:
+Examples from real behavior:
+- `clip=1.0000`: badly overloaded; all other quality metrics are suspect
+- `clip=0.0000` on a strong station: gain is in a usable range
+
+#### How to adjust gain
+
+If using `tef` strategy:
+- start with `rtl_gain_db = -1`
+- adjust `[processing].agc_mode`
+
+Interpretation:
+- lower `agc_mode` = more sensitivity
+- higher `agc_mode` = more overload protection
+
+Practical sequence:
+- overloaded strong locals: try `agc_mode = 3`
+- balanced mixed area: keep `agc_mode = 2`
+- weak rural / DX-heavy location: try `agc_mode = 1`, then `0` only if needed
+
+If using fixed manual gain:
+- set `rtl_gain_db` to a fixed value
+- use `3 dB` to `6 dB` steps
+
+Practical manual range:
+- dense urban / strong antenna: `8 .. 16 dB`
+- suburban mixed area: `12 .. 22 dB`
+- weak rural / DX: `20 .. 36 dB`
+
+Do not chase the highest signal number. The correct gain is the highest gain
+that does not produce sustained clipping on strong stations.
+
+### 5. How To Read The Console Output
+
+Watch the console while tuning. The current log fields are meant to tell you
+what to fix next.
+
+#### `[SIG]` lines
+
+Current format:
+
+```text
+[SIG] dbfs=... compensated=... floor=... snr=... level=... filtered=... clip=...
+```
+
+Field meaning:
+- `dbfs`: absolute tuned-channel receiver power
+  - What to do next: use this to compare empty vs strong channels when calibrating the meter
+- `compensated`: gain-adjusted internal power
+  - What to do next: use this only as a secondary reference; do not tune gain from this alone
+- `floor`: estimated baseline / local floor reference
+  - What to do next: compare this with empty frequencies; if empty channels still look too strong, revisit gain first, then meter calibration
+- `snr`: currently diagnostic only
+  - What to do next: do not make first-pass gain decisions from this field
+- `level`: mapped UI / XDR display level
+  - What to do next: use it for client display sanity, not as your primary gain control signal
+- `filtered`: smoothed display level
+  - What to do next: use it only to understand why the client meter moves more slowly than raw `level`
+- `clip`: overload indicator
+  - What to do next: this is the primary gain-health field; reduce clipping before tuning anything else
+
+#### `[ST]` lines
+
+Current format:
+
+```text
+[ST] pilot=... stereo=... quality=... blend=...
+```
+
+Field meaning:
+- `pilot`: 19 kHz pilot strength estimate
+  - What to do next: a strong stereo station should show a clearly stronger pilot than a weak or mono station
+- `stereo`: decoder lock state
+  - What to do next: `stereo=1` means the decoder is actually locked; `stereo=0` means do not expect stable stereo output
+- `quality`: stereo-path confidence
+  - What to do next: compare this across stations; low quality on a strong local means recheck gain, bandwidth, and RF cleanliness
+- `blend`: actual stereo separation currently applied
+  - What to do next: if a strong station has low blend after gain is fixed, adjust stereo blend policy or recheck pilot quality
+
+#### `[DSP]` lines
+
+Examples:
+
+```text
+[DSP] reset reason=retune
+```
+
+Meaning:
+- the DSP pipeline was reset because tuning changed
+  - What to do next: nothing; this is expected during retune and is not itself an RF fault
+
+#### `[XDR]` lines
+
+Examples:
+
+```text
+[XDR] tuning to 105900 kHz
+[XDR] client connected from 127.0.0.1
+[XDR] client disconnected from 127.0.0.1
+```
+
+Meaning:
+- control-plane activity from the XDR client
+  - What to do next: use this to confirm the client really sent a tune/start/stop command before blaming DSP behavior
+
+#### What Good Looks Like
+
+Strong clean station:
+- `clip` near zero
+- strong `pilot`
+- `stereo=1`
+- `quality` clearly above weak/noisy stations
+- `blend` high, usually near full stereo
+
+Weak or noisy station:
+- `clip` still near zero
+- lower `pilot`
+- `stereo` may flicker or drop
+- lower `quality`
+- lower `blend`, drifting toward mono
+
+Empty or quiet frequency:
+- low `dbfs`
+- low `level`
+- no meaningful stereo lock
+- if it still looks strong, gain or meter calibration is wrong
+
+#### What Bad Looks Like
+
+- high `clip`:
+  - too much gain; reduce gain first
+- high `level` on empty frequencies:
+  - likely gain or meter calibration problem; do not blame stereo first
+- `stereo=1` but low `blend` on a strong station:
+  - gain may still be wrong, or the stereo-quality/blend policy is too conservative
+- repeated `[DSP] reset reason=retune` while tuning:
+  - expected during retune, not a signal-path fault
+
+#### Example: Reading One Realistic Console Sequence
+
+```text
+[SIG] dbfs=-1.79 compensated=-13.79 floor=-4.79 snr=0.00 level=115.0 filtered=115.2 clip=0.0000
+[ST] pilot=207 stereo=1 quality=0.788 blend=0.633
+[DSP] reset reason=retune
+[XDR] tuning to 105900 kHz
+```
+
+How to interpret it:
+- first `[SIG]` line:
+  - `clip=0.0000` means gain is now healthy
+  - `level=115.0` means the station is strong
+  - action: do not lower gain further just because the station is strong; clipping is already controlled
+- `[ST]` line:
+  - `pilot=207` and `stereo=1` mean stereo lock is good
+  - `quality=0.788` and `blend=0.633` mean stereo is working, but it is still being narrowed
+  - action: if this is a clearly strong local station, recheck stereo blend policy after gain is fixed
+- `[DSP] reset reason=retune`:
+  - expected because tuning changed
+  - action: none
+- `[XDR] tuning to 105900 kHz`:
+  - confirms the client actually requested the new frequency
+  - action: none
+
+### 6. Tune Stereo Behavior Only After Gain Is Correct
+
+Do not tune stereo blending while clipping is still high.
+
+Main control:
+- `[processing] stereo_blend = soft|normal|aggressive`
+
+Meaning:
+- `soft`: keep more stereo, even on weaker signals
+- `normal`: balanced default
+- `aggressive`: collapse toward mono sooner to suppress stereo noise
+
+Use:
+- `soft` if stations are generally clean and you want maximum stereo image
+- `normal` for most users
+- `aggressive` if weak stereo sounds noisy and you prefer quieter mono-ish output
+
+Important:
+- a strong station should not need `soft` just to sound correct
+- if a strong local only becomes acceptable in `soft`, recheck gain and pilot quality first
+
+### 7. Set Bandwidth For The Kind Of Listening You Want
+
+Main control:
+- `[processing] w0_bandwidth_hz`
+
+Starting point:
+- `194000` for normal WFM stereo listening
+
+Use a narrower bandwidth only when needed:
+- weak-signal or adjacent-channel trouble: try `168000`, `151000`, `133000`
+
+Tradeoff:
+- wider bandwidth = better stereo, pilot, and RDS recovery when clean
+- narrower bandwidth = more adjacent-channel rejection, but easier to lose stereo quality
+
+Do not narrow bandwidth first when the real issue is overload.
+
+### 8. Calibrate The Signal Meter For Your Location
+
+These keys are display calibration only:
 - `signal_floor_dbfs`
 - `signal_ceil_dbfs`
 - `signal_bias_db`
 
-Suggested process:
-1. Tune a no-signal frequency and note baseline.
-2. Tune a strong clean local station and note top-end.
-3. Set:
-   - `signal_floor_dbfs` near typical no-signal noise floor
-   - `signal_ceil_dbfs` near strong-local level
-   - `signal_bias_db` to align displayed values with your expected dBf-like range
+They do not fix RF overload, wrong tuning, or ghosting.
 
-Starting point that works for many setups:
+Procedure:
+1. Tune an empty or very weak frequency and note typical `dbfs`
+2. Tune a strong clean local station and note typical `dbfs`
+3. Set:
+   - `signal_floor_dbfs` near the empty-frequency value
+   - `signal_ceil_dbfs` near the strong-station value
+   - `signal_bias_db` only if you want the displayed scale nudged up or down
+
+Example:
+- empty frequency around `-52 dBFS`
+- strong local around `-14 dBFS`
+
+Starting point:
 
 ```ini
 [sdr]
-signal_floor_dbfs = -55.0
-signal_ceil_dbfs = -12.0
+signal_floor_dbfs = -52.0
+signal_ceil_dbfs = -14.0
 signal_bias_db = -6.0
 ```
 
-If your scan looks mostly empty except spikes:
-- first fix gain/overload as above
-- then widen meter window slightly (for example lower `signal_floor_dbfs`)
+Symptoms of bad meter calibration:
+- empty channels always look too strong: floor is too high, or gain is still wrong
+- every strong station saturates near the top: ceil is too low
+- everything looks compressed into the middle: floor/ceil window is too wide
 
-### 6. When To Use Fixed `rtl_gain_db`
+### 9. Wrong Frequency / Ghosting Troubleshooting
 
-Use fixed manual gain when:
-- your antenna/system is stable and you want repeatable results
-- you are doing comparisons/logging and need reproducible levels
+If stations appear on the wrong frequency, or you hear a strong station turning
+up elsewhere, work through the causes in this order.
+
+#### 1. Systematic frequency offset: suspect `freq_correction_ppm`
+
+Symptom:
+- all stations are shifted by roughly the same amount
+
+Most relevant key:
+- `[sdr] freq_correction_ppm`
+
+What to do:
+1. tune one known strong local station
+2. set gain so `clip` is near zero
+3. check whether the station peak is consistently offset by the same amount on multiple stations
+4. if the offset is systematic, adjust `freq_correction_ppm`
+
+Do not try to correct systematic offset with:
+- `signal_floor_dbfs`
+- `signal_ceil_dbfs`
+- `signal_bias_db`
+
+Those only change display calibration.
+
+#### 2. Duplicates of strong stations: suspect overload or image response
+
+Symptom:
+- strong stations appear again elsewhere
+- this is especially likely if `clip` is nonzero
+
+Most relevant keys:
+- `[sdr] rtl_gain_db`
+- `[processing] agc_mode`
+
+What to do:
+1. lower gain until `clip` is near zero
+2. retest the same strong station and the suspected ghost frequency
+3. if the duplicate weakens or disappears when gain is reduced, treat it as overload / image behavior
+
+If duplicates remain only at high gain, the fix is RF front-end discipline, not meter calibration.
+
+#### 3. Nearby strong station leaking into adjacent channels: suspect adjacent-channel leakage
+
+Symptom:
+- the “ghost” is near a strong station
+- the problem improves when bandwidth is narrowed
+
+Most relevant key:
+- `[processing] w0_bandwidth_hz`
+
+What to do:
+1. keep gain sane first
+2. narrow bandwidth from `194000` to `168000`, `151000`, or `133000`
+3. retest whether the nearby leakage reduces
+
+If it improves with narrower bandwidth, this is more likely adjacent leakage than frequency math.
+
+#### 4. Big changes with antenna or placement: suspect site/front-end issues
+
+Symptom:
+- behavior changes dramatically with antenna swaps, placement changes, or nearby RF devices
+
+What to do:
+- treat this as an RF environment problem first
+- recheck gain, antenna placement, cabling, and overload conditions
+
+Do not assume the software is tuning wrong if the symptom changes a lot with antenna and site conditions.
+
+#### Quick decision test
+
+- all stations shifted together:
+  - suspect `freq_correction_ppm`
+- strong stations duplicated elsewhere and clipping is nonzero:
+  - suspect overload/image response
+- problem sits near a strong adjacent station and improves with narrower bandwidth:
+  - suspect adjacent leakage
+- behavior changes dramatically with antenna or gain changes:
+  - suspect RF front-end/site conditions
+
+### 10. Choose The Right Profile For Your Location
+
+Dense city / rooftop / strong locals:
+- prefer overload protection
+- start with `tef`, `agc_mode = 3`
+- if still overloaded, try fixed `rtl_gain_db = 8 .. 16`
+- keep `stereo_blend = normal` or `aggressive`
+
+Suburban / mixed conditions:
+- start with `tef`, `agc_mode = 2`
+- if weak stations are too soft, try `agc_mode = 1`
+- if noise on weak stereo is annoying, use `stereo_blend = aggressive`
+
+Rural / weak-signal / DX:
+- start with `tef`, `agc_mode = 1`
+- if still too weak, try fixed `rtl_gain_db = 24 .. 36`
+- if strong locals occasionally overload, back off by `3 .. 6 dB`
+- keep `stereo_blend = normal` first; use `soft` only if stations are clean enough to justify it
+
+### 11. Recommended Validation Pass
+
+After every major tuning change, verify all three:
+
+Strong station:
+- no obvious distortion
+- `clip` near zero
+- stable stereo lock
+
+Medium station:
+- still usable
+- stereo remains stable if the station is actually strong enough
+
+Weak or empty frequency:
+- should not look unrealistically strong
+- noise floor should behave consistently
+
+If one setting improves one case while breaking the other two, it is not a good site profile.
+
+### 12. When To Use Fixed Manual Gain
+
+Use fixed `rtl_gain_db` when:
+- antenna and site are stable
+- you want repeatable comparisons
+- you are benchmarking meter or scan behavior
 
 Avoid fixed manual gain when:
-- traveling between locations
-- switching antennas frequently
-- local RF conditions vary widely over time
+- moving between locations
+- changing antennas often
+- local RF density varies a lot over time
 
-### 7. Client Control Safety
+For general listening, strategy-managed gain is usually easier to keep sane.
 
-If users control gain from XDR clients and this causes confusion:
-- set `client_gain_allowed = false` in `[processing]`
-- keep gain policy only in `fm-sdr-tuner.ini`
+### 13. Fast Troubleshooting
 
-This prevents accidental client-side `A`/`G` changes from overriding your tuned
-site profile.
+Strong station sounds rough or crunchy:
+- gain too high
+- reduce gain first; do not touch stereo blend first
 
-### 8. Fast Troubleshooting
+Weak stations never hold stereo:
+- that may be correct behavior
+- if strong stations also fail stereo, recheck gain, bandwidth, and pilot quality
 
-Audio sounds distorted on strong stations:
-- lower gain (`agc_mode` higher number in TEF, or lower fixed `rtl_gain_db`)
+Scan or meter looks wrong:
+- fix clipping first
+- then recalibrate `signal_floor_dbfs` / `signal_ceil_dbfs`
 
-Weak stations vanish/no stereo anywhere:
-- increase gain (`agc_mode` lower number in TEF, or higher fixed `rtl_gain_db`)
+Stereo image is too narrow on clearly strong locals:
+- gain may still be wrong
+- if gain is healthy, check `quality`/`blend`, then try `stereo_blend = soft`
 
-Behavior changes wildly when reconnecting client:
-- disable client gain control: `client_gain_allowed = false`
+Stations appear on the wrong frequency:
+- first eliminate clipping
+- then determine whether the offset is systematic (`freq_correction_ppm`) or a strong-station duplicate (overload / image response)
 
-Scan graph looks unrealistic:
-- verify gain first
-- then recalibrate `signal_floor_dbfs` / `signal_ceil_dbfs` / `signal_bias_db`
+Behavior changes when reconnecting XDR client:
+- set `client_gain_allowed = false`
+- keep all gain policy in `fm-sdr-tuner.ini`
 
 ## CMake Options
 

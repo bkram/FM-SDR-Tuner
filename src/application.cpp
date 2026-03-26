@@ -21,6 +21,7 @@
 #include "signal_level.h"
 #include "tuner_controller.h"
 #include "tuner_session.h"
+#include "wav_writer.h"
 #include "xdr_facade.h"
 #include "xdr_server.h"
 
@@ -55,6 +56,7 @@ void Application::logStartup(const CPUFeatures &cpu) const {
             << config.processing.stereo_blend << "'\n";
   std::cout << "[Config] sdr.signal_bias_db=" << config.sdr.signal_bias_db
             << "\n";
+  std::cout << "[Config] sdr.rtl_gain_db=" << config.sdr.rtl_gain_db << "\n";
   std::cout << "[Config] sdr.freq_correction_ppm="
             << config.sdr.freq_correction_ppm << "\n";
   std::cout << "[Config] sdr.low_latency_iq="
@@ -106,6 +108,26 @@ FILE *Application::openIqCapture(AudioOutput &audioOut,
   return iqHandle;
 }
 
+bool Application::initMpxCapture(WavWriter &mpxWavOut,
+                                 TunerSession &tunerSession,
+                                 uint32_t sampleRate) const {
+  if (m_options.mpxWavFile.empty()) {
+    return true;
+  }
+  if (!mpxWavOut.init(m_options.mpxWavFile, sampleRate, 1,
+                      m_options.verboseLogging, "MPX WAV")) {
+    std::cerr << "[MPX] failed to initialize MPX WAV output: "
+              << m_options.mpxWavFile << "\n";
+    tunerSession.disconnect();
+    return false;
+  }
+  if (m_options.verboseLogging) {
+    std::cout << "[MPX] capture enabled: " << m_options.mpxWavFile
+              << " (" << sampleRate << " Hz mono)\n";
+  }
+  return true;
+}
+
 bool Application::readIqSamples(
     const std::function<size_t(uint8_t *, size_t)> &tunerReadIQ,
     const std::function<void(const uint8_t *, size_t)> &writeIqCapture,
@@ -132,9 +154,10 @@ bool Application::readIqSamples(
 }
 
 void Application::shutdownResources(AudioOutput &audioOut, FILE *&iqHandle,
-                                    XDRServer &xdrServer,
+                                    WavWriter &mpxWavOut, XDRServer &xdrServer,
                                     TunerSession &tunerSession) const {
   audioOut.shutdown();
+  mpxWavOut.shutdown();
   if (iqHandle) {
     std::fclose(iqHandle);
     iqHandle = nullptr;
@@ -167,6 +190,7 @@ int Application::run() {
   bool xdrGuestMode = m_options.xdrGuestMode;
   uint16_t xdrPort = m_options.xdrPort;
   bool autoReconnect = m_options.autoReconnect;
+  const bool autoStartTuner = m_options.autoStart;
   bool lowLatencyIq = m_options.lowLatencyIq;
 
   const size_t iqDecimation = static_cast<size_t>(iqSampleRate / INPUT_RATE);
@@ -243,6 +267,12 @@ int Application::run() {
     return std::clamp(gainDb, 0, 49);
   };
 
+  auto tefAgcGainDb = [&](int agcMode) -> int {
+    static constexpr int kAgcToGainDb[4] = {44, 36, 30, 24};
+    const int clippedMode = std::clamp(agcMode, 0, 3);
+    return kAgcToGainDb[clippedMode];
+  };
+
   auto effectiveAppliedGainDb = [&]() -> int {
     if (isImsAgcEnabled()) {
       return 0;
@@ -307,9 +337,15 @@ int Application::run() {
     }
 
     if (verboseLogging) {
-      std::cout << "[SDR] " << reason << " A" << agcMode << " G"
-                << formatCustomGain(custom) << " (rf=" << rf << ",if=" << ifv
-                << ")"
+      std::cout << "[SDR] " << reason;
+      if (gain >= 0) {
+        std::cout << " fixed_gain=" << gain << " dB";
+      } else {
+        std::cout << " A" << agcMode << "(table=" << tefAgcGainDb(agcMode)
+                  << " dB) G" << formatCustomGain(custom)
+                  << "(flags rf=" << rf << ",if=" << ifv << ")";
+      }
+      std::cout
                 << " -> mode=" << (imsAgc ? "auto" : "manual")
                 << " tuner_gain=" << gainDb << " dB"
                 << " manual=" << (imsAgc ? 0 : 1)
@@ -365,12 +401,18 @@ int Application::run() {
   dspPipeline.setBandwidthHz(appliedBandwidthHz);
 
   AudioOutput audioOut;
+  WavWriter mpxWavOut;
   if (!initAudioOutput(audioOut, tunerSession, requestedVolume)) {
+    return 1;
+  }
+  if (!initMpxCapture(mpxWavOut, tunerSession, INPUT_RATE)) {
+    audioOut.shutdown();
     return 1;
   }
 
   FILE *iqHandle = openIqCapture(audioOut, tunerSession);
   if (!m_options.iqFile.empty() && !iqHandle) {
+    mpxWavOut.shutdown();
     return 1;
   }
   auto writeIqCapture = [&](const uint8_t *data, size_t sampleCount) {
@@ -383,14 +425,14 @@ int Application::run() {
   std::atomic<bool> tunerActive(false);
   std::atomic<bool> pendingStartRequest(false);
   std::atomic<bool> pendingStopRequest(false);
-  const bool autoStartTuner = false;
 
   XDRServer xdrServer(xdrPort);
   XdrFacade xdrFacade(xdrServer, xdrState,
                       {.verboseLogging = verboseLogging,
                        .useSdrppGainStrategy = useSdrppGainStrategy,
                        .allowClientGainOverride =
-                           config.processing.client_gain_allowed});
+                           config.processing.client_gain_allowed,
+                       .fixedLocalGain = (gain >= 0)});
   xdrFacade.configureServer(xdrPassword, xdrGuestMode);
   xdrFacade.installCallbacks(
       [&](int volumePercent) { audioOut.setVolumePercent(volumePercent); },
@@ -510,7 +552,8 @@ int Application::run() {
     }
 
     (void)processing_runner::processAudioBlock(
-        iqBuffer, samples, OUTPUT_RATE, effectiveAppliedGainDb(),
+        iqBuffer, samples, OUTPUT_RATE, iqSampleRate, appliedBandwidthHz,
+        effectiveAppliedGainDb(),
         kSignalGainCompFactor, config, verboseLogging, rfLevelSmoother,
         [&](const SignalLevelResult &signal, double clipRatio,
             float rfLevelFiltered) {
@@ -520,12 +563,13 @@ int Application::run() {
               rfLevelFiltered, verboseLogging);
         },
         targetForceMono, appliedEffectiveForceMono, dspPipeline, rdsWorker,
-        xdrServer, retuneMuteSamplesRemaining, retuneMuteTotalSamples, audioOut);
+        xdrServer, retuneMuteSamplesRemaining, retuneMuteTotalSamples, audioOut,
+        &mpxWavOut);
   }
 
   rdsWorker.stop();
 
-  shutdownResources(audioOut, iqHandle, xdrServer, tunerSession);
+  shutdownResources(audioOut, iqHandle, mpxWavOut, xdrServer, tunerSession);
 
   std::cout << "[APP] shutdown complete.\n";
   return 0;

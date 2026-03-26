@@ -98,6 +98,7 @@ public:
 private:
   void addClientSocket(int clientSocket);
   void removeClientSocket(int clientSocket);
+  void joinClientThreads();
   void handleClient(int clientSocket);
   void handleFmdxClient(int clientSocket);
   void handleXdrClient(int clientSocket, const char *clientIP);
@@ -116,9 +117,8 @@ private:
   std::thread m_acceptThread;
   std::mutex m_clientSocketsMutex;
   std::vector<int> m_clientSockets;
-  std::atomic<int> m_activeClientThreads;
-  std::mutex m_clientThreadWaitMutex;
-  std::condition_variable m_clientThreadWaitCv;
+  std::mutex m_clientThreadsMutex;
+  std::vector<std::thread> m_clientThreads;
 
   std::string m_password;
   bool m_guestMode;

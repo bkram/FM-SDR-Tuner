@@ -1,4 +1,5 @@
 #include "app_options.h"
+#include "tuning_limits.h"
 
 #include <algorithm>
 #include <cctype>
@@ -43,9 +44,12 @@ void printUsage(const char *prog) {
       << "  -f, --freq <khz>      Frequency in kHz (default: 88600)\n"
       << "  -g, --gain <db>       RTL-SDR gain in dB (default: auto)\n"
       << "  -w, --wav <file>      Output WAV file\n"
+      << "      --mpx-wav <file>  Output decoded MPX WAV file (mono, 256000 Hz)\n"
       << "  -i, --iq <file>       Capture raw IQ bytes to file\n"
       << "      --low-latency-iq  Keep newest IQ samples (drop backlog on "
          "overload)\n"
+      << "      --auto-start      Start tuner immediately without waiting for "
+         "an XDR start command\n"
       << "  -s, --audio           Enable audio output\n"
       << "  -l, --list-audio      List available audio output devices\n"
       << "  -d, --device <id>     Audio output device (index or name)\n"
@@ -137,8 +141,12 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
   auto parseUIntFreqKHz = [&](const std::string &value) -> bool {
     try {
       const int parsedFreq = std::stoi(value);
-      if (parsedFreq <= 0) {
-        std::cerr << "[CLI] invalid frequency kHz: " << parsedFreq << "\n";
+      if (parsedFreq <= 0 ||
+          !fm_tuner::isValidFmBroadcastFreqKHz(
+              static_cast<uint32_t>(parsedFreq))) {
+        std::cerr << "[CLI] invalid FM broadcast frequency kHz: " << parsedFreq
+                  << " (allowed " << fm_tuner::kFmBroadcastMinFreqKHz << ".."
+                  << fm_tuner::kFmBroadcastMaxFreqKHz << ")\n";
         return false;
       }
       opts.freqKHz = static_cast<uint32_t>(parsedFreq);
@@ -190,6 +198,10 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
     }
     if (arg == "--low-latency-iq") {
       opts.lowLatencyIq = true;
+      continue;
+    }
+    if (arg == "--auto-start") {
+      opts.autoStart = true;
       continue;
     }
     if (arg == "--no-low-latency-iq") {
@@ -290,6 +302,16 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
       opts.wavFile = value;
       continue;
     }
+    if (arg == "--mpx-wav" || arg.rfind("--mpx-wav=", 0) == 0) {
+      const std::string value = readValue(i, arg, "mpx-wav");
+      if (value.empty()) {
+        std::cerr << "[CLI] missing value for --mpx-wav\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      opts.mpxWavFile = value;
+      continue;
+    }
     if (arg == "-i" || arg == "--iq" || arg.rfind("--iq=", 0) == 0) {
       const std::string value = readValue(i, arg, "iq");
       if (value.empty()) {
@@ -327,9 +349,10 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
     return result;
   }
 
-  if (opts.wavFile.empty() && opts.iqFile.empty() && !opts.enableSpeaker) {
+  if (opts.wavFile.empty() && opts.mpxWavFile.empty() && opts.iqFile.empty() &&
+      !opts.enableSpeaker) {
     std::cerr << "[CLI] error: must specify at least one output: -w (wav), -i "
-                 "(iq), or -s (audio)\n";
+                 "(iq), --mpx-wav, or -s (audio)\n";
     printUsage(argv[0]);
     result.outcome = AppParseOutcome::ExitFailure;
     return result;

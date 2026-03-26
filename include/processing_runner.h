@@ -10,12 +10,14 @@
 #include "dsp_pipeline.h"
 #include "rds_worker.h"
 #include "signal_level.h"
+#include "wav_writer.h"
 #include "xdr_server.h"
 
 namespace processing_runner {
 
 bool processAudioBlock(
     const uint8_t *iqBuffer, size_t samples, int outputRate,
+    uint32_t iqSampleRate, int channelBandwidthHz,
     int effectiveAppliedGainDb, double signalGainCompFactor,
     const Config &config, bool verboseLogging,
     SignalLevelSmoother &rfLevelSmoother,
@@ -24,7 +26,7 @@ bool processAudioBlock(
     bool targetForceMono, bool &appliedEffectiveForceMono, DspPipeline &dspPipeline,
     RdsWorker &rdsWorker, XDRServer &xdrServer,
     size_t &retuneMuteSamplesRemaining, size_t &retuneMuteTotalSamples,
-    AudioOutput &audioOut);
+    AudioOutput &audioOut, WavWriter *mpxWavOut);
 
 } // namespace processing_runner
 

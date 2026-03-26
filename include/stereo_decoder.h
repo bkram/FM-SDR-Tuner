@@ -21,6 +21,8 @@ public:
   void setForceMono(bool force);
   void setBlendMode(BlendMode mode) { m_blendMode = mode; }
   int getPilotLevelTenthsKHz() const { return m_pilotLevelTenthsKHz; }
+  float getStereoBlend() const { return m_stereoBlend; }
+  float getStereoQuality() const { return m_stereoQuality; }
 
   bool isStereo() const { return m_stereoDetected; }
 
@@ -32,11 +34,15 @@ private:
   BlendMode m_blendMode;
   float m_pilotMagnitude;
   float m_pilotBandMagnitude;
+  float m_pilotResidualMagnitude;
   float m_mpxMagnitude;
   float m_stereoBlend;
+  float m_stereoQuality;
   int m_pilotLevelTenthsKHz;
   float m_pilotI;
   float m_pilotQ;
+  float m_lrRawMagnitude;
+  float m_lrAudioMagnitude;
 
   float m_pllPhase;
   float m_pllFreq;
@@ -50,8 +56,8 @@ private:
   int m_delaySamples;
   fm_tuner::dsp::liquid::FIRFilter m_liquidPilotBandFilter;
   fm_tuner::dsp::liquid::NCO m_liquidPilotPll;
-  fm_tuner::dsp::liquid::FIRFilter m_liquidLeftAudioFilter;
-  fm_tuner::dsp::liquid::FIRFilter m_liquidRightAudioFilter;
+  fm_tuner::dsp::liquid::FIRFilter m_liquidMonoAudioFilter;
+  fm_tuner::dsp::liquid::FIRFilter m_liquidLrAudioFilter;
 };
 
 #endif

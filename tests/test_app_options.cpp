@@ -82,3 +82,21 @@ TEST_CASE("App options parser accepts IQ capture as output", "[app_options]") {
   REQUIRE(result.outcome == AppParseOutcome::Run);
   REQUIRE(result.options.iqFile == "/tmp/capture.iq");
 }
+
+TEST_CASE("App options parser accepts MPX WAV capture as output", "[app_options]") {
+  std::vector<std::string> args = {"fm-sdr-tuner", "--mpx-wav",
+                                   "/tmp/capture_mpx.wav"};
+  std::vector<char *> argv = makeArgv(args);
+  const AppParseResult result =
+      parseAppOptions(static_cast<int>(argv.size()), argv.data(), 256000);
+  REQUIRE(result.outcome == AppParseOutcome::Run);
+  REQUIRE(result.options.mpxWavFile == "/tmp/capture_mpx.wav");
+}
+
+TEST_CASE("App options parser rejects out-of-band FM frequency", "[app_options]") {
+  std::vector<std::string> args = {"fm-sdr-tuner", "--freq", "14900", "-s"};
+  std::vector<char *> argv = makeArgv(args);
+  const AppParseResult result =
+      parseAppOptions(static_cast<int>(argv.size()), argv.data(), 256000);
+  REQUIRE(result.outcome == AppParseOutcome::ExitFailure);
+}

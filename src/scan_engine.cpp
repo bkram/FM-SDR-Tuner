@@ -1,5 +1,7 @@
 #include "scan_engine.h"
 
+#include "tuning_limits.h"
+
 #include <algorithm>
 #include <cmath>
 #include <complex>
@@ -55,7 +57,7 @@ void ScanEngine::handleControl(
 
 bool ScanEngine::runIfActive(
     XDRServer &xdrServer, bool rtlConnected, const std::function<bool()> &shouldRun,
-    const std::function<void(uint32_t)> &tunerSetFrequency,
+    const std::function<bool(uint32_t)> &tunerSetFrequency,
     const std::function<size_t(uint8_t *, size_t)> &tunerReadIQ,
     const std::function<void(const uint8_t *, size_t)> &writeIqCapture,
     const std::chrono::milliseconds &scanRetrySleep, uint8_t *iqBuffer,
@@ -67,19 +69,24 @@ bool ScanEngine::runIfActive(
     return false;
   }
 
-  constexpr int kScanRetries = 2;
-  constexpr int kFftAverages = 2;
+  constexpr int kScanRetries = 1;
+  constexpr int kFftAverages = 1;
   constexpr size_t kScanReadSamplesCap = 32768;
-  constexpr size_t kRetuneDiscardSamples = 2048;
-  constexpr float kUsableSpectrumFraction = 0.45f;
-  constexpr float kCenterStepFraction = 0.75f;
-  constexpr float kDcRejectHz = 4000.0f;
-  constexpr float kPi = 3.14159265358979323846f;
+  constexpr size_t kRetuneDiscardSamples = 512;
+  constexpr float kUsableSpectrumFraction = 0.85f;
+  constexpr float kCenterStepFraction = 0.60f;
+  constexpr float kDcRejectHz = 2000.0f;
   constexpr double kWindowFloor = 1e-12;
   constexpr double kPowerFloor = 1e-20;
+  constexpr double kScanSnrGateDb = 4.0;
+  constexpr double kScanSnrCeilDb = 28.0;
 
-  const int startKHz = std::min(m_config.startKHz, m_config.stopKHz);
-  const int stopKHz = std::max(m_config.startKHz, m_config.stopKHz);
+  const int startKHz = std::clamp(std::min(m_config.startKHz, m_config.stopKHz),
+                                  static_cast<int>(fm_tuner::kFmBroadcastMinFreqKHz),
+                                  static_cast<int>(fm_tuner::kFmBroadcastMaxFreqKHz));
+  const int stopKHz = std::clamp(std::max(m_config.startKHz, m_config.stopKHz),
+                                 static_cast<int>(fm_tuner::kFmBroadcastMinFreqKHz),
+                                 static_cast<int>(fm_tuner::kFmBroadcastMaxFreqKHz));
   const int stepKHz = std::max(5, m_config.stepKHz);
   const int channelBandwidthHz =
       std::clamp((m_config.bandwidthHz > 0) ? m_config.bandwidthHz : 56000,
@@ -128,13 +135,159 @@ bool ScanEngine::runIfActive(
     return wrapped;
   };
 
+  auto estimateLevelsFromCapture =
+      [&](int64_t tunedCenterHz, size_t samples, int firstChannel,
+          int lastChannel, bool onlyMissing) -> bool {
+    const size_t nfft = nearestPow2(std::min<size_t>(samples, 16384));
+    if (nfft < 1024) {
+      return false;
+    }
+
+    const float binHz = static_cast<float>(iqSampleRate) /
+                        static_cast<float>(nfft);
+    const int binHalf = std::max(
+        1, static_cast<int>(std::lround((channelBandwidthHz * 0.5f) / binHz)));
+    const int dcRejectBins = std::max(
+        1, static_cast<int>(std::lround(kDcRejectHz / std::max(binHz, 1.0f))));
+    const int guardBins = std::max(
+        1, static_cast<int>(std::lround(6000.0f / std::max(binHz, 1.0f))));
+    const int sideSpanBins = std::max(
+        binHalf, static_cast<int>(std::lround((channelBandwidthHz * 0.35f) /
+                                              std::max(binHz, 1.0f))));
+    if (!m_fftState.ensureSize(nfft)) {
+      return false;
+    }
+
+    double meanI = 0.0;
+    double meanQ = 0.0;
+    for (size_t i = 0; i < nfft; i++) {
+      meanI += (static_cast<int>(iqBuffer[i * 2]) - 127.5) * (1.0 / 127.5);
+      meanQ += (static_cast<int>(iqBuffer[i * 2 + 1]) - 127.5) * (1.0 / 127.5);
+    }
+    meanI /= static_cast<double>(nfft);
+    meanQ /= static_cast<double>(nfft);
+    for (size_t i = 0; i < nfft; i++) {
+      const float iRaw =
+          static_cast<float>((static_cast<int>(iqBuffer[i * 2]) - 127.5) *
+                                 (1.0 / 127.5) -
+                             meanI);
+      const float qRaw = static_cast<float>(
+          (static_cast<int>(iqBuffer[i * 2 + 1]) - 127.5) * (1.0 / 127.5) -
+          meanQ);
+      const float w = m_fftState.window[i];
+      m_fftState.fftIn[i] = {iRaw * w, qRaw * w};
+    }
+
+    fft_execute(m_fftState.plan);
+
+    const int64_t spanLowHz = tunedCenterHz - usableHalfSpanHz;
+    const int64_t spanHighHz = tunedCenterHz + usableHalfSpanHz;
+    const double nfftNorm =
+        static_cast<double>(nfft) * static_cast<double>(nfft);
+
+    for (int ch = firstChannel; ch <= lastChannel; ch++) {
+      if (onlyMissing &&
+          std::isfinite(levelByChannel[static_cast<size_t>(ch)])) {
+        continue;
+      }
+
+      const int freqKHz = startKHz + ch * stepKHz;
+      const int64_t fHz = static_cast<int64_t>(freqKHz) * 1000;
+      if (fHz < spanLowHz || fHz > spanHighHz) {
+        continue;
+      }
+
+      const float relHz = static_cast<float>(fHz - tunedCenterHz);
+      const int centerBin = static_cast<int>(
+          std::lround((relHz / static_cast<float>(iqSampleRate)) *
+                      static_cast<float>(nfft)));
+      double channelSum = 0.0;
+      int usedBins = 0;
+      for (int b = centerBin - binHalf; b <= centerBin + binHalf; b++) {
+        if (std::abs(b) <= dcRejectBins) {
+          continue;
+        }
+        const int idx = binWrap(b, static_cast<int>(nfft));
+        const float re = m_fftState.fftOut[static_cast<size_t>(idx)].real();
+        const float im = m_fftState.fftOut[static_cast<size_t>(idx)].imag();
+        channelSum += static_cast<double>(re) * static_cast<double>(re) +
+                      static_cast<double>(im) * static_cast<double>(im);
+        usedBins++;
+      }
+      if (usedBins <= 0) {
+        continue;
+      }
+
+      double sideSum = 0.0;
+      int sideBins = 0;
+      for (int sign : {-1, 1}) {
+        const int sideStart = centerBin + sign * (binHalf + guardBins);
+        const int sideStop =
+            centerBin + sign * (binHalf + guardBins + sideSpanBins);
+        const int step = (sideStart <= sideStop) ? 1 : -1;
+        for (int b = sideStart; b != sideStop + step; b += step) {
+          if (std::abs(b) <= dcRejectBins) {
+            continue;
+          }
+          const int idx = binWrap(b, static_cast<int>(nfft));
+          const float re = m_fftState.fftOut[static_cast<size_t>(idx)].real();
+          const float im = m_fftState.fftOut[static_cast<size_t>(idx)].imag();
+          sideSum += static_cast<double>(re) * static_cast<double>(re) +
+                     static_cast<double>(im) * static_cast<double>(im);
+          sideBins++;
+        }
+      }
+
+      const double bandPower = std::max(kPowerFloor, channelSum / nfftNorm);
+      const double dbfs = 10.0 * std::log10(bandPower + kWindowFloor);
+      const double compensatedDbfs =
+          dbfs - static_cast<double>(effectiveAppliedGainDb) *
+                     signalGainCompFactor +
+          sdrConfig.signal_bias_db;
+      const double safeNoisePerBin =
+          std::max(kPowerFloor, (sideBins > 0)
+                                    ? ((sideSum / static_cast<double>(sideBins)) /
+                                       nfftNorm)
+                                    : (bandPower / static_cast<double>(usedBins)));
+      const double sidePower =
+          std::max(kPowerFloor, safeNoisePerBin * static_cast<double>(usedBins));
+      const double snrDb = std::max(
+          0.0, 10.0 * std::log10((std::max(kPowerFloor, bandPower - sidePower) +
+                                  kPowerFloor) /
+                                 (sidePower + kPowerFloor)));
+      const double safeCeilDbfs =
+          std::max(sdrConfig.signal_ceil_dbfs, sdrConfig.signal_floor_dbfs + 1.0);
+      const double clippedDbfs =
+          std::clamp(compensatedDbfs, sdrConfig.signal_floor_dbfs, safeCeilDbfs);
+      const float absLevel120 = static_cast<float>(
+          ((clippedDbfs - sdrConfig.signal_floor_dbfs) /
+           (safeCeilDbfs - sdrConfig.signal_floor_dbfs)) *
+          120.0);
+      const float snrLevel120 = std::clamp(
+          static_cast<float>(((snrDb - kScanSnrGateDb) /
+                              (kScanSnrCeilDb - kScanSnrGateDb)) *
+                             120.0),
+          0.0f, 120.0f);
+      const float level120 = std::min(absLevel120, snrLevel120);
+      levelByChannel[static_cast<size_t>(ch)] =
+          std::max(levelByChannel[static_cast<size_t>(ch)], level120);
+    }
+
+    return true;
+  };
+
   for (; centerHz <= endCenterHz; centerHz += centerStepHz) {
     if (!shouldRun() || xdrServer.consumeScanCancel()) {
       m_active = false;
       break;
     }
 
-    tunerSetFrequency(static_cast<uint32_t>(centerHz));
+    if (!tunerSetFrequency(static_cast<uint32_t>(centerHz))) {
+      std::cerr << "[SCAN] warning: failed to retune to "
+                << (centerHz / 1000) << " kHz; aborting scan\n";
+      m_active = false;
+      break;
+    }
     // Discard one short read after retune to let tuner/NCO settle.
     (void)tunerReadIQ(iqBuffer, std::min(sdrBufSamples, kRetuneDiscardSamples));
 
@@ -152,126 +305,107 @@ bool ScanEngine::runIfActive(
 
       writeIqCapture(iqBuffer, samples);
 
-      const size_t nfft = nearestPow2(std::min<size_t>(samples, 16384));
-      if (nfft < 1024) {
-        continue;
-      }
-      const float binHz = static_cast<float>(iqSampleRate) /
-                          static_cast<float>(nfft);
-      const int binHalf = std::max(
-          1, static_cast<int>(std::lround((channelBandwidthHz * 0.5f) / binHz)));
-      const int dcRejectBins = std::max(
-          1, static_cast<int>(std::lround(kDcRejectHz / std::max(binHz, 1.0f))));
-      std::vector<std::complex<float>> fftIn(nfft);
-      std::vector<std::complex<float>> fftOut(nfft);
-      double meanI = 0.0;
-      double meanQ = 0.0;
-      for (size_t i = 0; i < nfft; i++) {
-        meanI += (static_cast<int>(iqBuffer[i * 2]) - 127.5) * (1.0 / 127.5);
-        meanQ += (static_cast<int>(iqBuffer[i * 2 + 1]) - 127.5) * (1.0 / 127.5);
-      }
-      meanI /= static_cast<double>(nfft);
-      meanQ /= static_cast<double>(nfft);
-      for (size_t i = 0; i < nfft; i++) {
-        const float iRaw =
-            static_cast<float>((static_cast<int>(iqBuffer[i * 2]) - 127.5) *
-                                   (1.0 / 127.5) -
-                               meanI);
-        const float qRaw = static_cast<float>(
-            (static_cast<int>(iqBuffer[i * 2 + 1]) - 127.5) * (1.0 / 127.5) -
-            meanQ);
-        const float w = 0.5f - 0.5f * std::cos(
-                                     static_cast<float>(2.0f * kPi) *
-                                     static_cast<float>(i) /
-                                     static_cast<float>(nfft - 1));
-        fftIn[i] = {iRaw * w, qRaw * w};
-      }
-
-      fftplan plan =
-          fft_create_plan(static_cast<unsigned int>(nfft), fftIn.data(),
-                          fftOut.data(), LIQUID_FFT_FORWARD, 0);
-      if (!plan) {
-        continue;
-      }
-      fft_execute(plan);
-      fft_destroy_plan(plan);
-
-      const int64_t spanLowHz = centerHz - usableHalfSpanHz;
-      const int64_t spanHighHz = centerHz + usableHalfSpanHz;
-      const double nfftNorm =
-          static_cast<double>(nfft) * static_cast<double>(nfft);
-
-      for (int ch = 0; ch < channelCount; ch++) {
-        const int freqKHz = startKHz + ch * stepKHz;
-        const int64_t fHz = static_cast<int64_t>(freqKHz) * 1000;
-        if (fHz < spanLowHz || fHz > spanHighHz) {
-          continue;
-        }
-
-        const float relHz = static_cast<float>(fHz - centerHz);
-        const int centerBin = static_cast<int>(
-            std::lround((relHz / static_cast<float>(iqSampleRate)) *
-                        static_cast<float>(nfft)));
-        double sum = 0.0;
-        int usedBins = 0;
-        for (int b = centerBin - binHalf; b <= centerBin + binHalf; b++) {
-          if (std::abs(b) <= dcRejectBins) {
-            continue;
-          }
-          const int idx = binWrap(b, static_cast<int>(nfft));
-          const float re = fftOut[static_cast<size_t>(idx)].real();
-          const float im = fftOut[static_cast<size_t>(idx)].imag();
-          sum += static_cast<double>(re) * static_cast<double>(re) +
-                 static_cast<double>(im) * static_cast<double>(im);
-          usedBins++;
-        }
-        if (usedBins <= 0) {
-          continue;
-        }
-        const double bandPower = std::max(kPowerFloor, sum / nfftNorm);
-        const double dbfs = 10.0 * std::log10(bandPower + kWindowFloor);
-        const double compensatedDbfs =
-            dbfs - static_cast<double>(effectiveAppliedGainDb) *
-                       signalGainCompFactor +
-            sdrConfig.signal_bias_db;
-        const double safeCeilDbfs =
-            std::max(sdrConfig.signal_ceil_dbfs, sdrConfig.signal_floor_dbfs + 1.0);
-        const double clippedDbfs =
-            std::clamp(compensatedDbfs, sdrConfig.signal_floor_dbfs, safeCeilDbfs);
-        const float level120 = static_cast<float>(
-            ((clippedDbfs - sdrConfig.signal_floor_dbfs) /
-             (safeCeilDbfs - sdrConfig.signal_floor_dbfs)) *
-            120.0);
-        levelByChannel[static_cast<size_t>(ch)] =
-            std::max(levelByChannel[static_cast<size_t>(ch)], level120);
-      }
+      (void)estimateLevelsFromCapture(centerHz, samples, 0, channelCount - 1,
+                                      false);
     }
   }
 
   // Fallback for uncovered channels so the client receives complete scan lines.
-  for (int ch = 0; ch < channelCount; ch++) {
+  // Batch contiguous uncovered channels into the largest span one retune can
+  // cover, instead of retuning once per missing channel.
+  for (int ch = 0; ch < channelCount;) {
     if (std::isfinite(levelByChannel[static_cast<size_t>(ch)])) {
+      ch++;
       continue;
     }
-    const int freqKHz = startKHz + ch * stepKHz;
-    tunerSetFrequency(static_cast<uint32_t>(freqKHz) * 1000U);
+
+    const int batchStart = ch;
+    const int64_t batchStartHz =
+        static_cast<int64_t>(startKHz + batchStart * stepKHz) * 1000;
+    const int64_t batchMaxStopHz = batchStartHz + (usableHalfSpanHz * 2);
+    int batchEnd = batchStart;
+    while ((batchEnd + 1) < channelCount &&
+           !std::isfinite(levelByChannel[static_cast<size_t>(batchEnd + 1)])) {
+      const int64_t nextHz =
+          static_cast<int64_t>(startKHz + (batchEnd + 1) * stepKHz) * 1000;
+      if (nextHz > batchMaxStopHz) {
+        break;
+      }
+      batchEnd++;
+    }
+
+    const int64_t batchEndHz =
+        static_cast<int64_t>(startKHz + batchEnd * stepKHz) * 1000;
+    const uint32_t batchCenterHz =
+        static_cast<uint32_t>((batchStartHz + batchEndHz) / 2);
+
+    if (!tunerSetFrequency(batchCenterHz)) {
+      std::cerr << "[SCAN] warning: failed to retune to "
+                << (batchCenterHz / 1000) << " kHz during fallback sampling\n";
+      for (int missing = batchStart; missing <= batchEnd; missing++) {
+        levelByChannel[static_cast<size_t>(missing)] = 0.0f;
+      }
+      ch = batchEnd + 1;
+      continue;
+    }
+    (void)tunerReadIQ(iqBuffer, std::min(sdrBufSamples, kRetuneDiscardSamples));
+
     size_t samples = 0;
     for (int retries = 0; retries < kScanRetries && samples == 0; retries++) {
-      samples = tunerReadIQ(iqBuffer, std::min(sdrBufSamples, static_cast<size_t>(4096)));
+      samples =
+          tunerReadIQ(iqBuffer, std::min(sdrBufSamples, static_cast<size_t>(4096)));
       if (samples == 0) {
         std::this_thread::sleep_for(scanRetrySleep);
       }
     }
     if (samples == 0) {
-      levelByChannel[static_cast<size_t>(ch)] = 0.0f;
+      for (int missing = batchStart; missing <= batchEnd; missing++) {
+        levelByChannel[static_cast<size_t>(missing)] = 0.0f;
+      }
+      ch = batchEnd + 1;
       continue;
     }
+
     writeIqCapture(iqBuffer, samples);
-    const SignalLevelResult signal = computeSignalLevel(
-        iqBuffer, samples, effectiveAppliedGainDb, signalGainCompFactor,
-        sdrConfig.signal_bias_db, sdrConfig.signal_floor_dbfs,
-        sdrConfig.signal_ceil_dbfs);
-    levelByChannel[static_cast<size_t>(ch)] = signal.level120;
+    if (!estimateLevelsFromCapture(batchCenterHz, samples, batchStart, batchEnd,
+                                   true)) {
+      for (int missing = batchStart; missing <= batchEnd; missing++) {
+        const int freqKHz = startKHz + missing * stepKHz;
+        if (!tunerSetFrequency(static_cast<uint32_t>(freqKHz) * 1000U)) {
+          std::cerr << "[SCAN] warning: failed to retune to " << freqKHz
+                    << " kHz during per-channel fallback sampling\n";
+          levelByChannel[static_cast<size_t>(missing)] = 0.0f;
+          continue;
+        }
+        size_t singleSamples = 0;
+        for (int retries = 0; retries < kScanRetries && singleSamples == 0;
+             retries++) {
+          singleSamples = tunerReadIQ(
+              iqBuffer, std::min(sdrBufSamples, static_cast<size_t>(4096)));
+          if (singleSamples == 0) {
+            std::this_thread::sleep_for(scanRetrySleep);
+          }
+        }
+        if (singleSamples == 0) {
+          levelByChannel[static_cast<size_t>(missing)] = 0.0f;
+          continue;
+        }
+        writeIqCapture(iqBuffer, singleSamples);
+        const SignalLevelResult signal = computeSignalLevel(
+            iqBuffer, singleSamples, effectiveAppliedGainDb,
+            signalGainCompFactor, sdrConfig.signal_bias_db,
+            sdrConfig.signal_floor_dbfs, sdrConfig.signal_ceil_dbfs,
+            iqSampleRate, channelBandwidthHz);
+        levelByChannel[static_cast<size_t>(missing)] = signal.level120;
+      }
+    }
+
+    for (int missing = batchStart; missing <= batchEnd; missing++) {
+      if (!std::isfinite(levelByChannel[static_cast<size_t>(missing)])) {
+        levelByChannel[static_cast<size_t>(missing)] = 0.0f;
+      }
+    }
+    ch = batchEnd + 1;
   }
 
   std::ostringstream scanLine;

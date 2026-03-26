@@ -1,4 +1,5 @@
 #include "config.h"
+#include "tuning_limits.h"
 
 #include <algorithm>
 #include <cctype>
@@ -194,7 +195,8 @@ void parseTunerSection(const std::string &key, const std::string &value,
     }
   } else if (key == "default_freq") {
     int parsed = 0;
-    if (parseInt(value, parsed) && parsed > 0) {
+    if (parseInt(value, parsed) && parsed > 0 &&
+        fm_tuner::isValidFmBroadcastFreqKHz(static_cast<uint32_t>(parsed))) {
       tuner.default_freq = static_cast<uint32_t>(parsed);
     }
   } else if (key == "deemphasis") {

@@ -19,6 +19,7 @@ struct AppOptions {
   uint32_t freqKHz = 88600;
   int gain = -1;
   std::string wavFile;
+  std::string mpxWavFile;
   std::string iqFile;
   bool enableSpeaker = false;
   std::string audioDevice;
@@ -26,6 +27,7 @@ struct AppOptions {
   bool xdrGuestMode = false;
   uint16_t xdrPort = 7373;
   bool autoReconnect = true;
+  bool autoStart = false;
   bool lowLatencyIq = false;
   bool verboseLogging = true;
 };

@@ -37,6 +37,7 @@ public:
     bool verboseLogging = false;
     bool useSdrppGainStrategy = false;
     bool allowClientGainOverride = true;
+    bool fixedLocalGain = false;
   };
 
   XdrFacade(XDRServer &server, XdrCommandState &state, Options options)

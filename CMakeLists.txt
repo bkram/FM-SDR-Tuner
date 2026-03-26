@@ -95,6 +95,7 @@ set(SOURCES
     src/tuner_session.cpp
     src/runtime_loop.cpp
     src/processing_runner.cpp
+    src/wav_writer.cpp
     src/scan_engine.cpp
     src/rtl_tcp_client.cpp
     src/rtl_sdr_device.cpp

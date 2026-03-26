@@ -1,11 +1,97 @@
 #include "catch_compat.h"
 
 #include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 
 #define private public
 #include "xdr_server.h"
 #undef private
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+using SocketLen = int;
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+using SocketLen = socklen_t;
+#endif
+
+namespace {
+
+#if defined(_WIN32)
+struct WinSockInit {
+  WinSockInit() {
+    WSADATA wsaData{};
+    const int rc = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    REQUIRE(rc == 0);
+  }
+  ~WinSockInit() { WSACleanup(); }
+};
+#endif
+
+void closeSock(int sock) {
+#if defined(_WIN32)
+  closesocket(static_cast<SOCKET>(sock));
+#else
+  close(sock);
+#endif
+}
+
+uint16_t reserveLoopbackPort() {
+  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  if (sock < 0) {
+    return 0;
+  }
+
+  sockaddr_in addr{};
+#if defined(__APPLE__)
+  addr.sin_len = sizeof(addr);
+#endif
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  if (bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+    closeSock(sock);
+    return 0;
+  }
+
+  sockaddr_in actual{};
+  SocketLen len = sizeof(actual);
+  if (getsockname(sock, reinterpret_cast<sockaddr *>(&actual), &len) != 0) {
+    closeSock(sock);
+    return 0;
+  }
+  const uint16_t port = ntohs(actual.sin_port);
+  closeSock(sock);
+  return port;
+}
+
+int connectLoopback(uint16_t port) {
+  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  REQUIRE(sock >= 0);
+
+  sockaddr_in addr{};
+#if defined(__APPLE__)
+  addr.sin_len = sizeof(addr);
+#endif
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons(port);
+
+  const int rc = connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+  REQUIRE(rc == 0);
+  return sock;
+}
+
+} // namespace
 
 TEST_CASE("XDR processCommand updates state and invokes callbacks", "[xdr_unit]") {
   XDRServer xdr(7374);
@@ -41,9 +127,16 @@ TEST_CASE("XDR processCommand updates state and invokes callbacks", "[xdr_unit]"
   REQUIRE(xdr.processCommand("T101700000", true, false) == "T101700");
   REQUIRE(tuned.load() == 101700000u);
 
+  REQUIRE(xdr.processCommand("T14900", true, false).empty());
+  REQUIRE(tuned.load() == 101700000u);
+  REQUIRE(xdr.getFrequency() == 101700000u);
+
   REQUIRE(xdr.processCommand("Y77", true, false) == "Y77");
   REQUIRE(volume.load() == 77);
   REQUIRE(xdr.getVolume() == 77);
+
+  REQUIRE(xdr.processCommand("W250000", true, false) == "W250000");
+  REQUIRE(xdr.getBandwidth() == 250000);
 
   REQUIRE(xdr.processCommand("A3", true, false) == "A3");
   REQUIRE(agc.load() == 3);
@@ -77,7 +170,7 @@ TEST_CASE("XDR scan commands are clamped and exposed via consumeScanStart",
   XDRServer::ScanConfig cfg{};
   REQUIRE(xdr.consumeScanStart(cfg));
   REQUIRE(cfg.startKHz == 64000);
-  REQUIRE(cfg.stopKHz == 120000);
+  REQUIRE(cfg.stopKHz == 108000);
   REQUIRE(cfg.stepKHz == 5);
   REQUIRE(cfg.bandwidthHz == 400000);
   REQUIRE(cfg.antenna == 9);
@@ -105,4 +198,29 @@ TEST_CASE("XDR updateRDS suppresses groups with block B errors", "[xdr_unit]") {
 
   REQUIRE(sawClean);
   REQUIRE_FALSE(sawErrored);
+}
+
+TEST_CASE("XDR stop joins client threads and clears thread registry",
+          "[xdr_unit]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+
+  XDRServer xdr(port);
+  xdr.setVerboseLogging(false);
+  REQUIRE(xdr.start());
+
+  const int sock = connectLoopback(port);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  REQUIRE_FALSE(xdr.m_clientThreads.empty());
+
+  xdr.stop();
+  REQUIRE(xdr.m_clientThreads.empty());
+  REQUIRE(xdr.m_clientSockets.empty());
+
+  closeSock(sock);
 }
