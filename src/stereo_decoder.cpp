@@ -1,5 +1,6 @@
 #include "stereo_decoder.h"
 #include <algorithm>
+#include <complex>
 
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
@@ -13,6 +14,8 @@ constexpr float kMpxMinAcquire = 0.005f;
 constexpr float kMpxMinHold = 0.0028f;
 constexpr float kPilotCoherenceAcquire = 0.18f;
 constexpr float kPilotCoherenceHold = 0.11f;
+constexpr float kPilotResidualAcquire = 0.95f;
+constexpr float kPilotResidualHold = 1.05f;
 constexpr float kPllLockAcquireHz = 180.0f;
 constexpr float kPllLockHoldHz = 320.0f;
 constexpr float kPilotRatioQualityFloor = 0.080f;
@@ -62,7 +65,7 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
 
   m_delaySamples = std::max(0, (pilotTapCount - 1) / 2);
   m_delayLine.assign(static_cast<size_t>(std::max(1, m_delaySamples + 1)),
-                     0.0f);
+                     std::complex<float>(0.0f, 0.0f));
   const float nominalPllFreq =
       2.0f * kPi * 19000.0f / static_cast<float>(m_inputRate);
   m_liquidPilotPll.init(LIQUID_VCO, nominalPllFreq);
@@ -89,7 +92,8 @@ void StereoDecoder::reset() {
   m_pilotCount = 0;
   m_pilotLossCount = 0;
   m_delayPos = 0;
-  std::fill(m_delayLine.begin(), m_delayLine.end(), 0.0f);
+  std::fill(m_delayLine.begin(), m_delayLine.end(),
+            std::complex<float>(0.0f, 0.0f));
   m_liquidPilotBandFilter.reset();
   m_liquidPilotPll.reset();
   m_liquidMonoAudioFilter.reset();
@@ -109,17 +113,17 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
   float attackTau = 0.045f;
   float releaseTau = 0.018f;
   float lowQualityGate = 0.70f;
-  float lockFloor = 0.85f;
+  float lockFloor = 0.78f;
   if (m_blendMode == BlendMode::Soft) {
     attackTau = 0.035f;
     releaseTau = 0.024f;
     lowQualityGate = 0.62f;
-    lockFloor = 0.92f;
+    lockFloor = 0.86f;
   } else if (m_blendMode == BlendMode::Aggressive) {
     attackTau = 0.080f;
     releaseTau = 0.012f;
     lowQualityGate = 0.82f;
-    lockFloor = 0.65f;
+    lockFloor = 0.58f;
   }
 
   const float blendAttack =
@@ -158,7 +162,7 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
                    0.0f, 1.0f);
     (void)pilotMag;
     const float quality =
-        std::pow(std::max(0.0f, ratioQ * cohQ * cleanQ * pllQ), 0.25f);
+        std::pow(std::max(0.0f, ratioQ * cohQ * cleanQ * pllQ), 0.40f);
     m_stereoQuality = quality;
     float qualityShaped = quality;
     if (m_blendMode == BlendMode::Soft) {
@@ -179,7 +183,7 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
 
     if (m_stereoDetected) {
       const float floorKeep =
-          std::clamp((quality - 0.50f) / 0.20f, 0.0f, 1.0f);
+          std::clamp((quality - 0.72f) / 0.18f, 0.0f, 1.0f);
       const float adaptiveFloor = lockFloor * floorKeep;
       return std::clamp(adaptiveFloor + ((1.0f - adaptiveFloor) * qualityShaped),
                         0.0f, 1.0f);
@@ -195,15 +199,15 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     const float mpx = mono[i];
 
     m_liquidPilotBandFilter.push(std::complex<float>(mpx, 0.0f));
-    const float pilot = m_liquidPilotBandFilter.execute().real();
+    const std::complex<float> pilot = m_liquidPilotBandFilter.execute();
     m_pilotBandMagnitude = (m_pilotBandMagnitude * kPilotEnvSmooth) +
                            (std::abs(pilot) * kPilotEnvInject);
     m_mpxMagnitude =
         (m_mpxMagnitude * kPilotEnvSmooth) + (std::abs(mpx) * kPilotEnvInject);
     const float phaseNow = m_liquidPilotPll.phase();
-    const float vcoI = std::cos(phaseNow);
-    const float vcoQ = std::sin(phaseNow);
-    const float error = pilot * vcoQ;
+    const std::complex<float> vco(std::cos(phaseNow), std::sin(phaseNow));
+    const std::complex<float> mixedPilot = pilot * std::conj(vco);
+    const float error = std::atan2(mixedPilot.imag(), mixedPilot.real());
     m_liquidPilotPll.stepPLL(error);
     m_liquidPilotPll.step();
     const float phaseNext = m_liquidPilotPll.phase();
@@ -216,16 +220,17 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     m_pllPhase = phaseNext;
     m_pllFreq = std::clamp(dphi, m_pllMinFreq, m_pllMaxFreq);
 
-    m_pilotI = (m_pilotI * kPilotIqSmooth) + ((pilot * vcoI) * kPilotIqInject);
-    m_pilotQ = (m_pilotQ * kPilotIqSmooth) + ((pilot * vcoQ) * kPilotIqInject);
+    m_pilotI =
+        (m_pilotI * kPilotIqSmooth) + (mixedPilot.real() * kPilotIqInject);
+    m_pilotQ =
+        (m_pilotQ * kPilotIqSmooth) + (mixedPilot.imag() * kPilotIqInject);
     const float pilotMagNow =
         std::sqrt((m_pilotI * m_pilotI) + (m_pilotQ * m_pilotQ));
     const float pilotRatioNow =
         m_pilotBandMagnitude / std::max(m_mpxMagnitude, 1e-3f);
     const float pilotCoherenceNow =
         pilotMagNow / std::max(m_pilotBandMagnitude, 1e-4f);
-    const float pilotReconstructed = (m_pilotI * vcoI) + (m_pilotQ * vcoQ);
-    const float pilotResidual = pilot - pilotReconstructed;
+    const float pilotResidual = mixedPilot.imag();
     m_pilotResidualMagnitude =
         (m_pilotResidualMagnitude * kPilotEnvSmooth) +
         (std::abs(pilotResidual) * kPilotEnvInject);
@@ -234,8 +239,8 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     const float pllErrHzNow = std::abs(m_pllFreq - nominalPllFreq) *
                               static_cast<float>(m_inputRate) / (2.0f * kPi);
 
-    const float delayedMpx = m_delayLine[m_delayPos];
-    m_delayLine[m_delayPos] = mpx;
+    const std::complex<float> delayedMpx = m_delayLine[m_delayPos];
+    m_delayLine[m_delayPos] = std::complex<float>(mpx, 0.0f);
     m_delayPos++;
     if (m_delayPos >= m_delayLine.size()) {
       m_delayPos = 0;
@@ -245,11 +250,11 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     // 1) take delayed MPX as complex (real, imag=0),
     // 2) multiply by conjugated PLL output twice (38 kHz downconversion),
     // 3) take real part and apply 2x gain.
-    const float pllRe = std::cos(m_pllPhase);
-    const float pllIm = std::sin(m_pllPhase);
-    const float cos2 = (pllRe * pllRe) - (pllIm * pllIm);
-    const float monoRaw = delayedMpx;
-    const float lrRaw = 2.0f * delayedMpx * cos2;
+    const std::complex<float> pll(std::cos(m_pllPhase), std::sin(m_pllPhase));
+    const std::complex<float> lrMixed =
+        delayedMpx * std::conj(pll) * std::conj(pll);
+    const float monoRaw = delayedMpx.real();
+    const float lrRaw = 2.0f * lrMixed.real();
     m_lrRawMagnitude =
         (m_lrRawMagnitude * kPilotEnvSmooth) + (std::abs(lrRaw) * kPilotEnvInject);
     const float targetStereoBlend = computeBlendTarget(
@@ -285,15 +290,23 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
   m_pilotMagnitude = pilotMag;
 
   const float mpxThreshold = m_stereoDetected ? kMpxMinHold : kMpxMinAcquire;
-  const float qualityThreshold = m_stereoDetected ? 0.48f : 0.58f;
-  const float pllErrHz = std::abs(m_pllFreq - nominalPllFreq) *
-                         static_cast<float>(m_inputRate) / (2.0f * kPi);
-  const float pllThreshold =
-      m_stereoDetected ? kPllLockHoldHz : kPllLockAcquireHz;
+  const float pilotRatio =
+      m_pilotBandMagnitude / std::max(m_mpxMagnitude, 1e-3f);
+  const float pilotCoherence =
+      m_pilotMagnitude / std::max(m_pilotBandMagnitude, 1e-4f);
+  const float pilotResidualRatio =
+      m_pilotResidualMagnitude / std::max(m_pilotMagnitude, 1e-4f);
+  const float ratioThreshold =
+      m_stereoDetected ? kPilotRatioHold : kPilotRatioAcquire;
+  const float coherenceThreshold =
+      m_stereoDetected ? kPilotCoherenceHold : kPilotCoherenceAcquire;
+  const float residualThreshold =
+      m_stereoDetected ? kPilotResidualHold : kPilotResidualAcquire;
   const bool pilotPresent =
       (m_mpxMagnitude > mpxThreshold) &&
-      (m_stereoQuality > qualityThreshold) &&
-      (pllErrHz < (pllThreshold * 1.15f));
+      (pilotRatio > ratioThreshold) &&
+      (pilotCoherence > coherenceThreshold) &&
+      (pilotResidualRatio < residualThreshold);
   if (!m_forceStereo) {
     if (!m_stereoDetected) {
       if (pilotPresent) {

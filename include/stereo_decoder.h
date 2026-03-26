@@ -3,6 +3,7 @@
 
 #include "dsp/liquid_primitives.h"
 #include <cmath>
+#include <complex>
 #include <stddef.h>
 #include <stdint.h>
 #include <vector>
@@ -51,7 +52,7 @@ private:
   int m_pilotCount;
   int m_pilotLossCount;
 
-  std::vector<float> m_delayLine;
+  std::vector<std::complex<float>> m_delayLine;
   size_t m_delayPos;
   int m_delaySamples;
   fm_tuner::dsp::liquid::FIRFilter m_liquidPilotBandFilter;
