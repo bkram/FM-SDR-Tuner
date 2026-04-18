@@ -51,7 +51,7 @@ Linux `.deb` / `.rpm`:
 
 ```bash
 cpack -G DEB --config build/CPackConfig.cmake
-./scripts/test-linux-arm-builds.sh   # ubuntu:24.04, debian:trixie, fedora:40 container smoke tests
+./scripts/test-linux-arm-builds.sh   # ubuntu:24.04, debian:trixie, fedora:42, fedora:43 container smoke tests
 ```
 
 ### Static analysis / formatting
