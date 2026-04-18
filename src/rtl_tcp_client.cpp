@@ -20,6 +20,9 @@
 #include <thread>
 
 namespace {
+constexpr uint32_t kRtlTcpMaxTunerType = 6;
+constexpr uint32_t kRtlTcpMaxGainCount = 512;
+
 void closeSocket(int sock) {
 #if defined(_WIN32)
   closesocket(static_cast<SOCKET>(sock));
@@ -79,6 +82,30 @@ bool ensureSocketSubsystem() {
   return true;
 #endif
 }
+
+uint32_t readBe32(const uint8_t *data) {
+  uint32_t value = 0;
+  std::memcpy(&value, data, sizeof(value));
+  return ntohl(value);
+}
+
+bool validateRtlTcpHeader(const uint8_t *header) {
+  if (!header) {
+    return false;
+  }
+  if (std::memcmp(header, "RTL0", 4) != 0) {
+    return false;
+  }
+  const uint32_t tunerType = readBe32(header + 4);
+  const uint32_t gainCount = readBe32(header + 8);
+  if (tunerType > kRtlTcpMaxTunerType) {
+    return false;
+  }
+  if (gainCount > kRtlTcpMaxGainCount) {
+    return false;
+  }
+  return true;
+}
 } // namespace
 
 RTLTCPClient::RTLTCPClient(const std::string &host, uint16_t port)
@@ -90,7 +117,7 @@ RTLTCPClient::~RTLTCPClient() { disconnect(); }
 
 bool RTLTCPClient::connect() {
   if (!ensureSocketSubsystem()) {
-    std::cerr << "Failed to initialize socket subsystem" << std::endl;
+    std::cerr << "Failed to initialize socket subsystem" << "\n";
     return false;
   }
 
@@ -106,7 +133,7 @@ bool RTLTCPClient::connect() {
       getaddrinfo(m_host.c_str(), portStr.c_str(), &hints, &results);
   if (gai != 0 || !results) {
     std::cerr << "Invalid address: " << m_host << " (" << gai_strerror(gai)
-              << ")" << std::endl;
+              << ")" << "\n";
     return false;
   }
 
@@ -127,7 +154,7 @@ bool RTLTCPClient::connect() {
 
   if (m_socket < 0) {
     std::cerr << "Failed to connect to " << m_host << ":" << m_port
-              << std::endl;
+              << "\n";
     return false;
   }
 
@@ -135,17 +162,26 @@ bool RTLTCPClient::connect() {
   setRecvTimeoutMs(m_socket, 2000);
 
   uint8_t header[12];
-  if (readResponse(header, sizeof(header))) {
-    setRecvTimeoutMs(m_socket, 2000);
-    m_havePendingIqByte = false;
-    m_connected = true;
-    return true;
+  if (!readResponse(header, sizeof(header))) {
+    std::cerr << "Failed to read initial rtl_tcp header from " << m_host << ":"
+              << m_port << "\n";
+    closeSocket(m_socket);
+    m_socket = -1;
+    return false;
   }
 
-  std::cerr << "Invalid response from rtl_tcp server" << std::endl;
-  closeSocket(m_socket);
-  m_socket = -1;
-  return false;
+  if (!validateRtlTcpHeader(header)) {
+    std::cerr << "Invalid rtl_tcp header from " << m_host << ":" << m_port
+              << "\n";
+    closeSocket(m_socket);
+    m_socket = -1;
+    return false;
+  }
+
+  setRecvTimeoutMs(m_socket, 2000);
+  m_havePendingIqByte = false;
+  m_connected = true;
+  return true;
 }
 
 void RTLTCPClient::disconnect() {

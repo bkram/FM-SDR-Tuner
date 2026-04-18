@@ -30,7 +30,8 @@ FMDemod::FMDemod(int inputRate, int outputRate)
     : m_inputRate(std::max(1, inputRate)),
       m_outputRate(std::max(1, outputRate)), m_deviation(75000.0),
       m_deemphasisEnabled(true), m_bandwidthMode(0), m_w0BandwidthHz(194000),
-      m_dspAgcMode(DspAgcMode::Off), m_clipping(false), m_clippingRatio(0.0f) {
+      m_dspAgcMode(DspAgcMode::Off), m_clipping(false), m_clippingRatio(0.0f),
+      m_filteredChannelPowerDbfs(-120.0) {
   const float iqCutoffNorm =
       std::clamp(110000.0f / static_cast<float>(m_inputRate), 0.01f, 0.45f);
   m_liquidIqFilter.init(81, iqCutoffNorm);
@@ -41,7 +42,7 @@ FMDemod::FMDemod(int inputRate, int outputRate)
   m_liquidMonoResampler.init(ratio);
   m_liquidMonoDcBlock.initDCBlocker(0.0008f);
   setDeviation(75000.0);
-  setDeemphasis(75);
+  setDeemphasis(50);
   setDspAgcMode(DspAgcMode::Off);
 }
 
@@ -50,6 +51,7 @@ FMDemod::~FMDemod() = default;
 void FMDemod::setDeemphasis(int tau_us) {
   if (tau_us <= 0) {
     m_deemphasisEnabled = false;
+    m_liquidMonoDeemphasis.reset();
     return;
   }
   m_deemphasisEnabled = true;
@@ -73,6 +75,7 @@ void FMDemod::setDeviation(double deviation) {
 void FMDemod::reset() {
   m_clipping = false;
   m_clippingRatio = 0.0f;
+  m_filteredChannelPowerDbfs = -120.0;
   m_liquidIqFilter.reset();
   m_liquidFreqDemod.reset();
   m_liquidIqDcBlockI.reset();
@@ -132,6 +135,7 @@ void FMDemod::setBandwidthHz(int bwHz) {
   const float stopBandAtten =
       (selectedBwHz > 0 && selectedBwHz <= 42000) ? 70.0f : 60.0f;
   m_liquidIqFilter.init(filterLen, cutoffNorm, stopBandAtten);
+  reset();
 }
 
 void FMDemod::setW0BandwidthHz(int bwHz) {
@@ -139,18 +143,23 @@ void FMDemod::setW0BandwidthHz(int bwHz) {
 }
 
 void FMDemod::setDspAgcMode(DspAgcMode mode) {
-  m_dspAgcMode = mode;
-  if (m_dspAgcMode == DspAgcMode::Off) {
+  if (mode == m_dspAgcMode) {
     return;
   }
-  const float bandwidth = (m_dspAgcMode == DspAgcMode::Fast) ? 0.01f : 0.001f;
-  m_liquidIqAgc.init(bandwidth, 1.0f);
+  m_dspAgcMode = mode;
+  if (m_dspAgcMode != DspAgcMode::Off) {
+    const float bandwidth =
+        (m_dspAgcMode == DspAgcMode::Fast) ? 0.01f : 0.001f;
+    m_liquidIqAgc.init(bandwidth, 1.0f);
+  }
+  reset();
 }
 
 void FMDemod::demodulate(const uint8_t *iq, float *audio, size_t len) {
   const auto &kIqNorm = iqNormLut();
   const uint8_t *iqPtr = iq;
   size_t clipCount = 0;
+  double powerSum = 0.0;
 
   for (size_t i = 0; i < len; i++) {
     const uint8_t iByte = iqPtr[0];
@@ -166,7 +175,10 @@ void FMDemod::demodulate(const uint8_t *iq, float *audio, size_t len) {
     const float qDc = m_liquidIqDcBlockQ.execute(qRaw);
 
     m_liquidIqFilter.push(std::complex<float>(iDc, qDc));
-    std::complex<float> iqDemodIn = m_liquidIqFilter.execute();
+    std::complex<float> iqFiltered = m_liquidIqFilter.execute();
+    powerSum += static_cast<double>(iqFiltered.real()) * iqFiltered.real() +
+                static_cast<double>(iqFiltered.imag()) * iqFiltered.imag();
+    std::complex<float> iqDemodIn = iqFiltered;
     if (m_dspAgcMode != DspAgcMode::Off) {
       iqDemodIn = m_liquidIqAgc.execute(iqDemodIn);
     }
@@ -177,11 +189,21 @@ void FMDemod::demodulate(const uint8_t *iq, float *audio, size_t len) {
   m_clippingRatio =
       (len > 0) ? (static_cast<float>(clipCount) / static_cast<float>(len))
                 : 0.0f;
+  // Cap at 0 dBFS so ADC-rail overload (IQ FIR rings past full scale under
+  // heavy IF AGC) doesn't report physically nonsensical positive dBFS.
+  m_filteredChannelPowerDbfs =
+      (len > 0)
+          ? std::min(0.0,
+                     10.0 *
+                         std::log10((powerSum / static_cast<double>(len)) +
+                                    1e-20))
+          : -120.0;
 }
 
 void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
                                 size_t len) {
   size_t clipCount = 0;
+  double powerSum = 0.0;
 
   for (size_t i = 0; i < len; i++) {
     const float iRaw = iq[i].real();
@@ -194,7 +216,10 @@ void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
     const float qDc = m_liquidIqDcBlockQ.execute(qRaw);
 
     m_liquidIqFilter.push(std::complex<float>(iDc, qDc));
-    std::complex<float> iqDemodIn = m_liquidIqFilter.execute();
+    std::complex<float> iqFiltered = m_liquidIqFilter.execute();
+    powerSum += static_cast<double>(iqFiltered.real()) * iqFiltered.real() +
+                static_cast<double>(iqFiltered.imag()) * iqFiltered.imag();
+    std::complex<float> iqDemodIn = iqFiltered;
     if (m_dspAgcMode != DspAgcMode::Off) {
       iqDemodIn = m_liquidIqAgc.execute(iqDemodIn);
     }
@@ -205,6 +230,13 @@ void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
   m_clippingRatio =
       (len > 0) ? (static_cast<float>(clipCount) / static_cast<float>(len))
                 : 0.0f;
+  m_filteredChannelPowerDbfs =
+      (len > 0)
+          ? std::min(0.0,
+                     10.0 *
+                         std::log10((powerSum / static_cast<double>(len)) +
+                                    1e-20))
+          : -120.0;
 }
 
 size_t FMDemod::downsampleAudio(const float *demod, float *audio,

@@ -22,7 +22,9 @@ private:
 
   bool m_deemphasisEnabled;
   static constexpr float kDcBlockAlpha = 0.005f;
-  static constexpr int kDefaultDeemphasisUs = 75;
+  // EU / ITU-R BS.412 default. US/Korea deployments override via config
+  // ([tuner].deemphasis = 1 → 75 µs) or runtime XDR command.
+  static constexpr int kDefaultDeemphasisUs = 50;
   static constexpr float kMicrosecondsToSeconds = 1e-6f;
   fm_tuner::dsp::liquid::IIRFilterReal m_liquidLeftDeemphasis;
   fm_tuner::dsp::liquid::IIRFilterReal m_liquidRightDeemphasis;

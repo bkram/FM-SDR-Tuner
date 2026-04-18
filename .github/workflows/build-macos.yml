@@ -15,7 +15,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        for pkg in cmake pkgconf libtool librtlsdr libusb liquid-dsp openssl@3; do
+        for pkg in cmake pkgconf libtool librtlsdr libusb liquid-dsp openssl@3 catch2; do
           if brew list --versions "$pkg" >/dev/null; then
             echo "$pkg already installed"
           else

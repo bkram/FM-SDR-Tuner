@@ -34,6 +34,7 @@ public:
   void setDspAgcMode(DspAgcMode mode);
   bool isClipping() const { return m_clipping; }
   float getClippingRatio() const { return m_clippingRatio; }
+  double getFilteredChannelPowerDbfs() const { return m_filteredChannelPowerDbfs; }
 
 private:
   void demodulate(const uint8_t *iq, float *audio, size_t len);
@@ -54,6 +55,7 @@ private:
 
   bool m_clipping;
   float m_clippingRatio;
+  double m_filteredChannelPowerDbfs;
   fm_tuner::dsp::liquid::FIRFilter m_liquidIqFilter;
   fm_tuner::dsp::liquid::FreqDemod m_liquidFreqDemod;
   fm_tuner::dsp::liquid::IIRFilterReal m_liquidIqDcBlockI;

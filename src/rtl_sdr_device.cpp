@@ -35,7 +35,8 @@ RTLSDRDevice::RTLSDRDevice(uint32_t deviceIndex)
     : m_deviceIndex(deviceIndex), m_connected(false), m_deviceHandle(nullptr),
       m_asyncRunning(false), m_asyncFailed(false),
       m_iqRing(4U * 1024U * 1024U, 0), m_ringReadPos(0), m_ringWritePos(0),
-      m_ringFull(false), m_lowLatencyMode(false) {}
+      m_ringFull(false), m_lowLatencyMode(false), m_lowLatencyDropEvents(0),
+      m_lowLatencyDeadlineEvents(0), m_lowLatencyShortReads(0) {}
 
 RTLSDRDevice::~RTLSDRDevice() { disconnect(); }
 
@@ -221,33 +222,50 @@ size_t RTLSDRDevice::readIQ(uint8_t *buffer, size_t maxSamples) {
     return 0;
   }
   const size_t requestedBytes = std::min<size_t>(maxSamples * 2, 1U << 20);
+  const bool lowLatencyMode = m_lowLatencyMode.load(std::memory_order_relaxed);
   std::unique_lock<std::mutex> lock(m_bufferMutex);
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(35);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(lowLatencyMode ? 8 : 35);
+  bool hitDeadline = false;
   while (m_connected && !m_asyncFailed.load()) {
     const size_t availableNow = availableBytesLocked();
     if (availableNow >= requestedBytes) {
       break;
     }
     if (availableNow > 0 && std::chrono::steady_clock::now() >= deadline) {
+      hitDeadline = true;
       break;
     }
     if (m_bufferCv.wait_until(lock, deadline) == std::cv_status::timeout) {
+      hitDeadline = true;
       break;
     }
   }
   size_t available = availableBytesLocked();
   if (available == 0) {
+    if (lowLatencyMode && hitDeadline) {
+      const uint32_t count =
+          m_lowLatencyDeadlineEvents.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (count <= 5 || (count % 100) == 0) {
+        std::cerr << "[SDR] low-latency read deadline hit with no IQ data ("
+                  << count << ")\n";
+      }
+    }
     return 0;
   }
-  if (m_lowLatencyMode.load(std::memory_order_relaxed) &&
-      available > requestedBytes) {
+  if (lowLatencyMode && available > requestedBytes) {
     size_t drop = available - requestedBytes;
     drop &= ~static_cast<size_t>(1);
     if (drop > 0) {
       m_ringReadPos = (m_ringReadPos + drop) % m_iqRing.size();
       m_ringFull = false;
       available = availableBytesLocked();
+      const uint32_t count =
+          m_lowLatencyDropEvents.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (count <= 5 || (count % 100) == 0) {
+        std::cerr << "[SDR] low-latency IQ drop " << drop / 2
+                  << " samples to keep newest data (" << count << ")\n";
+      }
     }
   }
   size_t bytesToRead = std::min(available, requestedBytes);
@@ -269,6 +287,14 @@ size_t RTLSDRDevice::readIQ(uint8_t *buffer, size_t maxSamples) {
     }
   }
   m_ringFull = false;
+  if (lowLatencyMode && bytesToRead < requestedBytes) {
+    const uint32_t count =
+        m_lowLatencyShortReads.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 5 || (count % 100) == 0) {
+      std::cerr << "[SDR] low-latency short IQ read: " << bytesToRead / 2 << "/"
+                << requestedBytes / 2 << " samples (" << count << ")\n";
+    }
+  }
   return outByte / 2;
 #else
   (void)buffer;

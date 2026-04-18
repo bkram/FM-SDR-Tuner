@@ -1,131 +1,42 @@
 # FM-SDR-Tuner Issues and Improvements
 
-## Static Analysis Issues
+Last verified against current source: 2026-03-01
 
-### Critical
-- **src/xdr_server.cpp:325-340**: Memory leak - SHA1 context not destroyed on failure
-- **src/rtl_sdr_device.cpp:216-218**: Potential null dereference - `m_deviceHandle` not validated in all paths
-- **src/audio_output.cpp:1265-1324**: Potential null dereference - `m_wavHandle` not checked before writing
+## Verified Open Issues
 
 ### High
-- **src/xdr_server.cpp:325-340**: Missing error checking for OpenSSL functions (SHA1_Init, SHA1_Update, SHA1_Final)
-- **src/rtl_tcp_client.cpp:142-148**: Header read without proper validation
-- **src/main.cpp:1640-1641**: Vector resize without allocation failure check
+- **src/rtl_tcp_client.cpp:137-145**: Initial rtl_tcp header is read but not validated (magic/version/tuner fields are not checked).
+- **src/audio_output.cpp:1052-1059**: `AudioOutput::write()` allocates `scaledLeft/scaledRight` on each call (avoidable per-block heap churn on the audio path).
+- **src/audio_output.cpp:1084-1086**: WAV writing is performed inline in `AudioOutput::write()` (file I/O in the hot path).
+- **src/audio_output.cpp:1088-1179**: Speaker path should use a bounded lock-efficient ring buffer (explicit overflow policy) instead of grow-and-trim vectors.
+- **src/rtl_sdr_device.cpp:218-237**: `readIQ()` can block up to ~35 ms while waiting for buffered data.
+- **src/xdr_server.cpp:1221-1278**: Callback setter boilerplate is repetitive and easy to desynchronize over time.
 
 ### Medium
-- **src/main.cpp:1320-1324**: Unused parameter `appliedGainDb` in signal function
-- **src/main.cpp:1340-1338**: Verbose logging variables declared but unused in non-verbose mode
-- **src/xdr_server.cpp:1326**: Unused parameter `arg` in processFmdxCommand
+- **src/application.cpp:1-532**: Runtime orchestration is still concentrated in a single large compilation unit.
+- **src/xdr_server.cpp:828-844**: Scan queue is copied each loop iteration before send (extra churn during active scan streaming).
+- **src/scan_engine.cpp:165-197**: FFT input/output buffers and FFT plan are recreated inside scan loops; preallocate/reuse to reduce scan CPU overhead.
+- **src/fm_demod.cpp:229-273**: `m_demodScratch` growth checks run on each call; reserve and reuse strategy can be tightened for stable high-rate processing.
 
 ### Low
-- **src/rtl_sdr_device.cpp:97-100**: Missing error handling for rtlsdr_get_device_count() failure
-
----
-
-## Design Issues
-
-### Critical
-- **src/main.cpp**: 1500+ line main function with massive coupling - difficult to test and maintain
-- Real-time audio paths have blocking I/O (WAV writing, network I/O)
-
-### High
-- **src/audio_output.cpp**: No abstraction for audio backends (PortAudio/WAV)
-- **src/rtl_sdr_device.cpp**: RTL-SDR specific code not abstracted behind device interface
-- **src/rtl_tcp_client.cpp**: Mixed error handling (bool returns vs exceptions)
-
-### Medium
-- **src/config.cpp:24-28** and **src/config.cpp:54-58**: Duplicate string transformation functions
-- **src/main.cpp:1370-1380**: Volume scaling logic duplicated
-- **src/xdr_server.cpp:1249-1263** and **src/xdr_server.cpp:1314-1326**: Duplicate callback setter patterns
-
-### Low
-- **src/main.cpp**: Mixed naming conventions (camelCase vs snake_case)
-- **src/xdr_server.cpp**: Inconsistent variable naming (m_ vs no prefix)
-- Many member functions should be const-correct but aren't
-
----
-
-## Performance Issues
-
-### High
-- **src/main.cpp:1318-1325**: Signal level computation in every loop iteration
-- **src/rtl_sdr_device.cpp:212-274**: readIQ can block for 35ms
-- **src/audio_output.cpp:1334-1356**: WAV file I/O in audio callback (real-time path)
-- **src/xdr_server.cpp:602-641**: Network I/O in audio processing path
-
-### Medium
-- **src/main.cpp:1094-1100**: Multiple vector allocations in audio processing loop
-- **src/stereo_decoder.cpp:230-267**: Pilot detection algorithm could be optimized
-
----
-
-## Maintainability Issues
-
-### Medium
-- **src/main.cpp:1089**: Hardcoded decimation factors (magic numbers)
-- **src/stereo_decoder.cpp:5-22**: Magic constants for PLL parameters
-- **src/audio_output.cpp:31-34**: Hardcoded audio parameters
-
-### Low
-- Signal level computation doesn't handle invalid input gracefully
-- Inconsistent error handling strategies across modules
+- **src/audio_output.cpp:757,910** and **src/application.cpp:72,84**: Mixed newline style (`std::endl` and `"\n"`) remains inconsistent.
+- **src/audio_output.cpp:8+**: Extensive `#if defined(...)` style remains inconsistent with preferred `#ifdef` style.
 
 ---
 
 ## Priority Recommendations
 
-1. ✅ ~~Fix memory leak in xdr_server.cpp SHA1 usage~~ - Done
-2. ✅ ~~Add null checks for device/file handles~~ - Verified correct
-3. ✅ ~~Refactor main.cpp into smaller modules/functions~~ - Extracted signal_level
-4. ✅ ~~Add const-correctness where appropriate~~ - Verified correct
-5. ✅ ~~Replace magic numbers with named constants~~ - Done
-6. **High**: Abstract audio output behind interface
-7. **Low**: Standardize naming conventions
+1. **High**: Harden rtl_tcp handshake validation (reject malformed headers early).
+2. **High**: Reduce audio-path latency/churn (avoid per-block allocations and move WAV I/O off hot path).
+3. **High**: Abstract tuner/audio backends for cleaner multi-backend support.
+4. **Medium**: Rework audio output buffering to a bounded ring buffer model.
+5. **Medium**: Optimize scan DSP path by reusing FFT buffers/plans and minimizing per-iteration allocations.
+6. **Low**: Apply style consistency pass (naming, preprocessor style, newline style).
 
 ---
 
-## Completed
+## Future Milestones
 
-- [x] Code formatting (clang-format)
-- [x] Config cognitive complexity (204→25)
-- [x] Magic numbers → constants
-- [x] Short variable names expanded
-- [x] Extract signal_level module (-200 lines from main.cpp)
-- [x] SHA1 error handling
-
----
-
-## Remaining
-
-- Abstract audio output (significant refactor)
-- Naming conventions (low priority)
-  - `32767.0f` - audio_output.cpp:1316-1317
-  - `0.85f`, `1e-6f` - audio_output.cpp:931, 1375
-- **Short variable names**: Expand to meaningful names
-  - `l`, `r` → `left`, `right` (audio_output.cpp:1314-1315)
-  - `p` → `idx` or `sample` (af_post_processor.cpp:63)
-  - `dt`, `b`, `a` → `deltaTime`, `coeffs`, `coeffs` (af_post_processor.cpp:39-42)
-- **Pointer arithmetic**: Use array indexing
-  - af_post_processor.cpp:72-73
-  - audio_output.cpp:1314-1315, 1382-1383
-- **Implicit bool conversions**: Use explicit nullptr checks
-  - af_post_processor.cpp:53
-  - audio_output.cpp:1267, 1277, 1309, 1366, 1389
-- **Missing const**: Make member functions const where appropriate
-  - af_post_processor.cpp:20, 47
-
-### Low Priority (Style)
-- Uppercase float suffixes (`1.0f` → `1.0F`)
-- `#if defined` → `#ifdef`
-- `std::endl` → `'\n'`
-- Add braces around single-line statements
-- Trailing return types
-
----
-
-## clang-format Issues
-
-Many formatting violations found. Run to fix:
-```bash
-clang-format -i src/*.cpp
-```
+1.5 **High**: Audio latency fixes and improvements.
+1.6 **High**: Add SoapySDR support for broad SDR backend compatibility.
+1.7 **Medium**: DSP optimization pass (scan FFT reuse, demod scratch reuse, hot-path allocation audit).

@@ -31,15 +31,24 @@ void AFPostProcessor::reset() {
 void AFPostProcessor::setDeemphasis(int tau_us) {
   if (tau_us <= 0) {
     m_deemphasisEnabled = false;
+    m_liquidLeftDeemphasis.reset();
+    m_liquidRightDeemphasis.reset();
     return;
   }
 
   m_deemphasisEnabled = true;
+  // Bilinear-transformed one-pole de-emphasis, matching GNU Radio
+  // gr-analog fm_emph.py. Frequency pre-warping makes the digital response
+  // track the analog RC curve more accurately at the 48 kHz output rate
+  // (previous naïve form drifted ~0.5 dB near 10 kHz).
   const float tau = static_cast<float>(tau_us) * kMicrosecondsToSeconds;
-  const float samplePeriod = 1.0f / static_cast<float>(m_outputRate);
-  const float alpha = samplePeriod / (tau + samplePeriod);
-  const std::vector<float> coeffs = {alpha};
-  const std::vector<float> feedback = {1.0f, -(1.0f - alpha)};
+  const float fs = static_cast<float>(m_outputRate);
+  const float wp = 1.0f / tau;
+  const float wpp = std::tan(wp / (2.0f * fs));
+  const float b0 = wpp / (wpp + 1.0f);
+  const float a1 = (wpp - 1.0f) / (wpp + 1.0f);
+  const std::vector<float> coeffs = {b0, b0};
+  const std::vector<float> feedback = {1.0f, a1};
   m_liquidLeftDeemphasis.init(coeffs, feedback);
   m_liquidRightDeemphasis.init(coeffs, feedback);
 }
