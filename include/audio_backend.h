@@ -34,7 +34,7 @@ private:
   bool m_isRecording = false;
   FILE *m_fileHandle = nullptr;
   uint32_t m_dataSize = 0;
-  int m_sampleRate = 32000;
+  int m_sampleRate = 48000;
   int m_channels = 2;
   int m_bitsPerSample = 16;
 };

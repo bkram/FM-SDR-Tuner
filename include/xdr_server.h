@@ -186,6 +186,15 @@ private:
   StopCallback m_stopCallback;
 
   std::mutex m_callbackMutex;
+
+  // Shared body for all XDRServer::setXxxCallback setters: take the callback
+  // mutex and assign. Defined inline so each public setter collapses to one
+  // line without losing its distinct API signature.
+  template <typename Callback>
+  void assignCallback(Callback &target, Callback cb) {
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    target = std::move(cb);
+  }
 };
 
 #endif

@@ -25,6 +25,7 @@ public:
     int pilotTenthsKHz = 0;
     float stereoBlend = 0.0f;
     float stereoQuality = 0.0f;
+    float audioClipRatio = 0.0f;
     double channelPowerDbfs = std::numeric_limits<double>::quiet_NaN();
   };
 
@@ -36,12 +37,16 @@ public:
   void setBandwidthHz(int bandwidthHz);
   void setDeemphasisMode(int deemphasisMode);
   void setForceMono(bool forceMono);
+  void setBlendMode(StereoDecoder::BlendMode mode) { m_stereo.setBlendMode(mode); }
   size_t blockSize() const { return m_blockSamples; }
   size_t sdrBlockSamples() const { return m_blockSamples * m_iqDecimation; }
 
   bool process(const uint8_t *iq, size_t samples,
                const std::function<void(const float *, size_t)> &rdsSink,
                Result &out);
+
+  static constexpr float kSoftLimitThreshold = 0.85f;
+  static float softLimitSample(float x, uint32_t &softCount);
 
 private:
   int m_inputRate;

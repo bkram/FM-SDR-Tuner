@@ -12,9 +12,9 @@ constexpr size_t kWriterChunkSamples = 8192;
 } // namespace
 
 WavWriter::WavWriter()
-    : m_handle(nullptr), m_threadRunning(false), m_dataSize(0),
-      m_sampleRate(0), m_channels(0), m_verboseLogging(true), m_readPos(0),
-      m_writePos(0), m_size(0) {}
+    : m_handle(nullptr), m_threadRunning(false), m_fatalError(false),
+      m_dataSize(0), m_sampleRate(0), m_channels(0), m_verboseLogging(true),
+      m_readPos(0), m_writePos(0), m_size(0) {}
 
 WavWriter::~WavWriter() { shutdown(); }
 
@@ -36,6 +36,7 @@ bool WavWriter::init(const std::string &filename, uint32_t sampleRate,
   m_verboseLogging = verboseLogging;
   m_label = (label != nullptr) ? label : "WAV";
   m_dataSize = 0;
+  m_fatalError.store(false);
   m_readPos = 0;
   m_writePos = 0;
   m_size = 0;
@@ -43,7 +44,11 @@ bool WavWriter::init(const std::string &filename, uint32_t sampleRate,
                 0);
   m_encodeScratch.clear();
 
-  writeHeader();
+  if (!writeHeader()) {
+    std::fclose(m_handle);
+    m_handle = nullptr;
+    return false;
+  }
   m_threadRunning = true;
   m_thread = std::thread(&WavWriter::runWriterThread, this);
   return true;
@@ -58,49 +63,83 @@ void WavWriter::shutdown() {
   if (m_thread.joinable()) {
     m_thread.join();
   }
-  writeHeader();
+  if (!writeHeader() && !m_fatalError.load() && m_verboseLogging) {
+    std::cerr << "[AUDIO] " << m_label << " final header write failed\n";
+  }
   std::fclose(m_handle);
   m_handle = nullptr;
 }
 
-void WavWriter::writeHeader() {
+bool WavWriter::writeHeader() {
   if (!m_handle) {
-    return;
+    return false;
   }
 
   const uint32_t byteRate = m_sampleRate * m_channels * BITS_PER_SAMPLE / 8;
   const uint16_t blockAlign = m_channels * BITS_PER_SAMPLE / 8;
   const uint32_t dataSize = m_dataSize;
-
-  std::fseek(m_handle, 0, SEEK_SET);
-  std::fwrite("RIFF", 1, 4, m_handle);
-  const uint32_t fileSize = 36 + dataSize;
-  std::fwrite(&fileSize, 4, 1, m_handle);
-  std::fwrite("WAVE", 1, 4, m_handle);
-
-  std::fwrite("fmt ", 1, 4, m_handle);
+  const uint32_t fileSize = 36u + dataSize;
   const uint32_t fmtSize = 16;
-  std::fwrite(&fmtSize, 4, 1, m_handle);
   const uint16_t audioFormat = 1;
-  std::fwrite(&audioFormat, 2, 1, m_handle);
-  std::fwrite(&m_channels, 2, 1, m_handle);
-  std::fwrite(&m_sampleRate, 4, 1, m_handle);
-  std::fwrite(&byteRate, 4, 1, m_handle);
-  std::fwrite(&blockAlign, 2, 1, m_handle);
-  std::fwrite(&BITS_PER_SAMPLE, 2, 1, m_handle);
+  const uint16_t bitsPerSample = BITS_PER_SAMPLE;
 
-  std::fwrite("data", 1, 4, m_handle);
-  std::fwrite(&dataSize, 4, 1, m_handle);
+  if (std::fseek(m_handle, 0, SEEK_SET) != 0) {
+    if (m_verboseLogging) {
+      std::cerr << "[AUDIO] " << m_label << " failed to seek WAV header\n";
+    }
+    return false;
+  }
+
+  const bool ok =
+      std::fwrite("RIFF", 1, 4, m_handle) == 4 &&
+      std::fwrite(&fileSize, 4, 1, m_handle) == 1 &&
+      std::fwrite("WAVE", 1, 4, m_handle) == 4 &&
+      std::fwrite("fmt ", 1, 4, m_handle) == 4 &&
+      std::fwrite(&fmtSize, 4, 1, m_handle) == 1 &&
+      std::fwrite(&audioFormat, 2, 1, m_handle) == 1 &&
+      std::fwrite(&m_channels, 2, 1, m_handle) == 1 &&
+      std::fwrite(&m_sampleRate, 4, 1, m_handle) == 1 &&
+      std::fwrite(&byteRate, 4, 1, m_handle) == 1 &&
+      std::fwrite(&blockAlign, 2, 1, m_handle) == 1 &&
+      std::fwrite(&bitsPerSample, 2, 1, m_handle) == 1 &&
+      std::fwrite("data", 1, 4, m_handle) == 4 &&
+      std::fwrite(&dataSize, 4, 1, m_handle) == 1;
+  if (!ok && m_verboseLogging) {
+    std::cerr << "[AUDIO] " << m_label << " failed to write WAV header\n";
+  }
+  return ok;
 }
 
 bool WavWriter::writeData(const int16_t *samples, size_t sampleCount) {
   if (!m_handle || !samples || sampleCount == 0) {
     return false;
   }
+  if (m_fatalError.load()) {
+    return false;
+  }
+  const size_t maxBytes =
+      static_cast<size_t>(UINT32_MAX) - 36u - m_dataSize;
+  const size_t wantBytes = sampleCount * sizeof(int16_t);
+  if (wantBytes > maxBytes) {
+    if (m_verboseLogging) {
+      std::cerr << "[AUDIO] " << m_label
+                << " reached 4 GiB WAV limit, stopping capture\n";
+    }
+    m_fatalError.store(true);
+    return false;
+  }
   const size_t written =
       std::fwrite(samples, sizeof(int16_t), sampleCount, m_handle);
   m_dataSize += static_cast<uint32_t>(written * sizeof(int16_t));
-  return written == sampleCount;
+  if (written != sampleCount) {
+    if (m_verboseLogging) {
+      std::cerr << "[AUDIO] " << m_label << " short WAV write (" << written
+                << "/" << sampleCount << ")\n";
+    }
+    m_fatalError.store(true);
+    return false;
+  }
+  return true;
 }
 
 bool WavWriter::enqueueInterleavedFloat(const float *samples,
@@ -179,6 +218,8 @@ void WavWriter::runWriterThread() {
       }
       m_size -= copied;
     }
-    (void)writeData(localBuffer.data(), copied);
+    if (!writeData(localBuffer.data(), copied)) {
+      break;
+    }
   }
 }

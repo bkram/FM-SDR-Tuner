@@ -71,7 +71,7 @@ bool Application::initAudioOutput(AudioOutput &audioOut,
   const Config &config = m_options.config;
   const bool verboseLogging = m_options.verboseLogging;
   if (verboseLogging) {
-    std::cout << "[AUDIO] initializing audio output..." << std::endl;
+    std::cout << "[AUDIO] initializing audio output..." << "\n";
   }
   const std::string &audioDeviceToUse =
       !m_options.audioDevice.empty() ? m_options.audioDevice : config.audio.device;
@@ -83,7 +83,7 @@ bool Application::initAudioOutput(AudioOutput &audioOut,
   }
   audioOut.setVolumePercent(requestedVolume.load());
   if (verboseLogging) {
-    std::cout << "[AUDIO] audio output initialized" << std::endl;
+    std::cout << "[AUDIO] audio output initialized" << "\n";
   }
   return true;
 }
@@ -168,7 +168,7 @@ void Application::shutdownResources(AudioOutput &audioOut, FILE *&iqHandle,
 
 int Application::run() {
   constexpr int INPUT_RATE = 256000;
-  constexpr int OUTPUT_RATE = 32000;
+  constexpr int OUTPUT_RATE = 48000;
 
   const CPUFeatures cpu = detectCPUFeatures();
 
@@ -188,6 +188,12 @@ int Application::run() {
   const int defaultCustomGainFlags = config.sdr.default_custom_gain_flags;
   std::string xdrPassword = m_options.xdrPassword;
   bool xdrGuestMode = m_options.xdrGuestMode;
+  if (xdrPassword.empty() && !xdrGuestMode) {
+    xdrGuestMode = true;
+    if (m_options.verboseLogging) {
+      std::cout << "[XDR] no password set, enabling guest mode\n";
+    }
+  }
   uint16_t xdrPort = m_options.xdrPort;
   bool autoReconnect = m_options.autoReconnect;
   const bool autoStartTuner = m_options.autoStart;
@@ -399,6 +405,19 @@ int Application::run() {
   }
   DspPipeline dspPipeline(INPUT_RATE, OUTPUT_RATE, config.processing,
                           verboseLogging, dspBlockSize, iqDecimation);
+  if (!m_options.stereoBlendOverride.empty()) {
+    if (m_options.stereoBlendOverride == "soft") {
+      dspPipeline.setBlendMode(StereoDecoder::BlendMode::Soft);
+    } else if (m_options.stereoBlendOverride == "aggressive") {
+      dspPipeline.setBlendMode(StereoDecoder::BlendMode::Aggressive);
+    } else {
+      dspPipeline.setBlendMode(StereoDecoder::BlendMode::Normal);
+    }
+    if (verboseLogging) {
+      std::cout << "[DSP] stereo_blend override: "
+                << m_options.stereoBlendOverride << "\n";
+    }
+  }
   dspRuntime.addResetHandler([&]() { dspPipeline.reset(); });
   int appliedBandwidthHz = requestedBandwidthHz.load();
   int appliedDeemphasis = requestedDeemphasis.load();

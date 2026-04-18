@@ -571,11 +571,11 @@ bool AudioOutput::initAlsa(const std::string &deviceName) {
               << rate << " (will resample)\n";
   }
 
-  // Lower-latency target: ~128 ms device buffer at 32 kHz.
+  // Lower-latency target: ~128 ms device buffer at 48 kHz.
   snd_pcm_uframes_t bufferSize = 4096;
   snd_pcm_hw_params_set_buffer_size_near(m_alsaPcm, hwparams, &bufferSize);
 
-  // Lower-latency target: ~16 ms period at 32 kHz.
+  // Lower-latency target: ~16 ms period at 48 kHz.
   snd_pcm_uframes_t periodSize = 512;
   snd_pcm_hw_params_set_period_size_near(m_alsaPcm, hwparams, &periodSize,
                                          &dir);
@@ -780,7 +780,8 @@ void AudioOutput::runWinMMOutputThread() {
 
 AudioOutput::AudioOutput()
     : m_enableSpeaker(false), m_wavHandle(nullptr), m_running(false),
-      m_wavThreadRunning(false), m_wavDataSize(0), m_verboseLogging(true),
+      m_wavThreadRunning(false), m_wavFatalError(false), m_wavDataSize(0),
+      m_verboseLogging(true),
       m_requestedVolumePercent(kMaxVolumePercent),
       m_currentVolumeScale(kDefaultVolumeScale), m_speakerReadPos(0),
       m_speakerWritePos(0), m_speakerSize(0), m_wavReadPos(0), m_wavWritePos(0),
@@ -818,7 +819,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
 
   if (!wavFile.empty()) {
     if (!initWAV(wavFile)) {
-      std::cerr << "Failed to initialize WAV file" << std::endl;
+      std::cerr << "Failed to initialize WAV file" << "\n";
       return false;
     }
   }
@@ -970,7 +971,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
       std::cout << "[AUDIO] device selector: " << alsaDevice << "\n";
     }
     if (!initAlsa(alsaDevice)) {
-      std::cerr << "Failed to initialize ALSA audio output" << std::endl;
+      std::cerr << "Failed to initialize ALSA audio output" << "\n";
       return false;
     }
   }
@@ -1030,52 +1031,87 @@ bool AudioOutput::initWAV(const std::string &filename) {
     m_wavWritePos = 0;
     m_wavSize = 0;
   }
-  writeWAVHeader();
+  m_wavFatalError.store(false);
+  if (!writeWAVHeader()) {
+    fclose(m_wavHandle);
+    m_wavHandle = nullptr;
+    return false;
+  }
   m_wavThreadRunning = true;
   m_wavThread = std::thread(&AudioOutput::runWavWriterThread, this);
   return true;
 }
 
-void AudioOutput::writeWAVHeader() {
+bool AudioOutput::writeWAVHeader() {
   if (!m_wavHandle)
-    return;
+    return false;
 
-  uint32_t sampleRate = SAMPLE_RATE;
-  uint16_t numChannels = CHANNELS;
-  uint16_t bitsPerSample = BITS_PER_SAMPLE;
-  uint32_t byteRate = sampleRate * numChannels * bitsPerSample / 8;
-  uint16_t blockAlign = numChannels * bitsPerSample / 8;
-  uint32_t dataSize = m_wavDataSize;
+  const uint32_t sampleRate = SAMPLE_RATE;
+  const uint16_t numChannels = CHANNELS;
+  const uint16_t bitsPerSample = BITS_PER_SAMPLE;
+  const uint32_t byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  const uint16_t blockAlign = numChannels * bitsPerSample / 8;
+  const uint32_t dataSize = m_wavDataSize;
+  const uint32_t fileSize = 36u + dataSize;
+  const uint32_t fmtSize = 16;
+  const uint16_t audioFormat = 1;
 
-  fseek(m_wavHandle, 0, SEEK_SET);
+  if (fseek(m_wavHandle, 0, SEEK_SET) != 0) {
+    if (m_verboseLogging) {
+      std::cerr << "[AUDIO] failed to seek WAV header\n";
+    }
+    return false;
+  }
 
-  fwrite("RIFF", 1, 4, m_wavHandle);
-  uint32_t fileSize = 36 + dataSize;
-  fwrite(&fileSize, 4, 1, m_wavHandle);
-  fwrite("WAVE", 1, 4, m_wavHandle);
-
-  fwrite("fmt ", 1, 4, m_wavHandle);
-  uint32_t fmtSize = 16;
-  fwrite(&fmtSize, 4, 1, m_wavHandle);
-  uint16_t audioFormat = 1;
-  fwrite(&audioFormat, 2, 1, m_wavHandle);
-  fwrite(&numChannels, 2, 1, m_wavHandle);
-  fwrite(&sampleRate, 4, 1, m_wavHandle);
-  fwrite(&byteRate, 4, 1, m_wavHandle);
-  fwrite(&blockAlign, 2, 1, m_wavHandle);
-  fwrite(&bitsPerSample, 2, 1, m_wavHandle);
-
-  fwrite("data", 1, 4, m_wavHandle);
-  fwrite(&dataSize, 4, 1, m_wavHandle);
+  const bool ok =
+      fwrite("RIFF", 1, 4, m_wavHandle) == 4 &&
+      fwrite(&fileSize, 4, 1, m_wavHandle) == 1 &&
+      fwrite("WAVE", 1, 4, m_wavHandle) == 4 &&
+      fwrite("fmt ", 1, 4, m_wavHandle) == 4 &&
+      fwrite(&fmtSize, 4, 1, m_wavHandle) == 1 &&
+      fwrite(&audioFormat, 2, 1, m_wavHandle) == 1 &&
+      fwrite(&numChannels, 2, 1, m_wavHandle) == 1 &&
+      fwrite(&sampleRate, 4, 1, m_wavHandle) == 1 &&
+      fwrite(&byteRate, 4, 1, m_wavHandle) == 1 &&
+      fwrite(&blockAlign, 2, 1, m_wavHandle) == 1 &&
+      fwrite(&bitsPerSample, 2, 1, m_wavHandle) == 1 &&
+      fwrite("data", 1, 4, m_wavHandle) == 4 &&
+      fwrite(&dataSize, 4, 1, m_wavHandle) == 1;
+  if (!ok && m_verboseLogging) {
+    std::cerr << "[AUDIO] failed to write WAV header\n";
+  }
+  return ok;
 }
 
 bool AudioOutput::writeWAVData(const int16_t *samples, size_t sampleCount) {
   if (!m_wavHandle || !samples || sampleCount == 0)
     return false;
+  if (m_wavFatalError.load())
+    return false;
 
-  size_t written = fwrite(samples, sizeof(int16_t), sampleCount, m_wavHandle);
-  m_wavDataSize += written * sizeof(int16_t);
-  return written == sampleCount;
+  const size_t maxBytes =
+      static_cast<size_t>(UINT32_MAX) - 36u - m_wavDataSize;
+  const size_t wantBytes = sampleCount * sizeof(int16_t);
+  if (wantBytes > maxBytes) {
+    if (m_verboseLogging) {
+      std::cerr << "[AUDIO] reached 4 GiB WAV limit, stopping capture\n";
+    }
+    m_wavFatalError.store(true);
+    return false;
+  }
+
+  const size_t written =
+      fwrite(samples, sizeof(int16_t), sampleCount, m_wavHandle);
+  m_wavDataSize += static_cast<uint32_t>(written * sizeof(int16_t));
+  if (written != sampleCount) {
+    if (m_verboseLogging) {
+      std::cerr << "[AUDIO] short WAV write (" << written << "/" << sampleCount
+                << ")\n";
+    }
+    m_wavFatalError.store(true);
+    return false;
+  }
+  return true;
 }
 
 bool AudioOutput::enqueueWavSamples(const float *left, const float *right,
@@ -1145,7 +1181,9 @@ void AudioOutput::runWavWriterThread() {
       }
       m_wavSize -= copied;
     }
-    (void)writeWAVData(localBuffer.data(), copied);
+    if (!writeWAVData(localBuffer.data(), copied)) {
+      break;
+    }
   }
 }
 
@@ -1156,7 +1194,9 @@ void AudioOutput::closeWAV() {
     if (m_wavThread.joinable()) {
       m_wavThread.join();
     }
-    writeWAVHeader();
+    if (!writeWAVHeader() && !m_wavFatalError.load() && m_verboseLogging) {
+      std::cerr << "[AUDIO] final WAV header write failed\n";
+    }
     fclose(m_wavHandle);
     m_wavHandle = nullptr;
   }

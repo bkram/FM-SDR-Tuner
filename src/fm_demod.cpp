@@ -42,7 +42,7 @@ FMDemod::FMDemod(int inputRate, int outputRate)
   m_liquidMonoResampler.init(ratio);
   m_liquidMonoDcBlock.initDCBlocker(0.0008f);
   setDeviation(75000.0);
-  setDeemphasis(75);
+  setDeemphasis(50);
   setDspAgcMode(DspAgcMode::Off);
 }
 
@@ -135,6 +135,7 @@ void FMDemod::setBandwidthHz(int bwHz) {
   const float stopBandAtten =
       (selectedBwHz > 0 && selectedBwHz <= 42000) ? 70.0f : 60.0f;
   m_liquidIqFilter.init(filterLen, cutoffNorm, stopBandAtten);
+  reset();
 }
 
 void FMDemod::setW0BandwidthHz(int bwHz) {
@@ -142,12 +143,16 @@ void FMDemod::setW0BandwidthHz(int bwHz) {
 }
 
 void FMDemod::setDspAgcMode(DspAgcMode mode) {
-  m_dspAgcMode = mode;
-  if (m_dspAgcMode == DspAgcMode::Off) {
+  if (mode == m_dspAgcMode) {
     return;
   }
-  const float bandwidth = (m_dspAgcMode == DspAgcMode::Fast) ? 0.01f : 0.001f;
-  m_liquidIqAgc.init(bandwidth, 1.0f);
+  m_dspAgcMode = mode;
+  if (m_dspAgcMode != DspAgcMode::Off) {
+    const float bandwidth =
+        (m_dspAgcMode == DspAgcMode::Fast) ? 0.01f : 0.001f;
+    m_liquidIqAgc.init(bandwidth, 1.0f);
+  }
+  reset();
 }
 
 void FMDemod::demodulate(const uint8_t *iq, float *audio, size_t len) {
@@ -184,9 +189,15 @@ void FMDemod::demodulate(const uint8_t *iq, float *audio, size_t len) {
   m_clippingRatio =
       (len > 0) ? (static_cast<float>(clipCount) / static_cast<float>(len))
                 : 0.0f;
+  // Cap at 0 dBFS so ADC-rail overload (IQ FIR rings past full scale under
+  // heavy IF AGC) doesn't report physically nonsensical positive dBFS.
   m_filteredChannelPowerDbfs =
-      (len > 0) ? (10.0 * std::log10((powerSum / static_cast<double>(len)) + 1e-20))
-                : -120.0;
+      (len > 0)
+          ? std::min(0.0,
+                     10.0 *
+                         std::log10((powerSum / static_cast<double>(len)) +
+                                    1e-20))
+          : -120.0;
 }
 
 void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
@@ -220,8 +231,12 @@ void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
       (len > 0) ? (static_cast<float>(clipCount) / static_cast<float>(len))
                 : 0.0f;
   m_filteredChannelPowerDbfs =
-      (len > 0) ? (10.0 * std::log10((powerSum / static_cast<double>(len)) + 1e-20))
-                : -120.0;
+      (len > 0)
+          ? std::min(0.0,
+                     10.0 *
+                         std::log10((powerSum / static_cast<double>(len)) +
+                                    1e-20))
+          : -120.0;
 }
 
 size_t FMDemod::downsampleAudio(const float *demod, float *audio,

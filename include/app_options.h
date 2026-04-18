@@ -16,7 +16,7 @@ struct AppOptions {
   uint32_t iqSampleRate = 256000;
   std::string tunerSource = "rtl_sdr";
   uint32_t rtlDeviceIndex = 0;
-  uint32_t freqKHz = 88600;
+  uint32_t freqKHz = 87500;
   int gain = -1;
   std::string wavFile;
   std::string mpxWavFile;
@@ -30,6 +30,7 @@ struct AppOptions {
   bool autoStart = false;
   bool lowLatencyIq = false;
   bool verboseLogging = true;
+  std::string stereoBlendOverride; // empty = use config; else "soft"|"normal"|"aggressive"
 };
 
 struct AppParseResult {

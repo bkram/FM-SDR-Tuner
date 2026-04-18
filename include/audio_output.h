@@ -26,7 +26,7 @@
 
 class AudioOutput {
 public:
-  static constexpr int SAMPLE_RATE = 32000;
+  static constexpr int SAMPLE_RATE = 48000;
   static constexpr int CHANNELS = 2;
   static constexpr int BITS_PER_SAMPLE = 16;
   static constexpr int FRAMES_PER_BUFFER = 4096;
@@ -56,7 +56,7 @@ public:
 
 private:
   bool initWAV(const std::string &filename);
-  void writeWAVHeader();
+  bool writeWAVHeader();
   bool writeWAVData(const int16_t *samples, size_t sampleCount);
   void closeWAV();
   void runWavWriterThread();
@@ -88,6 +88,7 @@ private:
   FILE *m_wavHandle;
   std::atomic<bool> m_running;
   std::atomic<bool> m_wavThreadRunning;
+  std::atomic<bool> m_wavFatalError;
   uint32_t m_wavDataSize;
 
   bool m_verboseLogging;

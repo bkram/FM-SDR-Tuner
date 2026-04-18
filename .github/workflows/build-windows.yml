@@ -43,7 +43,23 @@ jobs:
     - name: Build and install liquid-dsp (MinGW-w64)
       shell: msys2 {0}
       run: |
-        git clone --depth 1 https://github.com/jgaeddert/liquid-dsp.git /tmp/liquid-dsp
+        # Pin to v1.7.0: later master added src/core/src/logging.c which uses
+        # timespec_get / TIME_UTC / strsep / "%T" strftime — features MSYS2
+        # MinGW-w64 headers do not expose under any feature-test macro. The
+        # v1.7.0 tag predates that file and builds cleanly on MinGW-w64.
+        git clone --depth 1 --branch v1.7.0 https://github.com/jgaeddert/liquid-dsp.git /tmp/liquid-dsp
+        # Two MinGW-w64-specific fixes to v1.7.0's CMakeLists:
+        #
+        # 1. LIQUID_VERSION derives from scripts/version.sh via execute_process,
+        #    which fails silently under MSYS2 and leaves line 380
+        #    `set_target_properties(... VERSION ${LIQUID_VERSION} SOVERSION 1)`
+        #    malformed. Hard-code the version literal.
+        #
+        # 2. Line 368 links the shared lib against `-lc` (glibc), which does
+        #    not exist under MinGW-w64 (the C runtime is msvcrt/ucrt and is
+        #    linked implicitly). Drop `c` from target_link_libraries.
+        sed -i 's|VERSION \${LIQUID_VERSION}|VERSION 1.7.0|' /tmp/liquid-dsp/CMakeLists.txt
+        sed -i 's|target_link_libraries(\${LIBNAME} c m)|target_link_libraries(\${LIBNAME} m)|' /tmp/liquid-dsp/CMakeLists.txt
         cmake -S /tmp/liquid-dsp -B /tmp/liquid-dsp/build -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_SHARED_LIBS=OFF \
@@ -54,6 +70,15 @@ jobs:
           -DCMAKE_INSTALL_PREFIX=/mingw64
         cmake --build /tmp/liquid-dsp/build --parallel
         cmake --install /tmp/liquid-dsp/build
+        # liquid-dsp v1.7.0's install drops `libliquid.dll.a` into
+        # ${prefix}/lib/static/ (the upstream default for that version),
+        # which is not on MSYS2's default `find_library` search path. Copy
+        # it to ${prefix}/lib/ so our root CMakeLists' fallback
+        # `find_library(NAMES liquid)` can locate it. The DLL is not staged
+        # by upstream install at all, so copy it from the build dir into
+        # ${prefix}/bin/ for runtime load during smoke tests.
+        cp /mingw64/lib/static/libliquid.dll.a /mingw64/lib/libliquid.dll.a
+        cp /tmp/liquid-dsp/build/libliquid.dll /mingw64/bin/libliquid.dll
 
     - name: Build (MinGW-w64)
       shell: msys2 {0}

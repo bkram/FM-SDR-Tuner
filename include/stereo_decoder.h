@@ -49,8 +49,12 @@ private:
   float m_pllFreq;
   float m_pllMinFreq;
   float m_pllMaxFreq;
-  int m_pilotCount;
-  int m_pilotLossCount;
+  float m_pilotConfidence;
+  // State of the Hi-Blend variable-cutoff one-pole LPF on the L-R signal.
+  // Cutoff scales with m_stereoBlend so under weak reception stereo imagery
+  // retains LF detail while HF (which carries most of the noise energy) is
+  // rolled off, instead of hard-dropping to mono.
+  float m_hiBlendLrState;
 
   std::vector<std::complex<float>> m_delayLine;
   size_t m_delayPos;

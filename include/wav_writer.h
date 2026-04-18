@@ -28,12 +28,13 @@ public:
   bool enqueueMonoFloat(const float *samples, size_t sampleCount);
 
 private:
-  void writeHeader();
+  bool writeHeader();
   bool writeData(const int16_t *samples, size_t sampleCount);
   void runWriterThread();
 
   FILE *m_handle;
   std::atomic<bool> m_threadRunning;
+  std::atomic<bool> m_fatalError;
   uint32_t m_dataSize;
   uint32_t m_sampleRate;
   uint16_t m_channels;

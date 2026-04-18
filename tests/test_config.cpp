@@ -192,7 +192,7 @@ TEST_CASE("Config accepts mixed-case booleans and preserves defaults on invalid 
     REQUIRE(result == true);
     REQUIRE(config.audio.enable_audio == true);
     REQUIRE(config.processing.dsp_agc == "off");
-    REQUIRE(config.processing.stereo_blend == "normal");
+    REQUIRE(config.processing.stereo_blend == "aggressive");
 
     std::remove("test_config.ini");
 }

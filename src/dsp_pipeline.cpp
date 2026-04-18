@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 
 namespace {
@@ -9,6 +10,23 @@ namespace {
 constexpr size_t kIqStagingBlocks = 4;
 
 } // namespace
+
+// Audio-output soft limiter: passthrough below |x| = kSoftLimitThreshold,
+// tanh soft knee above that, hard clamp at ±1.0 as a seatbelt. Threshold is
+// at about -1.4 dBFS so stereo-blend transients and resampler overshoot get
+// compressed instead of hard-clipped.
+float DspPipeline::softLimitSample(float x, uint32_t &softCount) {
+  const float ax = std::fabs(x);
+  if (ax <= kSoftLimitThreshold) {
+    return x;
+  }
+  ++softCount;
+  const float range = 1.0f - kSoftLimitThreshold;
+  const float soft =
+      kSoftLimitThreshold +
+      range * std::tanh((ax - kSoftLimitThreshold) / range);
+  return std::clamp((x < 0.0f) ? -soft : soft, -1.0f, 1.0f);
+}
 
 DspPipeline::DspPipeline(int inputRate, int outputRate,
                          const Config::ProcessingSection &processing,
@@ -71,6 +89,8 @@ void DspPipeline::reset() {
 
 void DspPipeline::setBandwidthHz(int bandwidthHz) {
   m_demod.setBandwidthHz(bandwidthHz);
+  m_stereo.reset();
+  m_afPost.reset();
 }
 
 void DspPipeline::setDeemphasisMode(int deemphasisMode) {
@@ -84,6 +104,9 @@ void DspPipeline::setDeemphasisMode(int deemphasisMode) {
     m_afPost.setDeemphasis(0);
     m_demod.setDeemphasis(0);
   }
+  m_demod.reset();
+  m_stereo.reset();
+  m_afPost.reset();
 }
 
 void DspPipeline::setForceMono(bool forceMono) { m_stereo.setForceMono(forceMono); }
@@ -226,9 +249,10 @@ bool DspPipeline::process(
     pilotTenthsKHz = m_stereo.getPilotLevelTenthsKHz();
   }
 
+  uint32_t softClipCount = 0;
   for (size_t i = 0; i < outSamples; i++) {
-    m_audioLeft[i] = std::clamp(m_audioLeft[i], -1.0f, 1.0f);
-    m_audioRight[i] = std::clamp(m_audioRight[i], -1.0f, 1.0f);
+    m_audioLeft[i] = softLimitSample(m_audioLeft[i], softClipCount);
+    m_audioRight[i] = softLimitSample(m_audioRight[i], softClipCount);
   }
 
   out.left = m_audioLeft.data();
@@ -239,6 +263,11 @@ bool DspPipeline::process(
   out.pilotTenthsKHz = pilotTenthsKHz;
   out.stereoBlend = m_stereo.getStereoBlend();
   out.stereoQuality = m_stereo.getStereoQuality();
+  out.audioClipRatio =
+      (outSamples > 0)
+          ? static_cast<float>(softClipCount) /
+                static_cast<float>(outSamples * 2U)
+          : 0.0f;
   out.channelPowerDbfs = m_demod.getFilteredChannelPowerDbfs();
   return true;
 }

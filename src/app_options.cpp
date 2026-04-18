@@ -41,8 +41,10 @@ void printUsage(const char *prog) {
          "rtl_sdr)\n"
       << "      --rtl-device <id>  RTL-SDR device index for --source rtl_sdr "
          "(default: 0)\n"
-      << "  -f, --freq <khz>      Frequency in kHz (default: 88600)\n"
+      << "  -f, --freq <khz>      Frequency in kHz (default: 87500)\n"
       << "  -g, --gain <db>       RTL-SDR gain in dB (default: auto)\n"
+      << "  -b, --blend <mode>    Stereo blend: soft|normal|aggressive (default: "
+         "config, normal)\n"
       << "  -w, --wav <file>      Output WAV file\n"
       << "      --mpx-wav <file>  Output decoded MPX WAV file (mono, 256000 Hz)\n"
       << "  -i, --iq <file>       Capture raw IQ bytes to file\n"
@@ -340,6 +342,20 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
         return result;
       }
       opts.xdrPassword = value;
+      continue;
+    }
+    if (arg == "-b" || arg == "--blend" || arg.rfind("--blend=", 0) == 0) {
+      std::string value = readValue(i, arg, "blend");
+      std::transform(
+          value.begin(), value.end(), value.begin(),
+          [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      if (value != "soft" && value != "normal" && value != "aggressive") {
+        std::cerr << "[CLI] invalid --blend value: '" << value
+                  << "' (expected soft|normal|aggressive)\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      opts.stereoBlendOverride = value;
       continue;
     }
 

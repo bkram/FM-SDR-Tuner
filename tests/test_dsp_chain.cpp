@@ -702,3 +702,166 @@ TEST_CASE("DspPipeline decimation staging handles fragmented high-rate IQ withou
   REQUIRE(offset == totalIqSamples);
   REQUIRE(producedBlocks == 2);
 }
+
+TEST_CASE("DspPipeline::softLimitSample passes through below threshold",
+          "[dsp_pipeline][soft_limit]") {
+  uint32_t count = 0;
+  REQUIRE(DspPipeline::softLimitSample(0.0f, count) == 0.0f);
+  REQUIRE(DspPipeline::softLimitSample(0.5f, count) == 0.5f);
+  REQUIRE(DspPipeline::softLimitSample(-0.8f, count) == -0.8f);
+  REQUIRE(DspPipeline::softLimitSample(DspPipeline::kSoftLimitThreshold,
+                                       count) ==
+          DspPipeline::kSoftLimitThreshold);
+  REQUIRE(count == 0);
+}
+
+TEST_CASE("DspPipeline::softLimitSample soft-knees above threshold and counts",
+          "[dsp_pipeline][soft_limit]") {
+  uint32_t count = 0;
+
+  const float over = DspPipeline::softLimitSample(1.5f, count);
+  REQUIRE(over > DspPipeline::kSoftLimitThreshold);
+  REQUIRE(over < 1.0f);
+
+  const float negOver = DspPipeline::softLimitSample(-1.5f, count);
+  REQUIRE(negOver < -DspPipeline::kSoftLimitThreshold);
+  REQUIRE(negOver > -1.0f);
+
+  REQUIRE(count == 2);
+
+  const float huge = DspPipeline::softLimitSample(100.0f, count);
+  REQUIRE(huge <= 1.0f);
+  REQUIRE(huge >= -1.0f);
+
+  const float monotonicA = DspPipeline::softLimitSample(0.96f, count);
+  const float monotonicB = DspPipeline::softLimitSample(0.99f, count);
+  const float monotonicC = DspPipeline::softLimitSample(1.20f, count);
+  REQUIRE(monotonicA < monotonicB);
+  REQUIRE(monotonicB < monotonicC);
+}
+
+TEST_CASE("Stereo hysteresis acquires and drops on a block-size-independent timeline",
+          "[dsp][stereo][hysteresis]") {
+  constexpr int kInputRate = 256000;
+  constexpr float kPilotHz = 19000.0f;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+  constexpr size_t kHoldSamples = 2 * kInputRate / 5;  // 400 ms of clean MPX
+  constexpr size_t kDropSamples = kInputRate;          // 1 s of pilot-less MPX
+
+  auto makeSample = [](size_t i, bool withPilot) {
+    const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+    const float l = 0.45f * std::sin(kTwoPi * 1000.0f * t);
+    const float r = 0.45f * std::sin(kTwoPi * 2800.0f * t);
+    const float mono = l + r;
+    const float pilot =
+        withPilot ? 0.08f * std::sin(kTwoPi * kPilotHz * t) : 0.0f;
+    const float dsb =
+        withPilot ? 0.25f * (l - r) * std::sin(kTwoPi * 2.0f * kPilotHz * t)
+                  : 0.0f;
+    return mono + pilot + dsb;
+  };
+
+  auto runWithBlock = [&](size_t blockSize) {
+    StereoDecoder dec(kInputRate, 32000);
+    std::vector<float> mpx(blockSize, 0.0f);
+    std::vector<float> left(blockSize, 0.0f);
+    std::vector<float> right(blockSize, 0.0f);
+
+    size_t acquireSample = 0;
+    bool acquired = false;
+    for (size_t i = 0; i < kHoldSamples; i += blockSize) {
+      const size_t count = std::min(blockSize, kHoldSamples - i);
+      for (size_t k = 0; k < count; k++) {
+        mpx[k] = makeSample(i + k, true);
+      }
+      dec.processAudio(mpx.data(), left.data(), right.data(), count);
+      if (!acquired && dec.isStereo()) {
+        acquired = true;
+        acquireSample = i + count;
+      }
+    }
+
+    size_t dropSample = 0;
+    bool dropped = false;
+    if (acquired) {
+      for (size_t i = 0; i < kDropSamples && !dropped; i += blockSize) {
+        const size_t count = std::min(blockSize, kDropSamples - i);
+        for (size_t k = 0; k < count; k++) {
+          mpx[k] = makeSample(kHoldSamples + i + k, false);
+        }
+        dec.processAudio(mpx.data(), left.data(), right.data(), count);
+        if (!dec.isStereo()) {
+          dropped = true;
+          dropSample = i + count;
+        }
+      }
+    }
+
+    struct Outcome {
+      bool acquired;
+      size_t acquireSample;
+      bool dropped;
+      size_t dropSample;
+    };
+    return Outcome{acquired, acquireSample, dropped, dropSample};
+  };
+
+  const auto small = runWithBlock(512);
+  const auto large = runWithBlock(8192);
+
+  REQUIRE(small.acquired);
+  REQUIRE(large.acquired);
+  REQUIRE(small.dropped);
+  REQUIRE(large.dropped);
+
+  const float acquireDeltaSec =
+      std::abs(static_cast<float>(small.acquireSample) -
+               static_cast<float>(large.acquireSample)) /
+      static_cast<float>(kInputRate);
+  const float dropDeltaSec =
+      std::abs(static_cast<float>(small.dropSample) -
+               static_cast<float>(large.dropSample)) /
+      static_cast<float>(kInputRate);
+
+  // Acquire and drop times should not drift by more than roughly one large
+  // block between the two configurations. The granularity of the larger
+  // 8192-sample block at 256 kHz is 32 ms, so allow a 50 ms acquire window
+  // and a 200 ms drop window to absorb per-block quantization.
+  REQUIRE(acquireDeltaSec < 0.050f);
+  REQUIRE(dropDeltaSec < 0.200f);
+}
+
+TEST_CASE("DspPipeline surfaces audioClipRatio and keeps audio in range",
+          "[dsp_pipeline][soft_limit]") {
+  constexpr size_t kBlockSamples = 256;
+  constexpr size_t kIqDecimation = 1;
+  constexpr int kInputRate = 256000;
+  constexpr int kOutputRate = 32000;
+  Config::ProcessingSection processing;
+  processing.stereo = true;
+  processing.w0_bandwidth_hz = 194000;
+  processing.stereo_blend = "normal";
+  processing.dsp_agc = "off";
+  DspPipeline pipeline(kInputRate, kOutputRate, processing, false,
+                       kBlockSamples, kIqDecimation);
+
+  std::vector<uint8_t> iq(kBlockSamples * 2, 0);
+  for (size_t i = 0; i < kBlockSamples; i++) {
+    iq[i * 2] = 140;
+    iq[i * 2 + 1] = 110;
+  }
+
+  DspPipeline::Result out;
+  const bool have = pipeline.process(
+      iq.data(), kBlockSamples, [](const float *, size_t) {}, out);
+  REQUIRE(have);
+  REQUIRE(out.outSamples > 0);
+  REQUIRE(out.audioClipRatio >= 0.0f);
+  REQUIRE(out.audioClipRatio <= 1.0f);
+  for (size_t i = 0; i < out.outSamples; i++) {
+    REQUIRE(out.left[i] >= -1.0f);
+    REQUIRE(out.left[i] <= 1.0f);
+    REQUIRE(out.right[i] >= -1.0f);
+    REQUIRE(out.right[i] <= 1.0f);
+  }
+}

@@ -117,7 +117,7 @@ RTLTCPClient::~RTLTCPClient() { disconnect(); }
 
 bool RTLTCPClient::connect() {
   if (!ensureSocketSubsystem()) {
-    std::cerr << "Failed to initialize socket subsystem" << std::endl;
+    std::cerr << "Failed to initialize socket subsystem" << "\n";
     return false;
   }
 
@@ -133,7 +133,7 @@ bool RTLTCPClient::connect() {
       getaddrinfo(m_host.c_str(), portStr.c_str(), &hints, &results);
   if (gai != 0 || !results) {
     std::cerr << "Invalid address: " << m_host << " (" << gai_strerror(gai)
-              << ")" << std::endl;
+              << ")" << "\n";
     return false;
   }
 
@@ -154,7 +154,7 @@ bool RTLTCPClient::connect() {
 
   if (m_socket < 0) {
     std::cerr << "Failed to connect to " << m_host << ":" << m_port
-              << std::endl;
+              << "\n";
     return false;
   }
 
@@ -164,7 +164,7 @@ bool RTLTCPClient::connect() {
   uint8_t header[12];
   if (!readResponse(header, sizeof(header))) {
     std::cerr << "Failed to read initial rtl_tcp header from " << m_host << ":"
-              << m_port << std::endl;
+              << m_port << "\n";
     closeSocket(m_socket);
     m_socket = -1;
     return false;
@@ -172,7 +172,7 @@ bool RTLTCPClient::connect() {
 
   if (!validateRtlTcpHeader(header)) {
     std::cerr << "Invalid rtl_tcp header from " << m_host << ":" << m_port
-              << std::endl;
+              << "\n";
     closeSocket(m_socket);
     m_socket = -1;
     return false;

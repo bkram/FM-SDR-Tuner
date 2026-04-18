@@ -27,10 +27,38 @@ Current architecture:
 
 - Direct USB RTL-SDR support (`--source rtl_sdr`) as default mode
 - `rtl_tcp` network source support (`--source rtl_tcp`)
-- FM stereo demod with runtime bandwidth/deemphasis control
-- RDS decode in dedicated worker thread
-- XDR protocol compatibility for FM-DX clients
-- Output to speaker (`-s`), WAV (`-w`), and/or IQ capture (`-i`)
+- FM stereo demod (polar discriminator + PLL-locked 19 kHz pilot) with runtime bandwidth/deemphasis control
+- Adaptive Hi-Blend stereo: L−R path runs through a blend-modulated low-pass so weak reception narrows the stereo image instead of hard-dropping to mono
+- Continuous-quality blend gate (no more mono pops on marginal signals)
+- Soft-knee audio limiter with metered clip ratio
+- RDS decode in dedicated worker thread (redsea-port: 171 kHz, 57 kHz PLL, RRC symbol sync, BPSK, block-sync state machine)
+- XDR protocol compatibility for FM-DX clients on port 7373
+- Audio output at 48 kHz (native Core Audio / ALSA / WinMM)
+- Output to speaker (`-s`), WAV (`-w`), MPX WAV (`--mpx-wav`), and/or raw IQ capture (`-i`)
+
+## Quick Start
+
+With an RTL-SDR connected, the binary works with no CLI flags and no config file — audio is on by default and the XDR server runs in implicit guest mode when no password is set:
+
+```bash
+./build/fm-sdr-tuner
+```
+
+This opens the XDR server on `127.0.0.1:7373` and waits for a client (xdr-gtk, FM-DX-Webserver, etc.) to send the start command. To skip the wait and hear audio immediately:
+
+```bash
+./build/fm-sdr-tuner --auto-start
+```
+
+Useful one-shot overrides (all still valid without a config file):
+
+```bash
+./build/fm-sdr-tuner -f 101100                # start at 101.1 MHz
+./build/fm-sdr-tuner -b soft                  # soft stereo blend profile
+./build/fm-sdr-tuner -P secret                # require XDR password 'secret'
+./build/fm-sdr-tuner -w capture.wav           # also record to WAV
+./build/fm-sdr-tuner -l                       # list audio output devices
+```
 
 ## Requirements
 
@@ -224,32 +252,32 @@ not for testing XDR client-controlled start/stop behavior.
 
 ## Runtime Behavior
 
-- At least one output must be enabled (`audio`, `wav`, or `iq`).
-- The tuner does not auto-start by default; an XDR client start command activates it.
+- Audio output is enabled by default. CLI flags can add WAV (`-w`), MPX WAV (`--mpx-wav`), and/or raw IQ (`-i`) outputs; use `-s` to re-enable audio when a config has explicitly disabled it.
 - Default source is direct RTL-SDR (`rtl_sdr`).
-- Audio output sample rate is fixed at `32000 Hz`.
+- Default startup frequency is `87500 kHz` (EU bottom of band — unlikely to hit a strong local on first run).
+- Audio output sample rate is fixed at `48000 Hz`.
 - Device/buffer latency is backend-specific (Core Audio / ALSA / WinMM).
+- XDR server listens on port `7373`. If `xdr.password` is empty and no `-P` is passed, the server automatically enters guest mode (no auth).
+- The tuner does not auto-start by default; an XDR client start command activates it. Use `--auto-start` to begin playback without a client.
+- De-emphasis default is 50 µs (EU/ITU). For US/Korea set `[tuner].deemphasis = 1` in the config (75 µs).
+- Default stereo blend profile is `aggressive` (fast mute on marginal pilot); select `normal` or `soft` via `-b` or the config.
 
-## Config-First Usage
+## Config-Driven Usage (optional)
 
-Primary workflow is config-driven:
+Once you know your site profile (gain, meter calibration, bandwidth), move the settings into a config file:
 
 ```bash
 ./build/fm-sdr-tuner -c fm-sdr-tuner.ini
 ```
 
-Recommended:
-- Put all normal runtime settings in `fm-sdr-tuner.ini`.
-- Use CLI only for temporary overrides during testing.
-
-Useful override examples:
+The bundled `fm-sdr-tuner.ini` is documented and safe to copy. CLI flags override anything the config sets, which is useful for A/B testing:
 
 ```bash
-# temporary frequency override
+# temporary frequency override on top of a baseline config
 ./build/fm-sdr-tuner -c fm-sdr-tuner.ini -f 101100
 
-# list audio devices once, then keep device in config
-./build/fm-sdr-tuner -l
+# try a different stereo blend profile without editing the INI
+./build/fm-sdr-tuner -c fm-sdr-tuner.ini -b soft
 ```
 
 ## Configuration (`fm-sdr-tuner.ini`)
@@ -290,7 +318,7 @@ clipping.
 
 ### 1. Start From A Known-Good Baseline
 
-Recommended baseline for most users:
+The binary already ships with sensible defaults (`gain_strategy = tef`, `agc_mode = 2`, `w0_bandwidth_hz = 194000`, `stereo_blend = aggressive`, `signal_floor_dbfs = -50`, `signal_ceil_dbfs = -18`, deemph 50 µs). For a dedicated site profile, put overrides in `fm-sdr-tuner.ini`:
 
 ```ini
 [sdr]
@@ -298,15 +326,15 @@ gain_strategy = tef
 rtl_gain_db = -1
 default_custom_gain_flags = 1
 freq_correction_ppm = 0
-signal_floor_dbfs = -55.0
-signal_ceil_dbfs = -12.0
-signal_bias_db = -6.0
+signal_floor_dbfs = -50.0
+signal_ceil_dbfs = -18.0
+signal_bias_db = -4.0
 
 [processing]
 agc_mode = 2
 w0_bandwidth_hz = 194000
 dsp_agc = off
-stereo_blend = normal
+stereo_blend = aggressive
 stereo = true
 client_gain_allowed = false
 ```
@@ -315,6 +343,7 @@ Why this baseline:
 - `tef` is the best default when local RF conditions are not yet known
 - `agc_mode = 2` is a stable middle ground
 - `w0_bandwidth_hz = 194000` is the correct starting point for normal WFM stereo
+- `stereo_blend = aggressive` pairs well with the adaptive Hi-Blend post-filter — the HF of stereo fades cleanly on marginal signals without audible pops
 - `client_gain_allowed = false` prevents XDR clients from changing gain while you tune the site profile
 
 ### 2. Validate Basic Hardware First

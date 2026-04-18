@@ -13,7 +13,7 @@ struct Config {
 
   struct AudioSection {
     std::string device;
-    bool enable_audio = false;
+    bool enable_audio = true;
     int startup_volume = 100;
   } audio;
 
@@ -24,8 +24,8 @@ struct Config {
     std::string gain_strategy = "tef"; // tef|sdrpp
     bool sdrpp_rtl_agc = false;
     int sdrpp_rtl_agc_gain_db = 18;
-    double signal_floor_dbfs = -55.0;
-    double signal_ceil_dbfs = -19.0;
+    double signal_floor_dbfs = -50.0;
+    double signal_ceil_dbfs = -18.0;
     double signal_bias_db = -4.0;
     bool low_latency_iq = false;
   } sdr;
@@ -33,7 +33,7 @@ struct Config {
   struct TunerSection {
     std::string source = "rtl_sdr"; // rtl_sdr|rtl_tcp
     uint32_t rtl_device = 0;
-    uint32_t default_freq = 88600;
+    uint32_t default_freq = 87500;
     int deemphasis = 0;
   } tuner;
 
@@ -49,7 +49,7 @@ struct Config {
     int dsp_block_samples = 8192;
     int w0_bandwidth_hz = 194000;
     std::string dsp_agc = "off"; // off|fast|slow
-    std::string stereo_blend = "normal";
+    std::string stereo_blend = "aggressive";
     bool stereo = true;
   } processing;
 

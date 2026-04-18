@@ -65,13 +65,14 @@ TEST_CASE("App options parser reads tcp host and port", "[app_options]") {
   REQUIRE(result.options.tcpPort == 4321);
 }
 
-TEST_CASE("App options parser rejects missing output selection",
+TEST_CASE("App options parser enables audio by default when no output given",
           "[app_options]") {
   std::vector<std::string> args = {"fm-sdr-tuner", "--source", "rtl_sdr"};
   std::vector<char *> argv = makeArgv(args);
   const AppParseResult result =
       parseAppOptions(static_cast<int>(argv.size()), argv.data(), 256000);
-  REQUIRE(result.outcome == AppParseOutcome::ExitFailure);
+  REQUIRE(result.outcome == AppParseOutcome::Run);
+  REQUIRE(result.options.enableSpeaker);
 }
 
 TEST_CASE("App options parser accepts IQ capture as output", "[app_options]") {

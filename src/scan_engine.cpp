@@ -78,8 +78,6 @@ bool ScanEngine::runIfActive(
   constexpr float kDcRejectHz = 2000.0f;
   constexpr double kWindowFloor = 1e-12;
   constexpr double kPowerFloor = 1e-20;
-  constexpr double kScanSnrGateDb = 4.0;
-  constexpr double kScanSnrCeilDb = 28.0;
 
   const int startKHz = std::clamp(std::min(m_config.startKHz, m_config.stopKHz),
                                   static_cast<int>(fm_tuner::kFmBroadcastMinFreqKHz),
@@ -105,17 +103,41 @@ bool ScanEngine::runIfActive(
   }
 
   const int64_t sampleRateHz = static_cast<int64_t>(iqSampleRate);
+  // Usable complex spectrum is Fs wide in total (±Fs/2). The half-span (from
+  // tuned center to the edge of the usable window) is therefore
+  // (Fs * kUsableSpectrumFraction) / 2 — but we also need to leave room for
+  // the per-channel integration window (±halfChannelBW) so it does not wrap
+  // across Nyquist and alias content from the opposite side of the band.
+  const int64_t maxHalfSpanByFraction =
+      static_cast<int64_t>((static_cast<double>(sampleRateHz) *
+                            kUsableSpectrumFraction) /
+                           2.0);
+  const int64_t halfChannelBandwidthHz =
+      static_cast<int64_t>(channelBandwidthHz) / 2;
+  const int64_t maxHalfSpanByNyquist =
+      std::max<int64_t>(1, (sampleRateHz / 2) - halfChannelBandwidthHz);
   const int64_t usableHalfSpanHz =
+      std::min(maxHalfSpanByFraction, maxHalfSpanByNyquist);
+  // Keep consecutive captures overlapping by at least ~25 %. This matters
+  // when a wide scan bandwidth forces usableHalfSpanHz small enough that the
+  // preferred Fs-fraction step would leave gaps between captures and push
+  // every in-gap channel into the per-channel fallback path.
+  const int64_t coverageCapHz =
+      std::max<int64_t>(1, (usableHalfSpanHz * 3) / 2);
+  const int64_t preferredStepHz =
       static_cast<int64_t>(static_cast<double>(sampleRateHz) *
-                           kUsableSpectrumFraction);
+                           kCenterStepFraction);
   const int64_t centerStepHz = std::max<int64_t>(
       static_cast<int64_t>(stepKHz) * 1000,
-      static_cast<int64_t>(static_cast<double>(sampleRateHz) *
-                           kCenterStepFraction));
-  int64_t centerHz = static_cast<int64_t>(startKHz) * 1000 +
-                     (usableHalfSpanHz / 2);
+      std::min(preferredStepHz, coverageCapHz));
+  // Place the first tune center one half-span above the requested start so
+  // the left edge of the first captured span lands at startKHz. Likewise the
+  // last allowed center sits one half-span above stopKHz, so a capture whose
+  // left edge reaches stopKHz is still considered in bounds.
+  int64_t centerHz =
+      static_cast<int64_t>(startKHz) * 1000 + usableHalfSpanHz;
   const int64_t endCenterHz =
-      static_cast<int64_t>(stopKHz) * 1000 + (usableHalfSpanHz / 2);
+      static_cast<int64_t>(stopKHz) * 1000 + usableHalfSpanHz;
   const size_t scanReadSamples =
       std::min(sdrBufSamples, std::max<size_t>(8192, kScanReadSamplesCap));
 
@@ -263,12 +285,11 @@ bool ScanEngine::runIfActive(
           ((clippedDbfs - sdrConfig.signal_floor_dbfs) /
            (safeCeilDbfs - sdrConfig.signal_floor_dbfs)) *
           120.0);
-      const float snrLevel120 = std::clamp(
-          static_cast<float>(((snrDb - kScanSnrGateDb) /
-                              (kScanSnrCeilDb - kScanSnrGateDb)) *
-                             120.0),
-          0.0f, 120.0f);
-      const float level120 = std::min(absLevel120, snrLevel120);
+      // Report raw per-channel level to match XDR-GTK / TEF668x convention
+      // (no FFT-SNR gate). Stations with low SNR due to adjacent-channel
+      // spillover are still real signals worth seeing on the spectrum plot.
+      (void)snrDb;
+      const float level120 = absLevel120;
       levelByChannel[static_cast<size_t>(ch)] =
           std::max(levelByChannel[static_cast<size_t>(ch)], level120);
     }

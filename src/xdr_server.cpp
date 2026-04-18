@@ -550,13 +550,14 @@ bool XDRServer::start() {
   }
 
   if (!ensureSocketSubsystem()) {
-    std::cerr << "[XDR] failed to initialize socket subsystem" << std::endl;
+    std::cerr << "[XDR] failed to initialize socket subsystem" << "\n";
     return false;
   }
 
   m_serverSocket = socket(AF_INET, SOCK_STREAM, 0);
   if (m_serverSocket < 0) {
-    std::cerr << "[XDR] failed to create server socket" << std::endl;
+    std::cerr << "[XDR] failed to create server socket (err=" << lastSocketError()
+              << ")" << "\n";
     return false;
   }
 
@@ -577,14 +578,16 @@ bool XDRServer::start() {
 
   if (bind(m_serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) <
       0) {
-    std::cerr << "[XDR] failed to bind to port " << m_port << std::endl;
+    std::cerr << "[XDR] failed to bind to port " << m_port
+              << " (err=" << lastSocketError() << ")" << "\n";
     closeSocket(m_serverSocket);
     m_serverSocket = -1;
     return false;
   }
 
   if (listen(m_serverSocket, 5) < 0) {
-    std::cerr << "[XDR] failed to listen on port " << m_port << std::endl;
+    std::cerr << "[XDR] failed to listen on port " << m_port
+              << " (err=" << lastSocketError() << ")" << "\n";
     closeSocket(m_serverSocket);
     m_serverSocket = -1;
     return false;
@@ -613,7 +616,7 @@ bool XDRServer::start() {
   });
 
   if (m_verboseLogging.load()) {
-    std::cout << "[XDR] listening on port " << m_port << std::endl;
+    std::cout << "[XDR] listening on port " << m_port << "\n";
   }
   return true;
 }
@@ -654,7 +657,7 @@ void XDRServer::handleClient(int clientSocket) {
   getpeername(clientSocket, (struct sockaddr *)&clientAddr, &clientLen);
   inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
 
-  std::cout << "[XDR] client connected from " << clientIP << std::endl;
+  std::cout << "[XDR] client connected from " << clientIP << "\n";
 
   setRecvTimeoutMs(clientSocket, 200);
   char firstByte = '\0';
@@ -668,24 +671,24 @@ void XDRServer::handleClient(int clientSocket) {
     std::string handshake;
     if (!recvLine(clientSocket, handshake, 16) || handshake != "x") {
       if (m_verboseLogging.load()) {
-        std::cout << "[XDR] invalid FM-DX handshake payload" << std::endl;
+        std::cout << "[XDR] invalid FM-DX handshake payload" << "\n";
       }
-      std::cout << "[XDR] client disconnected from " << clientIP << std::endl;
+      std::cout << "[XDR] client disconnected from " << clientIP << "\n";
       return;
     }
     if (m_verboseLogging.load()) {
-      std::cout << "[XDR] detected FM-DX protocol handshake" << std::endl;
+      std::cout << "[XDR] detected FM-DX protocol handshake" << "\n";
     }
     sendSocket(clientSocket, "1\n", 2);
     handleFmdxClient(clientSocket);
   } else {
     if (m_verboseLogging.load()) {
-      std::cout << "[XDR] detected XDR protocol handshake" << std::endl;
+      std::cout << "[XDR] detected XDR protocol handshake" << "\n";
     }
     handleXdrClient(clientSocket, clientIP);
   }
 
-  std::cout << "[XDR] client disconnected from " << clientIP << std::endl;
+  std::cout << "[XDR] client disconnected from " << clientIP << "\n";
 }
 
 void XDRServer::handleFmdxClient(int clientSocket) {
@@ -712,7 +715,7 @@ void XDRServer::handleFmdxClient(int clientSocket) {
     if (commandBufferOverflowed(command)) {
       if (m_verboseLogging.load()) {
         std::cout << "[XDR] closing FM-DX client due to oversized command line"
-                  << std::endl;
+                  << "\n";
       }
       break;
     }
@@ -722,7 +725,7 @@ void XDRServer::handleFmdxClient(int clientSocket) {
       if (pos > kMaxClientCommandLen) {
         if (m_verboseLogging.load()) {
           std::cout << "[XDR] closing FM-DX client due to oversized command line"
-                    << std::endl;
+                    << "\n";
         }
         setRecvTimeoutMs(clientSocket, 0);
         return;
@@ -770,7 +773,7 @@ void XDRServer::handleFmdxClient(int clientSocket) {
 
 void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
   if (m_verboseLogging.load()) {
-    std::cout << "[XDR] client authenticating from " << clientIP << std::endl;
+    std::cout << "[XDR] client authenticating from " << clientIP << "\n";
   }
   bool authenticated = false;
   bool guestSession = false;
@@ -778,7 +781,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
   std::string salt = generateSalt();
 
   if (m_verboseLogging.load()) {
-    std::cout << "[XDR] sending salt: '" << salt << "'" << std::endl;
+    std::cout << "[XDR] sending salt: '" << salt << "'" << "\n";
   }
 
   std::string msg = salt + "\n";
@@ -788,7 +791,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
   if (!recvLine(clientSocket, authMsg, HASH_LENGTH + 2)) {
     if (m_verboseLogging.load()) {
       std::cout << "[XDR] client disconnected before sending auth hash"
-                << std::endl;
+                << "\n";
     }
     return;
   }
@@ -802,13 +805,13 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
   if (m_verboseLogging.load()) {
     std::cout << "[XDR] received auth payload: '" << authMsg << "' -> hash '"
               << clientHash << "' (length: " << clientHash.length() << ")"
-              << std::endl;
+              << "\n";
   }
 
   bool authSuccess = authenticate(salt, clientHash);
   if (m_verboseLogging.load()) {
     std::cout << "[XDR] authentication " << (authSuccess ? "SUCCESS" : "FAILED")
-              << std::endl;
+              << "\n";
   }
 
   if (!authSuccess && !m_guestMode) {
@@ -861,10 +864,13 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
         std::vector<std::string> rdsLines;
         {
           std::lock_guard<std::mutex> lock(m_rdsMutex);
-          for (const auto &entry : m_rdsQueue) {
-            if (entry.first > lastRdsSeq) {
-              rdsLines.push_back(entry.second);
-              lastRdsSeq = entry.first;
+          if (!m_rdsQueue.empty() &&
+              m_rdsQueue.back().first > lastRdsSeq) {
+            for (const auto &entry : m_rdsQueue) {
+              if (entry.first > lastRdsSeq) {
+                rdsLines.push_back(entry.second);
+                lastRdsSeq = entry.first;
+              }
             }
           }
         }
@@ -882,10 +888,13 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
         std::vector<std::string> scanLines;
         {
           std::lock_guard<std::mutex> lock(m_scanMutex);
-          for (const auto &entry : m_scanQueue) {
-            if (entry.first > lastScanSeq) {
-              scanLines.push_back(entry.second);
-              lastScanSeq = entry.first;
+          if (!m_scanQueue.empty() &&
+              m_scanQueue.back().first > lastScanSeq) {
+            for (const auto &entry : m_scanQueue) {
+              if (entry.first > lastScanSeq) {
+                scanLines.push_back(entry.second);
+                lastScanSeq = entry.first;
+              }
             }
           }
         }
@@ -949,7 +958,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
     if (commandBufferOverflowed(command)) {
       if (m_verboseLogging.load()) {
         std::cout << "[XDR] closing XDR client due to oversized command line"
-                  << std::endl;
+                  << "\n";
       }
       break;
     }
@@ -959,7 +968,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
       if (pos > kMaxClientCommandLen) {
         if (m_verboseLogging.load()) {
           std::cout << "[XDR] closing XDR client due to oversized command line"
-                    << std::endl;
+                    << "\n";
         }
         setRecvTimeoutMs(clientSocket, 0);
         return;
@@ -1276,83 +1285,52 @@ std::string XDRServer::processCommand(const std::string &cmd,
 }
 
 void XDRServer::setFrequencyCallback(FrequencyCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_freqCallback = cb;
+  assignCallback(m_freqCallback, std::move(cb));
 }
-
 void XDRServer::setVolumeCallback(VolumeCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_volCallback = cb;
+  assignCallback(m_volCallback, std::move(cb));
 }
-
 void XDRServer::setGainCallback(GainCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_gainCallback = cb;
+  assignCallback(m_gainCallback, std::move(cb));
 }
-
 void XDRServer::setAGCCallback(AGCCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_agcCallback = cb;
+  assignCallback(m_agcCallback, std::move(cb));
 }
-
 void XDRServer::setModeCallback(IntCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_modeCallback = cb;
+  assignCallback(m_modeCallback, std::move(cb));
 }
-
 void XDRServer::setDeemphasisCallback(IntCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_deemphasisCallback = cb;
+  assignCallback(m_deemphasisCallback, std::move(cb));
 }
-
 void XDRServer::setFilterCallback(IntCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_filterCallback = cb;
+  assignCallback(m_filterCallback, std::move(cb));
 }
-
 void XDRServer::setBandwidthCallback(IntCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_bandwidthCallback = cb;
+  assignCallback(m_bandwidthCallback, std::move(cb));
 }
-
 void XDRServer::setAntennaCallback(IntCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_antennaCallback = cb;
+  assignCallback(m_antennaCallback, std::move(cb));
 }
-
 void XDRServer::setSquelchCallback(IntCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_squelchCallback = cb;
+  assignCallback(m_squelchCallback, std::move(cb));
 }
-
 void XDRServer::setRotatorCallback(IntCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_rotatorCallback = cb;
+  assignCallback(m_rotatorCallback, std::move(cb));
 }
-
 void XDRServer::setAlignmentCallback(IntCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_alignmentCallback = cb;
+  assignCallback(m_alignmentCallback, std::move(cb));
 }
-
 void XDRServer::setSamplingCallback(SamplingCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_samplingCallback = cb;
+  assignCallback(m_samplingCallback, std::move(cb));
 }
-
 void XDRServer::setForceMonoCallback(ForceMonoCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_forceMonoCallback = cb;
+  assignCallback(m_forceMonoCallback, std::move(cb));
 }
-
 void XDRServer::setStartCallback(StartCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_startCallback = cb;
+  assignCallback(m_startCallback, std::move(cb));
 }
-
 void XDRServer::setStopCallback(StopCallback cb) {
-  std::lock_guard<std::mutex> lock(m_callbackMutex);
-  m_stopCallback = cb;
+  assignCallback(m_stopCallback, std::move(cb));
 }
 
 std::string XDRServer::processFmdxCommand(const std::string &cmd) {

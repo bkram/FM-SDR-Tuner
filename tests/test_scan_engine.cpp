@@ -1,10 +1,11 @@
 #include "catch_compat.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstring>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <sstream>
 #include <string>
@@ -102,7 +103,9 @@ TEST_CASE("ScanEngine suppresses empty-channel FFT peaks with local floor gating
   xdr.m_scanStartKHz = 87500;
   xdr.m_scanStopKHz = 87700;
   xdr.m_scanStepKHz = 100;
-  xdr.m_scanBandwidthHz = 56000;
+  // 40 kHz channel BW leaves enough room that usableHalfSpanHz is not clipped
+  // by the Nyquist constraint, so first center = startKHz*1000 + 108800.
+  xdr.m_scanBandwidthHz = 40000;
   xdr.m_scanAntenna = 0;
   xdr.m_scanContinuous = false;
   xdr.m_scanStartPending = true;
@@ -115,7 +118,10 @@ TEST_CASE("ScanEngine suppresses empty-channel FFT peaks with local floor gating
 
   constexpr uint32_t kSampleRateHz = 256000;
   constexpr size_t kSamples = 16384;
-  constexpr int64_t kCenterHz = 87608800;
+  // First center = startKHz*1000 + min(Fs*0.85/2, Fs/2 - channelBW/2)
+  //              = 87500000 + min(108800, 128000-20000)
+  //              = 87500000 + 108000 = 87608000
+  constexpr int64_t kCenterHz = 87608000;
   constexpr float kToneHz = static_cast<float>(87600000 - kCenterHz);
   std::vector<uint8_t> iqBuffer = makeIqTone(kSamples, kSampleRateHz, kToneHz, 0.70f);
 
@@ -192,6 +198,9 @@ TEST_CASE("ScanEngine batches fallback retunes for contiguous uncovered channels
       [](uint32_t, int) {});
 
   REQUIRE(ran);
+  // 4 main-loop retunes + 1 fallback batch covering channels 87500-87700.
+  // Channel 87800 is picked up by the main loop because the coverage-capped
+  // centerStepHz keeps consecutive captures overlapping.
   REQUIRE(retuneCount == 5);
 
   std::lock_guard<std::mutex> lock(xdr.m_scanMutex);
