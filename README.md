@@ -812,8 +812,10 @@ Artifacts currently uploaded by CI:
   - `fm-sdr-tuner-linux-deb-ubuntu-24.04-arm64`
   - `fm-sdr-tuner-linux-deb-debian-trixie-x64`
   - `fm-sdr-tuner-linux-deb-debian-trixie-arm64`
-  - `fm-sdr-tuner-linux-rpm-fedora-40-x64`
-  - `fm-sdr-tuner-linux-rpm-fedora-40-arm64`
+  - `fm-sdr-tuner-linux-rpm-fedora-42-x64`
+  - `fm-sdr-tuner-linux-rpm-fedora-42-arm64`
+  - `fm-sdr-tuner-linux-rpm-fedora-43-x64`
+  - `fm-sdr-tuner-linux-rpm-fedora-43-arm64`
 - macOS build job:
   - `fm-sdr-tuner-macos` (binary + `README.md` + `fm-sdr-tuner.ini`)
 - Windows MinGW job:
@@ -833,8 +835,9 @@ Run local Linux package checks with Docker:
 ./scripts/test-linux-arm-builds.sh
 ```
 
-This script runs container builds for `ubuntu:24.04`, `debian:trixie`, and
-`fedora:40`, then performs package-install smoke tests in fresh containers.
+This script runs container builds for `ubuntu:24.04`, `debian:trixie`,
+`fedora:42`, and `fedora:43`, then performs package-install smoke tests in
+fresh containers.
 
 It validates:
 - `.deb` build + install smoke test on Ubuntu and Debian

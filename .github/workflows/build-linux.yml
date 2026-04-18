@@ -135,7 +135,7 @@ jobs:
         name: fm-sdr-tuner-linux-deb-debian-trixie-${{ matrix.arch }}
         path: dist/linux
 
-  build-fedora-40:
+  build-fedora-42:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -145,7 +145,7 @@ jobs:
             arch: x64
           - runner: ubuntu-24.04-arm
             arch: arm64
-    container: fedora:40
+    container: fedora:42
 
     steps:
     - uses: actions/checkout@v4
@@ -179,7 +179,54 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: fm-sdr-tuner-linux-rpm-fedora-40-${{ matrix.arch }}
+        name: fm-sdr-tuner-linux-rpm-fedora-42-${{ matrix.arch }}
+        path: dist/linux
+
+  build-fedora-43:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    container: fedora:43
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        dnf install -y cmake gcc-c++ make file pkgconfig
+        dnf install -y openssl-devel alsa-lib-devel
+        dnf install -y rtl-sdr-devel liquid-dsp-devel
+        dnf install -y catch2-devel
+        dnf install -y rpm-build || true
+
+    - name: Build
+      run: |
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF
+        cmake --build build -j$(nproc)
+
+    - name: Run tests
+      run: |
+        ctest --test-dir build --output-on-failure --no-tests=error
+
+    - name: Create RPM package
+      run: |
+        cd build
+        cpack -G RPM
+        mkdir -p ../dist/linux
+        cp ./*.rpm ../dist/linux/
+        cp ../README.md ../dist/linux/
+        cp ../fm-sdr-tuner.ini ../dist/linux/
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fm-sdr-tuner-linux-rpm-fedora-43-${{ matrix.arch }}
         path: dist/linux
 
   smoke-test-deb-install:
@@ -236,7 +283,8 @@ jobs:
 
   smoke-test-rpm-install:
     needs:
-      - build-fedora-40
+      - build-fedora-42
+      - build-fedora-43
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -248,23 +296,36 @@ jobs:
             arch: arm64
 
     steps:
-    - name: Download Fedora package artifact
+    - name: Download Fedora 42 package artifact
       uses: actions/download-artifact@v4
       with:
-        name: fm-sdr-tuner-linux-rpm-fedora-40-${{ matrix.arch }}
-        path: /tmp/artifacts/fedora
+        name: fm-sdr-tuner-linux-rpm-fedora-42-${{ matrix.arch }}
+        path: /tmp/artifacts/fedora-42
 
-    - name: Smoke test RPM install in fresh container
+    - name: Download Fedora 43 package artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: fm-sdr-tuner-linux-rpm-fedora-43-${{ matrix.arch }}
+        path: /tmp/artifacts/fedora-43
+
+    - name: Smoke test RPM install in fresh containers
       run: |
         set -euxo pipefail
-        docker pull fedora:40
-        docker run --rm -v "/tmp/artifacts/fedora:/pkg:ro" fedora:40 sh -euxc '
-          dnf install -y /pkg/*.rpm
-          ldd /usr/bin/fm-sdr-tuner | tee /tmp/ldd.txt
-          if grep -q "not found" /tmp/ldd.txt; then
-            echo "Missing shared libraries detected"
-            exit 1
-          fi
-          /usr/bin/fm-sdr-tuner --help >/tmp/help.txt 2>&1 || true
-          grep -q "Usage:" /tmp/help.txt
-        '
+        test_rpm_in_container() {
+          image="$1"
+          pkg_dir="$2"
+          docker pull "$image"
+          docker run --rm -v "$pkg_dir:/pkg:ro" "$image" sh -euxc '
+            dnf install -y /pkg/*.rpm
+            ldd /usr/bin/fm-sdr-tuner | tee /tmp/ldd.txt
+            if grep -q "not found" /tmp/ldd.txt; then
+              echo "Missing shared libraries detected"
+              exit 1
+            fi
+            /usr/bin/fm-sdr-tuner --help >/tmp/help.txt 2>&1 || true
+            grep -q "Usage:" /tmp/help.txt
+          '
+        }
+
+        test_rpm_in_container fedora:42 /tmp/artifacts/fedora-42
+        test_rpm_in_container fedora:43 /tmp/artifacts/fedora-43
