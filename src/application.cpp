@@ -255,22 +255,33 @@ int Application::run() {
   };
 
   auto calculateAppliedGainDb = [&]() -> int {
-    static constexpr int kAgcToGainDb[4] = {44, 36, 30, 24};
     const int agcMode = std::clamp(requestedAGCMode.load(), 0, 3);
-
+    auto agcModeToGainDb = [&](int mode) -> int {
+      const int clippedMode = std::clamp(mode, 0, 3);
+      if (useDirectRtlSdr && !useSdrppGainStrategy) {
+        static constexpr int kDirectRtlAutoGainDb[4] = {18, 12, 7, 0};
+        return kDirectRtlAutoGainDb[clippedMode];
+      }
+      static constexpr int kTefGainDb[4] = {44, 36, 30, 24};
+      return kTefGainDb[clippedMode];
+    };
     int custom = requestedCustomGain.load();
     const bool ceq = ((custom / 10) % 10) != 0;
-    int gainDb = kAgcToGainDb[agcMode] + (ceq ? 4 : 0);
+    int gainDb = agcModeToGainDb(agcMode) + (ceq ? 4 : 0);
     if (gain >= 0) {
       gainDb = gain;
     }
     return std::clamp(gainDb, 0, 49);
   };
 
-  auto tefAgcGainDb = [&](int agcMode) -> int {
-    static constexpr int kAgcToGainDb[4] = {44, 36, 30, 24};
+  auto agcModeToGainDb = [&](int agcMode) -> int {
     const int clippedMode = std::clamp(agcMode, 0, 3);
-    return kAgcToGainDb[clippedMode];
+    if (useDirectRtlSdr && !useSdrppGainStrategy) {
+      static constexpr int kDirectRtlAutoGainDb[4] = {18, 12, 7, 0};
+      return kDirectRtlAutoGainDb[clippedMode];
+    }
+    static constexpr int kTefGainDb[4] = {44, 36, 30, 24};
+    return kTefGainDb[clippedMode];
   };
 
   auto effectiveAppliedGainDb = [&]() -> int {
@@ -341,7 +352,7 @@ int Application::run() {
       if (gain >= 0) {
         std::cout << " fixed_gain=" << gain << " dB";
       } else {
-        std::cout << " A" << agcMode << "(table=" << tefAgcGainDb(agcMode)
+        std::cout << " A" << agcMode << "(table=" << agcModeToGainDb(agcMode)
                   << " dB) G" << formatCustomGain(custom)
                   << "(flags rf=" << rf << ",if=" << ifv << ")";
       }
@@ -560,7 +571,7 @@ int Application::run() {
           runtime_loop::maybeAdjustAutoGain(
               useSdrppGainStrategy, gain, isImsAgcEnabled(), requestedAGCMode,
               pendingAGC, lastGainDown, lastGainUp, signal, clipRatio,
-              rfLevelFiltered, verboseLogging);
+              rfLevelFiltered, verboseLogging, agcModeToGainDb);
         },
         targetForceMono, appliedEffectiveForceMono, dspPipeline, rdsWorker,
         xdrServer, retuneMuteSamplesRemaining, retuneMuteTotalSamples, audioOut,

@@ -44,7 +44,8 @@ void maybeAdjustAutoGain(
     std::chrono::steady_clock::time_point &lastGainDown,
     std::chrono::steady_clock::time_point &lastGainUp,
     const SignalLevelResult &signal, double clipRatio, float rfLevelFiltered,
-    bool verboseLogging);
+    bool verboseLogging,
+    const std::function<int(int)> &agcModeToGainDb);
 
 } // namespace runtime_loop
 

@@ -9,11 +9,6 @@ namespace runtime_loop {
 
 namespace {
 
-int tefAgcGainDb(int agcMode) {
-  static constexpr int kAgcToGainDb[4] = {44, 36, 30, 24};
-  return kAgcToGainDb[std::clamp(agcMode, 0, 3)];
-}
-
 } // namespace
 
 bool handleControlAndScan(
@@ -88,7 +83,7 @@ void maybeAdjustAutoGain(
     std::chrono::steady_clock::time_point &lastGainDown,
     std::chrono::steady_clock::time_point &lastGainUp,
     const SignalLevelResult &signal, double clipRatio, float rfLevelFiltered,
-    bool verboseLogging) {
+    bool verboseLogging, const std::function<int(int)> &agcModeToGainDb) {
   if (useSdrppGainStrategy || cliGain >= 0 || imsAgcEnabled) {
     return;
   }
@@ -106,8 +101,9 @@ void maybeAdjustAutoGain(
       lastGainDown = now;
       if (verboseLogging) {
         std::cout << "[GAIN] clip-protect: A" << current << " -> A"
-                  << (current + 1) << " (" << tefAgcGainDb(current) << " dB -> "
-                  << tefAgcGainDb(current + 1) << " dB, dbfs=" << std::fixed
+                  << (current + 1) << " (" << agcModeToGainDb(current)
+                  << " dB -> " << agcModeToGainDb(current + 1)
+                  << " dB, dbfs=" << std::fixed
                   << std::setprecision(2) << signal.dbfs
                   << ", clip=" << std::setprecision(4) << clipRatio << ")\n";
       }
@@ -120,8 +116,9 @@ void maybeAdjustAutoGain(
       lastGainUp = now;
       if (verboseLogging) {
         std::cout << "[GAIN] sensitivity-up: A" << current << " -> A"
-                  << (current - 1) << " (" << tefAgcGainDb(current) << " dB -> "
-                  << tefAgcGainDb(current - 1) << " dB, comp=" << std::fixed
+                  << (current - 1) << " (" << agcModeToGainDb(current)
+                  << " dB -> " << agcModeToGainDb(current - 1)
+                  << " dB, comp=" << std::fixed
                   << std::setprecision(2) << signal.compensatedDbfs
                   << ", clip=" << std::setprecision(4) << clipRatio << ")\n";
       }
