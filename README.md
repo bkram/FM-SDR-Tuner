@@ -91,6 +91,36 @@ sudo dnf install -y cmake alsa-lib-devel pkgconf-pkg-config openssl-devel rtl-sd
 
 Use vcpkg and install at least OpenSSL plus `librtlsdr` and `liquid-dsp` for your triplet.
 
+## Audio Loopback (optional)
+
+The tuner writes PCM to a single OS audio output device (Core Audio / ALSA / WinMM). It does not stream audio over the XDR control connection. If you want another application — FM-DX-Webserver, a streaming encoder, a recorder — to consume the tuner's audio, you need a virtual loopback that exposes the tuner's output as a recordable input on the host. Without a loopback the tuner can only play to a local speaker.
+
+List the devices the tuner can see with `./build/fm-sdr-tuner -l`, then point it at the loopback either per-run with `-d "<name>"` or persistently via `[audio] device = ...` in the INI. The bundled `fm-sdr-tuner.ini` already defaults to `BlackHole 2ch`.
+
+### macOS — BlackHole
+
+BlackHole is distributed as a Homebrew Cask (it installs a system audio driver), so the install flag is `--cask`. A reboot is required to complete the install:
+
+```bash
+brew install --cask blackhole-2ch
+```
+
+Set the tuner's output to `BlackHole 2ch`, and configure the consumer (FM-DX-Webserver, etc.) to record from `BlackHole 2ch`. To also monitor on real speakers, build a Multi-Output Device in Audio MIDI Setup that contains both BlackHole and the speaker, and select that aggregate as the tuner output.
+
+### Linux — ALSA `snd-aloop`
+
+Load the loopback kernel module (persist with a `/etc/modules-load.d/` entry if you want it across reboots):
+
+```bash
+sudo modprobe snd-aloop
+```
+
+`snd-aloop` exposes paired PCMs: writes to `hw:Loopback,0,<n>` appear as a capture on `hw:Loopback,1,<n>`. Point the tuner at the playback side via `[audio] device = hw:Loopback,0,0` (or pass `-d hw:Loopback,0,0`) and have the consumer capture from `hw:Loopback,1,0`. Use `aplay -L` / `arecord -L` to confirm the names on your system.
+
+### Windows — VB-CABLE
+
+Install [VB-Audio VB-CABLE](https://vb-audio.com/Cable/). Select `CABLE Input (VB-Audio Virtual Cable)` as the tuner's output device and have the consumer record from `CABLE Output`. VB-CABLE is one-way; for monitoring, use VB-Audio's "VoiceMeeter" or pair VB-CABLE with the Windows "Listen to this device" option on the cable's recording endpoint.
+
 ## Build
 
 Use the normal `build/` directory.
