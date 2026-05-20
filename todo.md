@@ -15,6 +15,15 @@ not retained; consult `git log` and merged PR descriptions for history.
   interface that owns connect/tune/gain/capabilities — see `src/tuner_session.cpp`
   and `src/tuner_controller.cpp`. Blocks any future Soapy / HackRF / Airspy
   work.
+- **Drop the pilot bandpass FIR (P18)**: today `StereoDecoder` runs a 243-tap
+  complex bandpass on every IQ sample at 256 kHz — the biggest remaining
+  hotspot in the post-v1.6.0 profile (`dotprod_crcf_execute_neon4`). Reference
+  implementation in `research/sdr-j-fm/src/fm/pilot-recover.cpp` uses a bare
+  product-detector PLL on the raw MPX float and relies on the loop bandwidth
+  itself to provide the bandpass behavior. Estimated **5-10 pp of one core
+  saved** plus a simpler architecture (no FIR group delay to compensate in
+  the L-R recovery delay line). Trade-off: less out-of-band rejection on the
+  PLL input, must validate on stations with strong adjacent splatter.
 - **IQ FIR L1 normalization + ADC-rail-aware gain policy (P17)**: under
   saturation the channel Kaiser FIR can ring past unit envelope (L1 > 1). A
   `dBFS ≤ 0` clamp was added as a meter-side band-aid; the underlying FIR
@@ -29,6 +38,15 @@ not retained; consult `git log` and merged PR descriptions for history.
 
 ### Medium
 
+- **Adaptive L-R phase alignment (P19)**: replace the current
+  `2·Re(MPX·conj(PLL)²)` L-R recovery (sensitive to pilot phase error) with
+  a Costas-style adaptive separator that drives the cos/sin cross-coupling
+  to zero. Reference: `PerfectStereoSeparation` in
+  `research/sdr-j-fm/src/fm/stereo-separation.cpp` by Thomas Neder. Improves
+  measured stereo separation on stations with marginal pilot quality
+  (where our current chain has 5-10° pilot phase error → ~3% crosstalk).
+  Self-contained ~150 lines; uses the existing pilot PLL as the phase
+  reference and adds a small integrator + LPF + error-witness path.
 - **Runtime `stereo_blend` control via XDR (P15b)**: `-b soft|normal|aggressive`
   covers startup-time selection but no XDR command toggles it at runtime.
   Candidate prefix `Fb`. Wire via `XDRServer::assignCallback` template.
@@ -41,6 +59,17 @@ not retained; consult `git log` and merged PR descriptions for history.
 
 ### Low / cross-cutting
 
+- **Squelch class (P20)**: mute audio + suppress meter when channel power
+  falls below a user-configurable threshold. Reference:
+  `research/sdr-j-fm/includes/various/squelchClass.h`. Useful for scan
+  / unattended / DX workflows where silence on empty channels is
+  preferable to hiss. ~50 lines plus a `[processing] squelch_dbfs =`
+  config knob.
+- **Subsystem-grouped include layout**: `research/sdr-j-fm` organizes
+  `includes/fm/`, `includes/rds/`, `includes/various/` by subsystem. We
+  do this partially in `include/dsp/` but most headers are flat. As the
+  codebase grows this matters; defer until P5 refactor naturally surfaces
+  the grouping.
 - **WinMM socket-handle truncation**: `int m_socket` / `int m_serverSocket`
   in `rtl_tcp_client.cpp` and `xdr_server.cpp` hold `SOCKET` (UINT_PTR) on
   Win64. In practice fits in 32 bits and `< 0` check works, but it's a
@@ -87,10 +116,14 @@ These would catch regressions that current CI can't:
 ## Future Milestones
 
 - **1.6.x** patch releases for the small remaining `stereo_blend` /
-  IQ-L1 fixes if they come up before the SoapySDR work.
+  IQ-L1 fixes (P15b, P17) if they come up before the SoapySDR work.
 - **1.7** — Broad SDR backend support. Backend capability interface (P6)
   → `SoapySDR` implementation → contract tests → CLI/config/XDR
-  integration cleanup. This is the headline of 1.7.
+  integration cleanup. Stretch goals if time allows: the pilot-FIR
+  removal (P18) and adaptive L-R alignment (P19), since both are
+  architectural-shape changes that pair naturally with the backend
+  refactor.
 - **1.8** — Runtime structural cleanup. Decompose `Application::run`
   (P5) into smaller responsibilities now that the backend layer is
-  abstracted.
+  abstracted. Pick up the smaller items (P20 squelch, mixed newline /
+  preprocessor style sweep) alongside the affected subsystems.

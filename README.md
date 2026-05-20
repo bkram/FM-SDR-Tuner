@@ -1068,6 +1068,7 @@ This software is based on or integrates ideas/components from:
 - redsea (RDS decoding pipeline; this project now uses redsea-derived components)
 - XDR-GTK and librdsparser (XDR ecosystem compatibility/parsing behavior)
 - FM-DX-Tuner and xdrd (protocol and tuner-control ecosystem references)
+- sdr-j-fm (algorithmic references for pilot recovery without bandpass FIR, adaptive Costas-style stereo separator, and squelch — see roadmap items P18-P20 in `plan.md`)
 
 Core third-party runtime/build dependencies used by this project include:
 
@@ -1086,6 +1087,7 @@ Core third-party runtime/build dependencies used by this project include:
 | librdsparser | https://github.com/kkonradpl/librdsparser | GPL-3.0 | RDS/XDR parsing reference in ecosystem |
 | FM-DX-Tuner | https://github.com/kkonradpl/FM-DX-Tuner | GPL-3.0 | Protocol/tuner-control ecosystem reference |
 | xdrd | https://github.com/kkonradpl/xdrd | GPL-2.0 | Original XDR daemon/protocol reference |
+| sdr-j-fm | https://github.com/JvanKatwijk/sdr-j-fm | GPL-3.0 | Algorithmic references for pilot recovery without bandpass FIR, adaptive Costas-style stereo separator (PerfectStereoSeparation by Thomas Neder, 2023), and squelch behaviour. Roadmap items P18, P19, P20. |
 | OpenSSL | https://www.openssl.org/ | Apache-2.0 (plus OpenSSL terms) | Auth/security-related crypto/hash usage |
 | librtlsdr | https://github.com/osmocom/rtl-sdr | GPL-2.0 | RTL-SDR hardware I/O and rtl_tcp ecosystem support |
 
