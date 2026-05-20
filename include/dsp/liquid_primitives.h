@@ -46,8 +46,17 @@ public:
   FIRFilter(FIRFilter &&) = delete;
   FIRFilter &operator=(FIRFilter &&) = delete;
 
+  // l1Normalize: when true and the filter is lowpass (center == 0), the
+  // designed taps are explicitly L1-normalized — i.e., sum(|tap|) ≤ 1.
+  // This guarantees that |y[n]| ≤ max|x[n]| at every output sample (the
+  // classic mathematical bound: |y| = |Σ h·x| ≤ Σ|h|·max|x| ≤ max|x|).
+  // Without this, a non-monotonic Kaiser FIR can ring past unit envelope
+  // under ADC-rail saturation, producing post-filter samples whose power
+  // exceeds the input dBFS — confusing the meter and gain policy. The
+  // bandpass-centered path is always L1-normalized as a side-effect of
+  // the centering step and ignores this flag.
   void init(std::uint32_t length, float cutoff, float stopBandAtten = 60.0f,
-            float center = 0.0f);
+            float center = 0.0f, bool l1Normalize = false);
   void initWithTaps(const std::vector<float> &taps, float scale = 1.0f);
   void reset();
   void push(std::complex<float> sample) const;
@@ -61,6 +70,7 @@ private:
   float m_cutoff = 0.0f;
   float m_stopBandAtten = 60.0f;
   float m_center = 0.0f;
+  bool m_l1Normalize = false;
   std::vector<float> m_taps{};
   bool m_useDirectTaps = false;
   float m_scale = 1.0f;

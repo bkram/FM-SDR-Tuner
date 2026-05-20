@@ -13,6 +13,7 @@
 
 #include "af_post_processor.h"
 #include "config.h"
+#include "dsp/liquid_primitives.h"
 #include "dsp/multipath_eq.h"
 #include "dsp/squelch.h"
 #include "dsp_pipeline.h"
@@ -1434,4 +1435,67 @@ TEST_CASE("Squelch ignores non-finite channel power", "[dsp][squelch]") {
   // NaN: don't change state.
   sq.updateGate(std::nan(""));
   REQUIRE(sq.isOpen());
+}
+
+namespace {
+
+// Drive a complex impulse through a lowpass FIR and return max |y[n]|.
+// The L1 bound says |y| ≤ Σ|tap| · max|x|; for an impulse of magnitude 1,
+// max|y| = Σ|tap_scaled|, which equals the FIR's L1 norm (scale included).
+float maxAbsImpulseResponse(fm_tuner::dsp::liquid::FIRFilter &fir,
+                            std::size_t probeLen) {
+  std::complex<float> impulse(1.0f, 0.0f);
+  float peak = 0.0f;
+  for (std::size_t n = 0; n < probeLen; ++n) {
+    fir.push(n == 0 ? impulse : std::complex<float>(0.0f, 0.0f));
+    const std::complex<float> y = fir.execute();
+    peak = std::max(peak, std::abs(y));
+  }
+  return peak;
+}
+
+} // namespace
+
+TEST_CASE("FIRFilter lowpass L1 normalization bounds the impulse response",
+          "[dsp][firfilter]") {
+  // Same parameters FMDemod uses for its IQ channel FIR with no narrowing.
+  // length=81, cutoff=0.45 (relative to sample rate), 60 dB stop, lowpass.
+  const std::uint32_t length = 81;
+  const float cutoff = 0.45f;
+
+  fm_tuner::dsp::liquid::FIRFilter firDefault;
+  firDefault.init(length, cutoff, 60.0f, 0.0f, /*l1Normalize=*/false);
+  const float peakDefault = maxAbsImpulseResponse(firDefault, length + 32);
+
+  fm_tuner::dsp::liquid::FIRFilter firNormalized;
+  firNormalized.init(length, cutoff, 60.0f, 0.0f, /*l1Normalize=*/true);
+  const float peakNormalized = maxAbsImpulseResponse(firNormalized, length + 32);
+
+  // Normalized peak ≤ 1 by construction. We allow a tiny epsilon for
+  // single-precision summation noise inside liquid's NEON kernels.
+  REQUIRE(peakNormalized <= 1.0f + 1e-4f);
+  // Both filters share the same group delay; the normalized response is
+  // strictly smaller or equal to the un-normalized one at every cutoff where
+  // L1 exceeds 1/(2·cutoff). For 0.45 this comfortably holds.
+  REQUIRE(peakNormalized <= peakDefault + 1e-4f);
+}
+
+TEST_CASE("FIRFilter L1 normalized lowpass keeps a unit-magnitude carrier "
+          "bounded",
+          "[dsp][firfilter]") {
+  // Drive a constant unit-magnitude carrier through the FIR and verify that
+  // the output never exceeds the input envelope. This is the property that
+  // protects downstream consumers from rail overflow after the IQ FIR.
+  fm_tuner::dsp::liquid::FIRFilter fir;
+  fir.init(81, 0.45f, 60.0f, 0.0f, /*l1Normalize=*/true);
+  constexpr float kTwoPi = 6.28318530717958647692f;
+  const float fNorm = 0.05f;
+  float peak = 0.0f;
+  for (int n = 0; n < 2048; ++n) {
+    const float phase = kTwoPi * fNorm * static_cast<float>(n);
+    std::complex<float> x(std::cos(phase), std::sin(phase));
+    fir.push(x);
+    peak = std::max(peak, std::abs(fir.execute()));
+  }
+  REQUIRE(peak <= 1.0f + 1e-4f);
 }

@@ -38,6 +38,7 @@ public:
   void setMultipathAdaptEnabled(bool enabled) {
     m_liquidMultipathEq.setAdaptEnabled(enabled);
   }
+  void setIqFirL1Normalize(bool enabled);
   float getMultipathEnvelopeError() const {
     return m_liquidMultipathEq.envelopeError();
   }
@@ -59,6 +60,7 @@ private:
   int m_bandwidthMode;
   int m_w0BandwidthHz;
   DspAgcMode m_dspAgcMode;
+  bool m_iqFirL1Normalize = false;
 
   std::vector<float> m_demodScratch;
 

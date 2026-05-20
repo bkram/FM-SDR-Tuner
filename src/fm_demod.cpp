@@ -36,7 +36,7 @@ FMDemod::FMDemod(int inputRate, int outputRate)
       m_filteredChannelPowerDbfs(-120.0) {
   const float iqCutoffNorm =
       std::clamp(110000.0f / static_cast<float>(m_inputRate), 0.01f, 0.45f);
-  m_liquidIqFilter.init(81, iqCutoffNorm);
+  m_liquidIqFilter.init(81, iqCutoffNorm, 60.0f, 0.0f, m_iqFirL1Normalize);
   m_liquidIqDcBlockI.initDCBlocker(0.0005f);
   m_liquidIqDcBlockQ.initDCBlocker(0.0005f);
   const float ratio =
@@ -139,8 +139,25 @@ void FMDemod::setBandwidthHz(int bwHz) {
       (selectedBwHz > 0 && selectedBwHz <= 73000) ? 121U : 81U;
   const float stopBandAtten =
       (selectedBwHz > 0 && selectedBwHz <= 42000) ? 70.0f : 60.0f;
-  m_liquidIqFilter.init(filterLen, cutoffNorm, stopBandAtten);
+  m_liquidIqFilter.init(filterLen, cutoffNorm, stopBandAtten, 0.0f,
+                        m_iqFirL1Normalize);
   reset();
+}
+
+void FMDemod::setIqFirL1Normalize(bool enabled) {
+  if (enabled == m_iqFirL1Normalize) {
+    return;
+  }
+  m_iqFirL1Normalize = enabled;
+  // Re-design the IQ FIR with the current bandwidth + new normalization flag.
+  // Forcing a re-init by bumping the mode through a sentinel keeps the
+  // setBandwidthHz path canonical (it owns the cutoff/taps math).
+  const int currentBw = (m_bandwidthMode >= 0 &&
+                         m_bandwidthMode < static_cast<int>(kXdrFmBwHz.size()))
+                            ? kXdrFmBwHz[static_cast<size_t>(m_bandwidthMode)]
+                            : 0;
+  m_bandwidthMode = -1;
+  setBandwidthHz(currentBw > 0 ? currentBw : m_w0BandwidthHz);
 }
 
 void FMDemod::setW0BandwidthHz(int bwHz) {

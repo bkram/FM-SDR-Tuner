@@ -96,6 +96,7 @@ DspPipeline::DspPipeline(int inputRate, int outputRate,
   }
   m_demod.setMultipathEqMode(
       multipathMode, static_cast<std::uint32_t>(processing.multipath_eq_taps));
+  m_demod.setIqFirL1Normalize(processing.iq_fir_l1_normalize);
 
   // Squelch — operates on the 48 kHz audio output, gated by the per-block
   // channelPowerDbfs estimate from FMDemod. Default config.squelch_dbfs

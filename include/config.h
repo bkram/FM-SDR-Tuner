@@ -62,6 +62,11 @@ struct Config {
     std::string adaptive_bandwidth = "off"; // off|conservative|aggressive
     std::string multipath_eq = "off"; // off|light|aggressive
     int multipath_eq_taps = 17;
+    // When true, the IQ channel FIR is L1-normalized at design time so that
+    // |y[n]| ≤ max|x[n]| for every output sample. Defaults to false to
+    // preserve existing meter calibration; enable when ADC-rail clipping is
+    // observed and downstream consumers rely on |IQ| ≤ 1.
+    bool iq_fir_l1_normalize = false;
     // Squelch threshold on the post-DSP channel power (compensated dBFS).
     // -120 = disabled (default). Useful for scan / unattended workflows
     // where silence on empty channels is preferable to hiss. Hysteresis is
