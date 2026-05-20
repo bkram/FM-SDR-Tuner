@@ -44,6 +44,41 @@ constexpr float kPilotIqInject = 1.0f - kPilotIqSmooth;
 // loop-bandwidth units.
 constexpr float kPilotPllBwAcquire = 0.01f;
 constexpr float kPilotPllBwHold = 0.003f;
+
+// Hi-Blend biquad coefficient refresh rate. The cutoff scales with
+// m_stereoBlend², which evolves on a tens-of-ms time scale; recomputing the
+// biquad coefficients (and therefore calling tan() to pre-warp omega) at
+// the full 256 kHz sample rate was wasted CPU. Refreshing every 64 samples
+// = ~4 kHz design rate keeps the cutoff lag well below audibility while
+// removing 63/64 of the per-sample tan() calls. The first sample of every
+// processAudio() call always re-designs so blend changes since the previous
+// call show up immediately.
+constexpr uint32_t kHiBlendCoeffRefreshMask = 63;
+
+constexpr float kHalfPi = 1.5707963267948966f;
+
+// Polynomial approximation of atan2 — max error ~0.0015 rad (~0.09°), more
+// than tight enough for the pilot-PLL phase detector at 19 kHz. Replaces
+// libm's atan2f in the inner loop where the profile showed ~150 samples /
+// ~1.25% of one core spent in atan2f. Branch-light to keep the hot path
+// predictable.
+inline float fast_atan2f(float y, float x) {
+  if (x == 0.0f) {
+    return (y > 0.0f) ? kHalfPi : (y < 0.0f) ? -kHalfPi : 0.0f;
+  }
+  constexpr float kPiOver4 = 0.7853981633974483f;
+  const float ax = std::fabs(x);
+  const float ay = std::fabs(y);
+  const bool xDom = (ax >= ay);
+  const float a = xDom ? (ay / ax) : (ax / ay);
+  // Rajan / Volder polynomial: angle ≈ a·(π/4 - (a-1)(0.2447 + 0.0663·a))
+  const float base = a * (kPiOver4 - (a - 1.0f) * (0.2447f + 0.0663f * a));
+  float result = xDom ? base : (kHalfPi - base);
+  if (x < 0.0f) {
+    result = kPi - result;
+  }
+  return (y < 0.0f) ? -result : result;
+}
 } // namespace
 
 StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
@@ -249,7 +284,7 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     const float phaseNow = m_liquidPilotPll.phase();
     const std::complex<float> vco(std::cos(phaseNow), std::sin(phaseNow));
     const std::complex<float> mixedPilot = pilot * std::conj(vco);
-    const float error = std::atan2(mixedPilot.imag(), mixedPilot.real());
+    const float error = fast_atan2f(mixedPilot.imag(), mixedPilot.real());
     m_liquidPilotPll.stepPLL(error);
     m_liquidPilotPll.step();
     const float phaseNext = m_liquidPilotPll.phase();
@@ -335,20 +370,24 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
 
     // Hi-Blend: scale L-R by blend (so blend=0 mutes stereo exactly) and
     // pass through a 2nd-order Butterworth LPF whose cutoff scales with
-    // blend². Coefficients are redesigned per sample because m_stereoBlend
-    // ramps across the block; the cost (~1 tan + a few muls) is dwarfed by
-    // upstream filter cost. 12 dB/oct above cutoff cleanly rejects stereo
-    // noise during weak reception.
+    // blend². The blend scaling stays per-sample so blend=0 mutes stereo
+    // exactly; the coefficient design itself only refreshes every
+    // (kHiBlendCoeffRefreshMask + 1) samples — blend evolves on a ms time
+    // scale, so a 4 kHz design rate is wholly adequate and saves the
+    // libm tan() call at 256 kHz. 12 dB/oct above cutoff rejects stereo
+    // noise cleanly during weak reception.
     const float blendClamped = std::clamp(m_stereoBlend, 0.0f, 1.0f);
-    const float cutoffHz = 200.0f + 14800.0f * blendClamped * blendClamped;
-    const float omega = std::tan(kPiOverFs * cutoffHz);
-    const float omega2 = omega * omega;
-    const float invNorm = 1.0f / (1.0f + omega / kButterQ + omega2);
-    m_hiBlendB0 = omega2 * invNorm;
-    m_hiBlendB1 = 2.0f * m_hiBlendB0;
-    m_hiBlendB2 = m_hiBlendB0;
-    m_hiBlendA1 = 2.0f * (omega2 - 1.0f) * invNorm;
-    m_hiBlendA2 = (1.0f - omega / kButterQ + omega2) * invNorm;
+    if ((static_cast<uint32_t>(i) & kHiBlendCoeffRefreshMask) == 0U) {
+      const float cutoffHz = 200.0f + 14800.0f * blendClamped * blendClamped;
+      const float omega = std::tan(kPiOverFs * cutoffHz);
+      const float omega2 = omega * omega;
+      const float invNorm = 1.0f / (1.0f + omega / kButterQ + omega2);
+      m_hiBlendB0 = omega2 * invNorm;
+      m_hiBlendB1 = 2.0f * m_hiBlendB0;
+      m_hiBlendB2 = m_hiBlendB0;
+      m_hiBlendA1 = 2.0f * (omega2 - 1.0f) * invNorm;
+      m_hiBlendA2 = (1.0f - omega / kButterQ + omega2) * invNorm;
+    }
 
     const float lrScaled = lrRaw * blendClamped;
     const float biquadOut = m_hiBlendB0 * lrScaled + m_hiBlendZ1;
