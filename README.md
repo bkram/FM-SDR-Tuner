@@ -945,6 +945,63 @@ Behavior changes when reconnecting XDR client:
 - set `client_gain_allowed = false`
 - keep all gain policy in `fm-sdr-tuner.ini`
 
+## Running On Low-CPU Devices (Raspberry Pi etc.)
+
+The full DSP pipeline at 256 kHz IQ rate is comfortably real-time on any 64-bit ARM since roughly the Raspberry Pi 4 era. Rough ballparks measured on Apple M1 Pro extrapolated by single-thread benchmark ratios:
+
+| Target | Default config | Headroom |
+|---|---|---|
+| Apple M1 / M2 / M3 / M4 | ~15-20% of one core | Plenty |
+| Modern x86 desktop / laptop | ~10-15% of one core | Plenty |
+| Raspberry Pi 5 (Cortex-A76) | ~25-30% of one core | Comfortable |
+| Raspberry Pi 4 (Cortex-A72) | ~45-55% of one core | Workable for dedicated-tuner use |
+| Raspberry Pi 3 / Zero 2 W | ≥90% of one core | Marginal; expect occasional dropouts |
+| Older / 32-bit ARM / Pi 1/2 | won't keep up real-time | Not supported |
+
+If you're targeting a constrained device, these knobs reduce CPU without hurting audio fidelity on normal stations:
+
+```ini
+[processing]
+# Keep these OFF — they add work on the inner DSP loop
+adaptive_bandwidth = off
+multipath_eq = off
+hicut = off
+
+# Optional: drop the LMS pilot canceller too. Default-on; setting it off
+# saves a few cycles per sample at the cost of marginally more 19 kHz
+# leakage in mono audio (well below audibility on real broadcasts).
+pilot_canceller = false
+
+# Stereo blend "aggressive" mutes stereo on weak signals quickly, avoiding
+# work in the L-R recovery loop when there's no real stereo to recover.
+stereo_blend = aggressive
+
+[debug]
+# Verbose logs aren't free at high block rates.
+log_level = 0
+```
+
+Build advice:
+
+```bash
+# ALWAYS Release build on RPi — Debug is several times slower.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+Runtime advice:
+
+- **Cooling matters.** RPi 4 throttles around 80 °C. A passive heatsink + airflow keeps the demod from stuttering under sustained load.
+- **Prefer direct USB RTL-SDR** (`--source rtl_sdr`) over `rtl_tcp` even on the same machine — the TCP roundtrip adds CPU and latency.
+- **USB 2.0 root port** is enough for 256 kHz, but avoid sharing the bus with other heavy USB devices.
+- **Skip audio output** if you only need the XDR control stream / WAV / MPX. Pass `--no-audio` and feed downstream consumers from `-w` or `--mpx-wav`.
+- **Avoid running other heavy workloads** (transcoders, browsers, GUIs) on the same Pi — the FM demod is real-time-sensitive.
+
+If even with all the above the Pi can't keep up:
+
+- Consider running `fm-sdr-tuner` on a more capable host and using `rtl_tcp` to pull IQ from the Pi (move the heavy DSP off the constrained device).
+- Or use a TEF-based hardware tuner. A real TEF6686/TEF6687 receiver does the demod in its own DSP silicon and the Pi only handles XDR protocol — basically zero CPU.
+
 ## CMake Options
 
 - `FM_TUNER_ENABLE_X86_AVX2=ON|OFF` (default `OFF`)

@@ -83,6 +83,7 @@ rtl_tcp -p 1234 -f 88600000 -g 20 -s 512000
 | `--mpx-audio-device <name>` | Audio device for live MPX (name substring match; default = system default output) | - |
 | `-i, --iq <file>` | Capture raw IQ bytes | - |
 | `-s, --audio` | Enable audio output | disabled |
+| `--no-audio` | Force-disable the 48 kHz audio output (overrides `[audio] enable_audio=true`). Useful with `--mpx-audio` / `-w` / `-i` for non-speaker workflows. | - |
 | `-d, --device <id|name>` | Audio output device selector | default |
 | `--low-latency-iq` | Prefer newest IQ samples under overload | disabled |
 | `--auto-start` | Start tuner without waiting for XDR client | disabled |
