@@ -64,6 +64,9 @@ void printUsage(const char *prog) {
       << "      --no-audio        Disable the 48 kHz audio output (overrides "
          "[audio] enable_audio=true); use with --mpx-audio / -w / -i\n"
       << "  -l, --list-audio      List available audio output devices\n"
+      << "      --calibrate       Sweep FM band (87.5-108 MHz), print station "
+         "table and recommended signal_floor_dbfs / signal_ceil_dbfs values "
+         "for the [sdr] section, then exit\n"
       << "  -d, --device <id>     Audio output device (index or name)\n"
       << "  -P, --password <pwd>   XDR server password\n"
       << "  -G, --guest            Enable guest mode (no password required)\n"
@@ -237,6 +240,10 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
       }
       result.outcome = AppParseOutcome::ExitSuccess;
       return result;
+    }
+    if (arg == "--calibrate") {
+      opts.calibrate = true;
+      continue;
     }
 
     if (arg == "-c" || arg == "--config" || arg.rfind("--config=", 0) == 0) {
@@ -420,8 +427,8 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
     return result;
   }
 
-  if (opts.wavFile.empty() && opts.mpxWavFile.empty() && opts.iqFile.empty() &&
-      !opts.enableSpeaker && !opts.mpxAudioEnabled) {
+  if (!opts.calibrate && opts.wavFile.empty() && opts.mpxWavFile.empty() &&
+      opts.iqFile.empty() && !opts.enableSpeaker && !opts.mpxAudioEnabled) {
     std::cerr << "[CLI] error: must specify at least one output: -w (wav), -i "
                  "(iq), --mpx-wav, --mpx-audio, or -s (audio)\n";
     printUsage(argv[0]);

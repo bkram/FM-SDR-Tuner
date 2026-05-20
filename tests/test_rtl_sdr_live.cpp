@@ -84,12 +84,17 @@ SignalLevelResult measureFrequencyLevel(RTLSDRDevice& dev, uint32_t freqKHz,
                                         int appliedGainDb,
                                         int channelBandwidthHz = 56000) {
   REQUIRE(dev.setFrequency(freqKHz * 1000U));
-  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
 
+  // Burn 4 full ring's worth of samples to ensure we're past any residual
+  // buffer from the previous tune frequency. Low-latency mode helps but is
+  // not a hard guarantee against latent in-flight USB transfers.
   std::vector<uint8_t> iq(4096 * 2, 0);
   size_t discardedSamples = 0;
-  (void)readIqWithRetries(dev, iq, iq.size() / 2, 4, std::chrono::milliseconds(15),
-                          discardedSamples);
+  for (int flush = 0; flush < 4; ++flush) {
+    (void)readIqWithRetries(dev, iq, iq.size() / 2, 4,
+                            std::chrono::milliseconds(15), discardedSamples);
+  }
 
   double dbfsSum = 0.0;
   double compensatedSum = 0.0;
@@ -401,6 +406,89 @@ TEST_CASE("RTLSDRDevice live DSP analysis sweep", "[rtl_sdr_live]") {
     REQUIRE(row.stereoLockRatio >= 0.0);
     REQUIRE(row.stereoLockRatio <= 1.0);
   }
+
+  dev.disconnect();
+}
+
+TEST_CASE("RTLSDRDevice FM band sweep for calibration", "[rtl_sdr_live]") {
+  if (!envEnabled("FM_TUNER_RUN_RTL_SDR_BANDSWEEP")) {
+    INFO("set FM_TUNER_RUN_RTL_SDR_BANDSWEEP=1 to run the full-band calibration sweep");
+    SUCCEED("RTL-SDR band sweep test not enabled");
+    return;
+  }
+
+  const uint32_t deviceIndex = envU32("FM_TUNER_RTL_DEVICE_INDEX", 0);
+  const uint32_t sampleRateHz = envU32("FM_TUNER_RTL_SAMPLE_RATE", 256000);
+  const uint32_t startKHz = envU32("FM_TUNER_BANDSWEEP_START_KHZ", 87500);
+  const uint32_t endKHz = envU32("FM_TUNER_BANDSWEEP_END_KHZ", 108000);
+  const uint32_t stepKHz = envU32("FM_TUNER_BANDSWEEP_STEP_KHZ", 100);
+  const int gainTenthsDb = envInt("FM_TUNER_RTL_GAIN_TENTHS_DB", 197);
+  const bool autoGain = envInt("FM_TUNER_BANDSWEEP_AUTOGAIN", 0) != 0;
+
+  RTLSDRDevice dev(deviceIndex);
+  REQUIRE(dev.connect());
+  REQUIRE(dev.setSampleRate(sampleRateHz));
+  // Drop ring backlog on retune. Without this, the FIFO contains samples
+  // from previous tune frequencies and the per-frequency measurement smears
+  // across recent neighbors.
+  dev.setLowLatencyMode(true);
+  if (autoGain) {
+    REQUIRE(dev.setGainMode(false));
+  } else {
+    REQUIRE(dev.setGainMode(true));
+    REQUIRE(dev.setGain(static_cast<uint32_t>(gainTenthsDb)));
+  }
+
+  struct Row {
+    uint32_t freqKHz;
+    double dbfs;
+    double compensatedDbfs;
+    double level120;
+  };
+  std::vector<Row> rows;
+  rows.reserve(((endKHz - startKHz) / stepKHz) + 1);
+
+  // FM broadcast occupies ~150 kHz of channel bandwidth and the running app's
+  // [SIG] line measures with `processing.w0_bandwidth_hz` (194 kHz default).
+  // Using 56 kHz here would concentrate the measurement on the central DC
+  // region where the R820T's LO-leakage notch suppresses signal — producing
+  // a deceptively low reading at the actual station frequency and a falsely
+  // strong reading 200 kHz off where the modulation lands outside the notch.
+  const int sweepChannelBwHz = static_cast<int>(
+      envU32("FM_TUNER_BANDSWEEP_CHANNEL_BW_HZ", 194000));
+  for (uint32_t f = startKHz; f <= endKHz; f += stepKHz) {
+    const SignalLevelResult r =
+        measureFrequencyLevel(dev, f, sampleRateHz,
+                              autoGain ? 0 : gainTenthsDb / 10,
+                              sweepChannelBwHz);
+    rows.push_back({f, r.dbfs, r.compensatedDbfs, r.level120});
+  }
+
+  // Compute robust min / max / percentiles on raw dBFS.
+  std::vector<double> sortedDbfs;
+  sortedDbfs.reserve(rows.size());
+  for (const Row& row : rows) {
+    sortedDbfs.push_back(row.dbfs);
+  }
+  std::sort(sortedDbfs.begin(), sortedDbfs.end());
+  const double p05 = sortedDbfs[static_cast<size_t>(sortedDbfs.size() * 0.05)];
+  const double p50 = sortedDbfs[sortedDbfs.size() / 2];
+  const double p95 = sortedDbfs[static_cast<size_t>(sortedDbfs.size() * 0.95)];
+  const double pMax = sortedDbfs.back();
+  const double pMin = sortedDbfs.front();
+
+  std::cout << "[SWEEP] freq_khz dbfs compensated_dbfs level120\n";
+  for (const Row& row : rows) {
+    std::cout << "[SWEEP] " << row.freqKHz << " " << row.dbfs << " "
+              << row.compensatedDbfs << " " << row.level120 << "\n";
+  }
+  std::cout << "[SWEEP-SUMMARY] count=" << rows.size()
+            << " min=" << pMin << " p05=" << p05 << " p50=" << p50
+            << " p95=" << p95 << " max=" << pMax << "\n";
+  std::cout << "[SWEEP-RECOMMENDATION] signal_floor_dbfs="
+            << std::round(p05 - 3.0) << " signal_ceil_dbfs="
+            << std::round(p95 + 3.0) << " range="
+            << (std::round(p95 + 3.0) - std::round(p05 - 3.0)) << " dB\n";
 
   dev.disconnect();
 }

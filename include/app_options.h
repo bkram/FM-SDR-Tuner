@@ -40,6 +40,10 @@ struct AppOptions {
   bool lowLatencyIq = false;
   bool verboseLogging = true;
   std::string stereoBlendOverride; // empty = use config; else "soft"|"normal"|"aggressive"
+  // One-shot band-sweep / calibration mode. When true, main() opens the
+  // RTL-SDR, sweeps 87.5–108 MHz, prints a per-frequency table + recommended
+  // INI values, and exits without starting the normal tuner pipeline.
+  bool calibrate = false;
 };
 
 struct AppParseResult {
