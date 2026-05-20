@@ -1,6 +1,7 @@
 #include "catch_compat.h"
 
 #include <chrono>
+#include <cmath>
 
 #include "adaptive_bandwidth.h"
 
