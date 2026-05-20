@@ -199,12 +199,53 @@ int runBandSweep(const BandSweepOptions &options) {
   const double pMax = dbfsSorted.back();
   const double pMin = dbfsSorted.front();
 
+  // Compute the ceiling from the strongest *non-saturated* readings only.
+  // RTL-SDR with R820T saturates around -3 to -6 dBFS — past that point the
+  // tuner AGC has clipped and the dBFS value no longer reflects the true RF
+  // strength of the station, it just hugs the rail. Including those points
+  // in p95 pulls the meter ceiling up into saturation territory and burns
+  // meter resolution on stations the receiver can't represent accurately.
+  // -6 dBFS is the conservative cutoff: anything closer to 0 dBFS is in
+  // the rail region and shouldn't drive the calibration window.
+  constexpr double kSaturationThresholdDbfs = -6.0;
+  std::vector<double> dbfsCleanSorted;
+  dbfsCleanSorted.reserve(rows.size());
+  for (const Row &row : rows) {
+    if (row.dbfs <= kSaturationThresholdDbfs) {
+      dbfsCleanSorted.push_back(row.dbfs);
+    }
+  }
+  std::sort(dbfsCleanSorted.begin(), dbfsCleanSorted.end());
+  const size_t saturatedCount = rows.size() - dbfsCleanSorted.size();
+  // Fall back to the full p95 if too few non-saturated points exist to make a
+  // meaningful percentile (e.g. very hot antenna with no gain reduction).
+  const double cleanP95 =
+      (dbfsCleanSorted.size() >= 10)
+          ? dbfsCleanSorted[static_cast<size_t>(dbfsCleanSorted.size() * 0.95)]
+          : p95;
+
   std::cout << "\n[CALIBRATE] signal envelope: min=" << pMin << " p05=" << p05
             << " median=" << p50 << " p95=" << p95 << " max=" << pMax
             << " dBFS\n";
+  if (saturatedCount > 0) {
+    std::cout << "[CALIBRATE] " << saturatedCount
+              << " point(s) at >= " << kSaturationThresholdDbfs
+              << " dBFS treated as ADC-saturated and excluded from ceiling "
+                 "calculation (non-saturated p95 = "
+              << cleanP95 << " dBFS)\n";
+  }
 
   const int recommendedFloor = static_cast<int>(std::round(p05 - 3.0));
-  const int recommendedCeil = static_cast<int>(std::round(p95 + 1.0));
+  // Ceiling = strongest non-saturated reading + 3 dB headroom, but never
+  // above the saturation threshold. The clamp is what makes the algorithm
+  // self-correcting on hot antennas: if cleanP95 already sits just below
+  // the rail, the +3 dB would otherwise push it back into the saturation
+  // zone and we'd lose the resolution we just gained by filtering. Capping
+  // at the threshold means "everything at or past the rail maps to 120",
+  // which matches what the meter physically can represent.
+  const double rawCeil = cleanP95 + 3.0;
+  const double clampedCeil = std::min(rawCeil, kSaturationThresholdDbfs);
+  const int recommendedCeil = static_cast<int>(std::round(clampedCeil));
   std::cout << "\n[CALIBRATE] recommended INI values for this antenna / "
                "location — paste into the [sdr] section of your config:\n\n";
   std::cout << "    signal_floor_dbfs = " << recommendedFloor << "\n";
