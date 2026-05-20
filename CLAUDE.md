@@ -1,6 +1,6 @@
-# CLAUDE.md
+# CLAUDE.md / AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Developer + AI-assistant guide for this repository. `AGENTS.md` is a symlink to this file — they're the same content. Anything you'd want to know to make a change here lives below.
 
 ## Project Overview
 
@@ -17,7 +17,32 @@ cmake -S . -B build
 cmake --build build
 ```
 
-macOS must select an architecture explicitly (`-DCMAKE_OSX_ARCHITECTURE=arm64` or `x86_64`). AVX2/FMA paths are off by default; enable via `-DFM_TUNER_ENABLE_X86_AVX2=ON` only for known-capable x86 targets.
+Per-platform notes:
+
+**macOS** — must select an architecture explicitly:
+
+```bash
+cmake -S . -B build -DCMAKE_OSX_ARCHITECTURES=arm64    # Apple Silicon
+cmake -S . -B build -DCMAKE_OSX_ARCHITECTURES=x86_64   # Intel
+cmake --build build -j
+```
+
+**Linux** — no architecture flag needed:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+**Windows (MinGW-w64 / MSYS2)** — supported in CI. Install the toolchain and deps, then the same `cmake -S . -B build` invocation works.
+
+If you use vcpkg locally, point CMake to the vcpkg toolchain:
+
+```bash
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+```
+
+AVX2/FMA paths are off by default; enable via `-DFM_TUNER_ENABLE_X86_AVX2=ON` only for known-capable x86 targets. On MSVC this propagates to `/arch:AVX2`; on GCC/Clang to `-mavx2 -mfma`. NEON paths on ARM are auto-enabled.
 
 ### Tests
 
@@ -117,9 +142,100 @@ Audio backends are compile-time selected: `FM_TUNER_HAS_COREAUDIO` (Apple), `FM_
 
 Tests are Catch2-based and compiled as **per-target executables that re-compile the specific source files they exercise** (see `tests/CMakeLists.txt`) — they do not link the main `fm-sdr-tuner` target. When you add or move a source file, update every test target that includes it. `catch_main.cpp` / `catch_compat.h` exist to bridge Catch2 v2 vs v3. Adding a test means adding both `add_executable(test_foo ...)` and `add_test(NAME foo COMMAND test_foo)`.
 
+## Project Structure
+
+```
+src/
+  main.cpp                 - Entry, hands off to Application::run()
+  application.cpp          - Lifecycle owner; wires IQ + DSP + audio + XDR
+  app_options.cpp          - CLI argument parser
+  config.cpp               - INI parser
+  runtime_loop.cpp         - Control + scan dispatch, auto-gain, adaptive BW
+  processing_runner.cpp    - Per-block hot path; signal-level + [METER] logging
+  rtl_sdr_device.cpp       - Direct USB RTL-SDR source
+  rtl_tcp_client.cpp       - rtl_tcp network client
+  tuner_session.cpp        - Tuner abstraction over the two sources above
+  tuner_controller.cpp     - Frequency/gain/AGC state machine
+  fm_demod.cpp             - FM discriminator + channel FIR + multipath EQ insertion
+  stereo_decoder.cpp       - Gear-shift PLL, pilot canceller, biquad Hi-Blend, L-R
+  af_post_processor.cpp    - Resampling, de-emphasis (+ optional HiCut crossfade)
+  rds_decoder.cpp          - RDS group decoder (legacy hook)
+  rds_worker.cpp           - Background thread feeding the redsea port
+  redsea_port/             - Ported RDS decode pipeline
+  signal_level.cpp         - dBFS / FFT-based channel + noise estimate
+  scan_engine.cpp          - XDR scan execution
+  xdr_server.cpp           - XDR protocol server (port 7373)
+  xdr_facade.cpp           - Bridge between XDR commands and tuner controller
+  adaptive_bandwidth.cpp   - Policy + hysteresis for SNR-driven channel BW
+  audio_output.cpp         - Core Audio / ALSA / WinMM 48 kHz stereo speaker output
+  mpx_audio_output.cpp     - Core Audio / ALSA live MPX → audio device (mono, ≥192 kHz)
+  wav_writer.cpp           - Buffered WAV writer; optional input-side resampler
+  cpu_features.cpp         - CPU capability detection (GCC/Clang and MSVC paths)
+  dsp/
+    liquid_primitives.cpp  - C++ wrappers over liquid-dsp primitives
+    multipath_eq.cpp       - CMA equalizer (Godard 1980; dispersion form + leak)
+    runtime.cpp            - DSP runtime / reset orchestration
+
+include/                   - Header files including dsp/iq_saturation.h
+                             (shared RTL-SDR ADC saturation constants)
+tests/                     - Catch2 per-target test executables
+                             (test_dsp_chain, test_wav_writer,
+                              test_adaptive_bandwidth, etc.)
+
+Not committed in this repository:
+research/                  - Reference implementations
+  SDRPlusPlus/             - FM demod, stereo, RDS algorithms
+  xdr-gtk/                 - XDR protocol client
+  FM-DX-Tuner/             - TEF tuner firmware
+  xdrd/                    - Original XDR daemon
+```
+
+The CLI surface and runtime knobs are documented exhaustively in `README.md`; this file does not duplicate the per-flag table.
+
+## Key Design Decisions
+
+- **SIMD**: DSP hot paths have SSE/AVX (x86) and NEON (ARM) optimized code behind `#ifdef`. AVX2/FMA off by default — opt-in via `FM_TUNER_ENABLE_X86_AVX2`.
+- **Audio**: Native backends only — Core Audio (macOS), ALSA (Linux), WinMM (Windows). Plus WAV file output.
+- **XDR Protocol**: Compatible with XDR-GTK and FM-DX-Webserver clients on port 7373. Two protocol code paths share `XDRServer` but dispatch via `processCommand` (XDR-GTK) vs `processFmdxCommand` (FM-DX after `x\n` handshake).
+- **RDS**: Decoded in a background thread (`RdsWorker`) so real-time audio is never blocked.
+- **Live MPX rebroadcast**: `MpxAudioOutput` is a separate sink from `AudioOutput` — same MPX tap source, independent device + rate.
+
 ## Code Conventions
 
 - C++17, no RTTI/exceptions assumptions beyond stdlib defaults.
 - Default to writing no comments; the README tuning guide carries the "why" for runtime behavior.
 - When modifying DSP or signal-level behavior, treat the captured `mpx_88600_60s.wav` / `stereo_88600_60s.wav` fixtures at the repo root as regression inputs.
 - `research/` and `build*/` directories are not committed sources — do not edit as if they were.
+
+### Static analysis / formatting tooling
+
+There is no enforcement wired into CMake; the tools below are run ad-hoc.
+
+**clang-tidy** — manually:
+
+```bash
+clang-tidy src/*.cpp -- -Iinclude -I/usr/local/include
+```
+
+Or via CMake (run from the build directory):
+
+```bash
+cmake -S . -B build -DCMAKE_CXX_CLANG_TIDY=clang-tidy
+cmake --build build
+```
+
+**clang-format** — single file:
+
+```bash
+clang-format -i src/main.cpp
+```
+
+All source files:
+
+```bash
+clang-format -i src/*.cpp include/**/*.h
+```
+
+## License
+
+GPLv3 — see `LICENSE`. Derived from components / ideas in SDRPlusPlus, XDR-GTK, FM-DX-Tuner, and xdrd; see `README.md` for the full component table and links.
