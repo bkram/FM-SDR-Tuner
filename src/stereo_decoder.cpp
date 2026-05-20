@@ -56,6 +56,47 @@ constexpr float kPilotPllBwHold = 0.003f;
 constexpr uint32_t kHiBlendCoeffRefreshMask = 63;
 
 constexpr float kHalfPi = 1.5707963267948966f;
+constexpr float kTwoPi = 6.28318530717959f;
+
+// 1024-entry sin/cos LUT with linear interpolation (N+1 entries so the
+// upper-bound interpolation lookup doesn't need a separate wrap). Max
+// error ~1.9e-5 (~13.7 bits) — well under the PLL's phase jitter and far
+// below the FM noise floor. The two per-sample sincos pairs in
+// processAudio (one for phaseNow, one for m_pllPhase) were ~95 leaf
+// samples / ~4% of active CPU in the post-Tier-2A profile; this swaps
+// the libm __sincosf_stret call for an L1-cache hit plus two multiplies.
+struct PhaseLUT {
+  static constexpr unsigned N = 1024;
+  float sinTbl[N + 1];
+  float cosTbl[N + 1];
+  PhaseLUT() {
+    for (unsigned i = 0; i <= N; ++i) {
+      const float p = static_cast<float>(i) * kTwoPi / static_cast<float>(N);
+      sinTbl[i] = std::sin(p);
+      cosTbl[i] = std::cos(p);
+    }
+  }
+};
+
+inline const PhaseLUT &phaseLUT() {
+  static const PhaseLUT lut;
+  return lut;
+}
+
+inline void fast_sincosf(float phase, float &s, float &c) {
+  // liquid NCO output is wrapped to [-π, π]; bring negative values into
+  // [0, 2π) so the integer-cast + mask gives a valid LUT index.
+  if (phase < 0.0f) phase += kTwoPi;
+  if (phase >= kTwoPi) phase -= kTwoPi;
+  constexpr float kInvTwoPi = 1.0f / kTwoPi;
+  const float scaled = phase * (static_cast<float>(PhaseLUT::N) * kInvTwoPi);
+  const unsigned idx = static_cast<unsigned>(scaled);
+  const unsigned i = idx & (PhaseLUT::N - 1U);
+  const float f = scaled - static_cast<float>(idx);
+  const auto &lut = phaseLUT();
+  s = lut.sinTbl[i] + f * (lut.sinTbl[i + 1] - lut.sinTbl[i]);
+  c = lut.cosTbl[i] + f * (lut.cosTbl[i + 1] - lut.cosTbl[i]);
+}
 
 // Polynomial approximation of atan2 — max error ~0.0015 rad (~0.09°), more
 // than tight enough for the pilot-PLL phase detector at 19 kHz. Replaces
@@ -290,7 +331,10 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     m_mpxMagnitude =
         (m_mpxMagnitude * kPilotEnvSmooth) + (std::abs(mpx) * kPilotEnvInject);
     const float phaseNow = m_liquidPilotPll.phase();
-    const std::complex<float> vco(std::cos(phaseNow), std::sin(phaseNow));
+    float vcoSin;
+    float vcoCos;
+    fast_sincosf(phaseNow, vcoSin, vcoCos);
+    const std::complex<float> vco(vcoCos, vcoSin);
     const std::complex<float> mixedPilot = pilot * std::conj(vco);
     const float error = fast_atan2f(mixedPilot.imag(), mixedPilot.real());
     m_liquidPilotPll.stepPLL(error);
@@ -335,7 +379,10 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     // 1) take delayed MPX as complex (real, imag=0),
     // 2) multiply by conjugated PLL output twice (38 kHz downconversion),
     // 3) take real part and apply 2x gain.
-    const std::complex<float> pll(std::cos(m_pllPhase), std::sin(m_pllPhase));
+    float pllSin;
+    float pllCos;
+    fast_sincosf(m_pllPhase, pllSin, pllCos);
+    const std::complex<float> pll(pllCos, pllSin);
     const std::complex<float> lrMixed =
         delayedMpx * std::conj(pll) * std::conj(pll);
     float monoRaw = delayedMpx.real();
