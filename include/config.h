@@ -62,6 +62,11 @@ struct Config {
     std::string adaptive_bandwidth = "off"; // off|conservative|aggressive
     std::string multipath_eq = "off"; // off|light|aggressive
     int multipath_eq_taps = 17;
+    // Squelch threshold on the post-DSP channel power (compensated dBFS).
+    // -120 = disabled (default). Useful for scan / unattended workflows
+    // where silence on empty channels is preferable to hiss. Hysteresis is
+    // a fixed 3 dB above the open threshold.
+    double squelch_dbfs = -120.0;
   } processing;
 
   struct DebugSection {

@@ -287,6 +287,11 @@ void parseProcessingSection(const std::string &key, const std::string &value,
     if (parseInt(value, parsed)) {
       processing.multipath_eq_taps = std::clamp(parsed, 5, 65);
     }
+  } else if (key == "squelch_dbfs") {
+    double parsed = 0.0;
+    if (parseDouble(value, parsed)) {
+      processing.squelch_dbfs = std::clamp(parsed, -120.0, 0.0);
+    }
   }
 }
 

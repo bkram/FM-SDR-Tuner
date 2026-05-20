@@ -14,6 +14,7 @@
 #include "af_post_processor.h"
 #include "config.h"
 #include "dsp/multipath_eq.h"
+#include "dsp/squelch.h"
 #include "dsp_pipeline.h"
 #include "fm_demod.h"
 #include "stereo_decoder.h"
@@ -1371,4 +1372,66 @@ TEST_CASE("Captured MPX fixture produces audio close to the reference",
   // every diagnostic path above; it's kept for future telemetry on (L+R)/2.
   (void)rmsSum;
 #endif
+}
+
+TEST_CASE("Squelch is a no-op when disabled (sentinel)", "[dsp][squelch]") {
+  fm_tuner::dsp::Squelch sq;
+  sq.configure(-120.0f, 3.0f, 0.030f, 48000);
+  std::vector<float> l(1024, 0.5f);
+  std::vector<float> r(1024, -0.25f);
+  sq.updateGate(-90.0); // even very low channel power must not gate
+  sq.process(l.data(), r.data(), l.size());
+  REQUIRE(sq.isOpen());
+  for (size_t i = 0; i < l.size(); ++i) {
+    REQUIRE(l[i] == 0.5f);
+    REQUIRE(r[i] == -0.25f);
+  }
+}
+
+TEST_CASE("Squelch closes below threshold and reopens with hysteresis",
+          "[dsp][squelch]") {
+  fm_tuner::dsp::Squelch sq;
+  sq.configure(-60.0f, 3.0f, 0.005f, 48000); // 5 ms ramp for fast test
+  std::vector<float> l(48000, 1.0f);
+  std::vector<float> r(48000, 1.0f);
+
+  // Start with a strong-signal block: gate should be open, audio pass-through.
+  sq.updateGate(-30.0);
+  sq.process(l.data(), r.data(), l.size());
+  REQUIRE(sq.isOpen());
+
+  // Drop signal well below -60. Gate closes, audio ramps to silence.
+  std::fill(l.begin(), l.end(), 1.0f);
+  std::fill(r.begin(), r.end(), 1.0f);
+  sq.updateGate(-80.0);
+  REQUIRE(!sq.isOpen());
+  sq.process(l.data(), r.data(), l.size());
+  // After 48000 samples (1 s) at 5 ms tau, gain should be essentially zero.
+  REQUIRE(std::abs(l.back()) < 1e-6f);
+  REQUIRE(std::abs(r.back()) < 1e-6f);
+
+  // Bring signal back up but only to -58 — within the 3 dB hysteresis
+  // band, so the gate must stay closed.
+  sq.updateGate(-58.0);
+  REQUIRE(!sq.isOpen());
+
+  // Above -60 + 3 = -57: gate reopens, audio ramps back up.
+  sq.updateGate(-50.0);
+  REQUIRE(sq.isOpen());
+  std::fill(l.begin(), l.end(), 1.0f);
+  std::fill(r.begin(), r.end(), 1.0f);
+  sq.process(l.data(), r.data(), l.size());
+  REQUIRE(l.back() > 0.99f);
+  REQUIRE(r.back() > 0.99f);
+}
+
+TEST_CASE("Squelch ignores non-finite channel power", "[dsp][squelch]") {
+  fm_tuner::dsp::Squelch sq;
+  sq.configure(-60.0f, 3.0f, 0.030f, 48000);
+  // Open initially.
+  sq.updateGate(-30.0);
+  REQUIRE(sq.isOpen());
+  // NaN: don't change state.
+  sq.updateGate(std::nan(""));
+  REQUIRE(sq.isOpen());
 }

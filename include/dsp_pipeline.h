@@ -11,6 +11,7 @@
 #include "af_post_processor.h"
 #include "config.h"
 #include "dsp/liquid_primitives.h"
+#include "dsp/squelch.h"
 #include "fm_demod.h"
 #include "stereo_decoder.h"
 
@@ -60,6 +61,7 @@ private:
   StereoDecoder m_stereo;
   AFPostProcessor m_afPost;
   fm_tuner::dsp::liquid::ComplexDecimator m_iqDecimator;
+  fm_tuner::dsp::Squelch m_squelch;
 
   std::vector<uint8_t> m_iqStagingRing;
   std::vector<uint8_t> m_iqLinearizedBlock;

@@ -97,6 +97,12 @@ DspPipeline::DspPipeline(int inputRate, int outputRate,
   m_demod.setMultipathEqMode(
       multipathMode, static_cast<std::uint32_t>(processing.multipath_eq_taps));
 
+  // Squelch — operates on the 48 kHz audio output, gated by the per-block
+  // channelPowerDbfs estimate from FMDemod. Default config.squelch_dbfs
+  // == -120 leaves the gate effectively disabled.
+  m_squelch.configure(static_cast<float>(processing.squelch_dbfs), 3.0f,
+                      0.030f, m_outputRate);
+
   const uint32_t decimFactor = static_cast<uint32_t>(m_iqDecimation);
   const uint32_t decimTapsPerPhase =
       (decimFactor >= 8U) ? 28U : ((decimFactor >= 4U) ? 20U : 12U);
@@ -286,6 +292,13 @@ bool DspPipeline::process(
     stereoDetected = m_stereo.isStereo();
     pilotTenthsKHz = m_stereo.getPilotLevelTenthsKHz();
   }
+
+  // Squelch — gate decision is per-block (driven by the FMDemod's
+  // channel-power estimate), but the per-sample gain ramp inside
+  // m_squelch.process() avoids audible clicks at the open/close edge.
+  // No-op when squelch_dbfs is at the disable sentinel.
+  m_squelch.updateGate(m_demod.getFilteredChannelPowerDbfs());
+  m_squelch.process(m_audioLeft.data(), m_audioRight.data(), outSamples);
 
   uint32_t softClipCount = 0;
   for (size_t i = 0; i < outSamples; i++) {
