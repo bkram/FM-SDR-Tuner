@@ -47,9 +47,6 @@ not retained; consult `git log` and merged PR descriptions for history.
   (where our current chain has 5-10° pilot phase error → ~3% crosstalk).
   Self-contained ~150 lines; uses the existing pilot PLL as the phase
   reference and adds a small integrator + LPF + error-witness path.
-- **Runtime `stereo_blend` control via XDR (P15b)**: `-b soft|normal|aggressive`
-  covers startup-time selection but no XDR command toggles it at runtime.
-  Candidate prefix `Fb`. Wire via `XDRServer::assignCallback` template.
 - **`m_demodScratch` growth check on every call** (`src/fm_demod.cpp`):
   reserve-and-reuse strategy can be tightened. Cheap, mechanical, isolated.
 - **Mixed newline style** between `std::endl` and `"\n"` across
@@ -59,12 +56,6 @@ not retained; consult `git log` and merged PR descriptions for history.
 
 ### Low / cross-cutting
 
-- **Squelch class (P20)**: mute audio + suppress meter when channel power
-  falls below a user-configurable threshold. Reference:
-  `research/sdr-j-fm/includes/various/squelchClass.h`. Useful for scan
-  / unattended / DX workflows where silence on empty channels is
-  preferable to hiss. ~50 lines plus a `[processing] squelch_dbfs =`
-  config knob.
 - **Subsystem-grouped include layout**: `research/sdr-j-fm` organizes
   `includes/fm/`, `includes/rds/`, `includes/various/` by subsystem. We
   do this partially in `include/dsp/` but most headers are flat. As the
@@ -115,8 +106,8 @@ These would catch regressions that current CI can't:
 
 ## Future Milestones
 
-- **1.6.x** patch releases for the small remaining `stereo_blend` /
-  IQ-L1 fixes (P15b, P17) if they come up before the SoapySDR work.
+- **1.6.x** further patch releases for the small remaining IQ-L1 fix
+  (P17) if it comes up before the SoapySDR work.
 - **1.7** — Broad SDR backend support. Backend capability interface (P6)
   → `SoapySDR` implementation → contract tests → CLI/config/XDR
   integration cleanup. Stretch goals if time allows: the pilot-FIR
@@ -125,5 +116,10 @@ These would catch regressions that current CI can't:
   refactor.
 - **1.8** — Runtime structural cleanup. Decompose `Application::run`
   (P5) into smaller responsibilities now that the backend layer is
-  abstracted. Pick up the smaller items (P20 squelch, mixed newline /
-  preprocessor style sweep) alongside the affected subsystems.
+  abstracted. Pick up the mixed-newline / preprocessor-style sweep
+  alongside the affected subsystems.
+
+### Recently closed
+
+- **1.6.1** — P15b (runtime stereo_blend XDR command `Fb<n>`) and P20
+  (channel-power squelch with hysteresis + ramp). Shipped in PR #10.
