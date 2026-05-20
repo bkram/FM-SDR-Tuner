@@ -65,6 +65,7 @@ Useful one-shot overrides (all still valid without a config file):
 ./build/fm-sdr-tuner --mpx-wav mpx.wav --mpx-rate 192000    # capture MPX at 192 kHz for downstream RDS/spectrum analysis or feeding an FM exciter
 ./build/fm-sdr-tuner --mpx-audio --mpx-audio-device "BlackHole" --mpx-rate 192000   # macOS: live MPX into a virtual loopback at 192 kHz
 ./build/fm-sdr-tuner -l                                     # list audio output devices
+./build/fm-sdr-tuner --calibrate                            # one-shot band sweep — prints stations + recommended signal_floor_dbfs / signal_ceil_dbfs for this location/antenna
 ```
 
 ## Requirements
@@ -736,7 +737,22 @@ The default 60 dB window (`-65` floor, `-5` ceil) is intentionally wide so it wo
 [METER] session observed: min=-53.5 dBFS, max=-26.9 dBFS — for full-scale meter consider floor≈-56, ceil≈-24
 ```
 
-Procedure with the auto-suggester:
+Two procedures, both work end-to-end:
+
+**Procedure A — One-shot band sweep (recommended).** Use the built-in calibration tool. It opens the RTL-SDR, sweeps 87.5–108 MHz, prints all detected stations sorted by quality, and emits copy-paste-ready INI values tuned to your antenna + location:
+
+```bash
+./fm-sdr-tuner --calibrate
+```
+
+The output includes:
+- a per-frequency table (dBFS + meter level at every 100 kHz step)
+- a sorted list of detected stations (level120 > 30)
+- a recommendation block with `signal_floor_dbfs`, `signal_ceil_dbfs`, and `signal_bias_db` chosen so the 0..120 meter spans the actual signal envelope at your site
+
+Paste the recommendation block into the `[sdr]` section of your INI and restart. Takes ~45 seconds, no XDR client or audio backend needed. Re-run any time the antenna or location changes.
+
+**Procedure B — Live auto-suggester (for tweaking while listening).**
 1. Start the tuner with the default wide window.
 2. Tune through your representative stations (strong local, mid, fringe, empty) over ~1 minute.
 3. Read the `[METER] session observed` line. It tracks the running min/max of compensated dBFS and recommends `floor ≈ min − 3 dB`, `ceil ≈ max + 3 dB` so the meter spans 0..120 across your real signal range.

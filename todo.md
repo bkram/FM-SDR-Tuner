@@ -24,12 +24,13 @@ not retained; consult `git log` and merged PR descriptions for history.
   saved** plus a simpler architecture (no FIR group delay to compensate in
   the L-R recovery delay line). Trade-off: less out-of-band rejection on the
   PLL input, must validate on stations with strong adjacent splatter.
-- **IQ FIR L1 normalization + ADC-rail-aware gain policy (P17)**: under
-  saturation the channel Kaiser FIR can ring past unit envelope (L1 > 1). A
-  `dBFS ≤ 0` clamp was added as a meter-side band-aid; the underlying FIR
-  taps aren't L1-renormalized, and the gain policy still accepts `G01` /
-  `G11` requests that would overload. Touch points: `src/fm_demod.cpp` (FIR
-  init), `src/runtime_loop.cpp` (gain refusal path).
+- **ADC-rail-aware gain policy refusal (P17b)**: the L1 normalization on the
+  IQ FIR is wired (`processing.iq_fir_l1_normalize`, default off — see v1.6.2)
+  so post-filter envelope can be hard-bounded. Still open: the gain policy
+  in `src/runtime_loop.cpp` accepts `G01` / `G11` requests that would push
+  the front end into chronic ADC saturation. Add a refusal path that
+  reports the chronic-clip ratio back through the XDR meter rather than
+  silently mis-representing the level.
 - **Application::run() decomposition (P5)**: `src/application.cpp` is still
   ~700 lines after the v1.5.1 / v1.6.0 work, owning session bootstrap, XDR
   facade wiring, scan restore, mute windows, reconnect, and the main DSP
@@ -106,8 +107,8 @@ These would catch regressions that current CI can't:
 
 ## Future Milestones
 
-- **1.6.x** further patch releases for the small remaining IQ-L1 fix
-  (P17) if it comes up before the SoapySDR work.
+- **1.6.x** further patch releases for the remaining gain-policy refusal
+  work (P17b) if it comes up before the SoapySDR work.
 - **1.7** — Broad SDR backend support. Backend capability interface (P6)
   → `SoapySDR` implementation → contract tests → CLI/config/XDR
   integration cleanup. Stretch goals if time allows: the pilot-FIR
@@ -121,5 +122,8 @@ These would catch regressions that current CI can't:
 
 ### Recently closed
 
+- **1.6.2** — P17a (IQ FIR L1 normalization, opt-in via
+  `[processing] iq_fir_l1_normalize`). Bounds post-filter envelope so
+  meter/downstream consumers never see |y| > max|x|.
 - **1.6.1** — P15b (runtime stereo_blend XDR command `Fb<n>`) and P20
   (channel-power squelch with hysteresis + ramp). Shipped in PR #10.
