@@ -99,7 +99,15 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
       m_pilotCancellerEnabled(true), m_delayPos(0), m_delaySamples(0) {
   constexpr float pilotCenterHz = 19000.0f;
   constexpr float pilotHalfBandwidthHz = 250.0f;
-  constexpr float pilotTransitionHz = 3000.0f;
+  // Wider transition than spec-tight (was 3 kHz → 325 taps @ 256 kHz). The
+  // 19 kHz pilot is a single narrow tone with nothing immediately adjacent
+  // to discriminate against — L+R audio ends at 15 kHz, L-R DSB-SC starts
+  // near 23 kHz — so 4 kHz still rejects both with margin. Tap count drops
+  // to ~243 (~25% fewer complex MACs/sec). Tried 5 kHz first but it lets
+  // enough broadband noise leak in that the quality metric (which uses
+  // pilotBand/mpx ratio) starts over-reporting on noisy signals. 4 kHz is
+  // the sweet spot.
+  constexpr float pilotTransitionHz = 4000.0f;
   int pilotTapCount =
       static_cast<int>(std::ceil(3.8 * static_cast<double>(m_inputRate) /
                                  static_cast<double>(pilotTransitionHz)));
