@@ -61,6 +61,10 @@ public:
   void setAlignmentCallback(IntCallback cb);
   void setSamplingCallback(SamplingCallback cb);
   void setForceMonoCallback(ForceMonoCallback cb);
+  // Stereo blend mode select: 0=soft, 1=normal, 2=aggressive. Mirrors the
+  // CLI -b flag and the [processing] stereo_blend INI key — runtime A/B is
+  // useful for comparing how each profile handles a given station.
+  void setBlendModeCallback(IntCallback cb);
   void setStartCallback(StartCallback cb);
   void setStopCallback(StopCallback cb);
 
@@ -182,6 +186,7 @@ private:
   IntCallback m_rotatorCallback;
   SamplingCallback m_samplingCallback;
   ForceMonoCallback m_forceMonoCallback;
+  IntCallback m_blendModeCallback;
   StartCallback m_startCallback;
   StopCallback m_stopCallback;
 

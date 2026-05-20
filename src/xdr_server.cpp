@@ -1176,9 +1176,25 @@ std::string XDRServer::processCommand(const std::string &cmd,
     return "D" + std::to_string(deemph);
   }
 
-  case 'F':
-    // TEF-style backends report bandwidth using 'W'.
+  case 'F': {
+    // 'F' is a prefix for tuner-extension subcommands (TEF-style backends
+    // historically reported bandwidth here, hence the original no-op
+    // placeholder). 'Fb<n>' selects stereo blend mode (0=soft, 1=normal,
+    // 2=aggressive). Other 'F<x>' codes left as no-op for forward
+    // compatibility.
+    if (!arg.empty() && arg[0] == 'b') {
+      int blend = 0;
+      if (!parseIntValue(arg.substr(1), blend)) {
+        return "";
+      }
+      blend = std::clamp(blend, 0, 2);
+      if (m_blendModeCallback) {
+        m_blendModeCallback(blend);
+      }
+      return std::string("Fb") + std::to_string(blend);
+    }
     return "";
+  }
 
   case 'W': {
     int bandwidth = 0;
@@ -1323,6 +1339,9 @@ void XDRServer::setAlignmentCallback(IntCallback cb) {
 void XDRServer::setSamplingCallback(SamplingCallback cb) {
   assignCallback(m_samplingCallback, std::move(cb));
 }
+void XDRServer::setBlendModeCallback(IntCallback cb) {
+  assignCallback(m_blendModeCallback, std::move(cb));
+}
 void XDRServer::setForceMonoCallback(ForceMonoCallback cb) {
   assignCallback(m_forceMonoCallback, std::move(cb));
 }
@@ -1420,6 +1439,24 @@ std::string XDRServer::processFmdxCommand(const std::string &cmd) {
       m_bandwidthCallback(bandwidth);
     }
     return "OK";
+  }
+
+  case 'F': {
+    // Tuner-extension subcommand prefix. Currently supports stereo blend
+    // selection via 'Fb<n>' (0=soft, 1=normal, 2=aggressive), matching the
+    // XDR-GTK protocol path. Other 'F<x>' codes are reserved.
+    if (!arg.empty() && arg[0] == 'b') {
+      int blend = 0;
+      if (!parseIntValue(arg.substr(1), blend)) {
+        return "ER";
+      }
+      blend = std::clamp(blend, 0, 2);
+      if (m_blendModeCallback) {
+        m_blendModeCallback(blend);
+      }
+      return "OK";
+    }
+    return "ER";
   }
 
   case 'D': {

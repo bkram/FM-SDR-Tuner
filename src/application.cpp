@@ -292,6 +292,8 @@ int Application::run() {
   auto &requestedVolume = xdrState.requestedVolume;
   auto &requestedDeemphasis = xdrState.requestedDeemphasis;
   auto &requestedForceMono = xdrState.requestedForceMono;
+  auto &requestedBlendMode = xdrState.requestedBlendMode;
+  auto &pendingBlendMode = xdrState.pendingBlendMode;
   auto &pendingFrequency = xdrState.pendingFrequency;
   auto &pendingGain = xdrState.pendingGain;
   auto &pendingAGC = xdrState.pendingAGC;
@@ -667,6 +669,23 @@ int Application::run() {
     bool targetForceMono = requestedForceMono.load();
     if (targetForceMono != appliedForceMono) {
       appliedForceMono = targetForceMono;
+    }
+
+    if (pendingBlendMode.exchange(false)) {
+      const int blend = std::clamp(requestedBlendMode.load(), 0, 2);
+      StereoDecoder::BlendMode mode = StereoDecoder::BlendMode::Normal;
+      const char *label = "normal";
+      if (blend == 0) {
+        mode = StereoDecoder::BlendMode::Soft;
+        label = "soft";
+      } else if (blend == 2) {
+        mode = StereoDecoder::BlendMode::Aggressive;
+        label = "aggressive";
+      }
+      dspPipeline.setBlendMode(mode);
+      if (verboseLogging) {
+        std::cout << "[XDR] stereo blend -> " << label << "\n";
+      }
     }
 
     size_t samples = 0;
