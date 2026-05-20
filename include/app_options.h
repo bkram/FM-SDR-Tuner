@@ -20,6 +20,15 @@ struct AppOptions {
   int gain = -1;
   std::string wavFile;
   std::string mpxWavFile;
+  // 0 = match the post-decimation IQ rate (no resample, current default).
+  // Otherwise the MPX is resampled to this rate before being written.
+  // 192000 Hz is a common target for downstream RDS / spectrum analysis tools
+  // and for feeding FM exciters that accept raw MPX.
+  uint32_t mpxWavSampleRate = 0;
+  // Live MPX -> audio device routing (intended for virtual loopback like
+  // BlackHole / snd-aloop, or for direct line-in into an FM exciter).
+  bool mpxAudioEnabled = false;
+  std::string mpxAudioDevice;
   std::string iqFile;
   bool enableSpeaker = false;
   std::string audioDevice;

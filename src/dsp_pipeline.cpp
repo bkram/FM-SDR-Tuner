@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 
 namespace {
 
@@ -68,6 +69,34 @@ DspPipeline::DspPipeline(int inputRate, int outputRate,
     m_stereo.setBlendMode(StereoDecoder::BlendMode::Normal);
   }
 
+  m_stereo.setPilotCancellerEnabled(processing.pilot_canceller);
+
+  std::string hicut = processing.hicut;
+  std::transform(
+      hicut.begin(), hicut.end(), hicut.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (hicut == "gentle") {
+    m_afPost.setHicutMode(AFPostProcessor::HicutMode::Gentle);
+  } else if (hicut == "strong") {
+    m_afPost.setHicutMode(AFPostProcessor::HicutMode::Strong);
+  } else {
+    m_afPost.setHicutMode(AFPostProcessor::HicutMode::Off);
+  }
+
+  std::string multipath = processing.multipath_eq;
+  std::transform(
+      multipath.begin(), multipath.end(), multipath.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  fm_tuner::dsp::MultipathEqMode multipathMode =
+      fm_tuner::dsp::MultipathEqMode::Off;
+  if (multipath == "light") {
+    multipathMode = fm_tuner::dsp::MultipathEqMode::Light;
+  } else if (multipath == "aggressive") {
+    multipathMode = fm_tuner::dsp::MultipathEqMode::Aggressive;
+  }
+  m_demod.setMultipathEqMode(
+      multipathMode, static_cast<std::uint32_t>(processing.multipath_eq_taps));
+
   const uint32_t decimFactor = static_cast<uint32_t>(m_iqDecimation);
   const uint32_t decimTapsPerPhase =
       (decimFactor >= 8U) ? 28U : ((decimFactor >= 4U) ? 20U : 12U);
@@ -85,12 +114,12 @@ void DspPipeline::reset() {
   m_afPost.reset();
   m_iqDecimator.reset();
   clearIqStaging();
+  m_pendingAudioReset = false;
 }
 
 void DspPipeline::setBandwidthHz(int bandwidthHz) {
   m_demod.setBandwidthHz(bandwidthHz);
-  m_stereo.reset();
-  m_afPost.reset();
+  m_pendingAudioReset = true;
 }
 
 void DspPipeline::setDeemphasisMode(int deemphasisMode) {
@@ -104,9 +133,7 @@ void DspPipeline::setDeemphasisMode(int deemphasisMode) {
     m_afPost.setDeemphasis(0);
     m_demod.setDeemphasis(0);
   }
-  m_demod.reset();
-  m_stereo.reset();
-  m_afPost.reset();
+  m_pendingAudioReset = true;
 }
 
 void DspPipeline::setForceMono(bool forceMono) { m_stereo.setForceMono(forceMono); }
@@ -182,6 +209,16 @@ bool DspPipeline::process(
     return false;
   }
 
+  if (m_pendingAudioReset) {
+    m_stereo.reset();
+    m_afPost.reset();
+    m_pendingAudioReset = false;
+  }
+
+  // Only let the multipath equalizer adapt when we have a strong, locked
+  // signal. CMA on a noisy or absent signal will wander to a wrong solution.
+  m_demod.setMultipathAdaptEnabled(m_stereo.isStereo());
+
   const uint8_t *iqForDemod = iq;
   const std::complex<float> *iqForDemodComplex = nullptr;
   size_t demodSamples = samples;
@@ -242,6 +279,7 @@ bool DspPipeline::process(
     const size_t stereoSamples =
         m_stereo.processAudio(m_demodBuffer.data(), m_stereoLeft.data(),
                               m_stereoRight.data(), demodSamples);
+    m_afPost.setSignalQuality(m_stereo.getStereoQuality());
     outSamples =
         m_afPost.process(m_stereoLeft.data(), m_stereoRight.data(), stereoSamples,
                          m_audioLeft.data(), m_audioRight.data(), m_blockSamples);
@@ -269,5 +307,19 @@ bool DspPipeline::process(
                 static_cast<float>(outSamples * 2U)
           : 0.0f;
   out.channelPowerDbfs = m_demod.getFilteredChannelPowerDbfs();
+
+  // Multipath equalizer telemetry. Only emit when the equalizer is active and
+  // adapting, throttled so it doesn't drown out the rest of the log.
+  if (m_verboseLogging) {
+    const float envErr = m_demod.getMultipathEnvelopeError();
+    if (envErr > 0.0f) {
+      static uint32_t eqLogCount = 0;
+      const uint32_t count = ++eqLogCount;
+      if (count <= 5 || (count % 100) == 0) {
+        std::cout << "[EQ] env_err=" << envErr << "\n";
+      }
+    }
+  }
+
   return true;
 }

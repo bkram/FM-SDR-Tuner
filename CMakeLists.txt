@@ -114,8 +114,11 @@ set(SOURCES
     src/redsea_port/util/util.cpp
     src/xdr_server.cpp
     src/audio_output.cpp
+    src/mpx_audio_output.cpp
     src/config.cpp
     src/signal_level.cpp
+    src/adaptive_bandwidth.cpp
+    src/dsp/multipath_eq.cpp
     src/main.cpp
 )
 

@@ -1393,6 +1393,49 @@ std::string XDRServer::processFmdxCommand(const std::string &cmd) {
     return oss.str();
   }
 
+  case 'B': {
+    // Force mono. Mirrors processCommand's 'B' handler in the XDR-GTK path so
+    // FM-DX clients (which speak this protocol after the 'x' handshake) can
+    // also toggle mono. Returns "OK" / "ER" to match the FM-DX convention.
+    int forceMono = 0;
+    if (!parseIntValue(arg, forceMono)) {
+      return "ER";
+    }
+    const bool mono = (forceMono != 0);
+    m_forceMono = mono;
+    if (m_forceMonoCallback) {
+      m_forceMonoCallback(mono);
+    }
+    return "OK";
+  }
+
+  case 'W': {
+    // Channel bandwidth in Hz — same units as processCommand's 'W'.
+    int bandwidth = 0;
+    if (!parseIntValue(arg, bandwidth)) {
+      return "ER";
+    }
+    m_bandwidth = bandwidth;
+    if (m_bandwidthCallback) {
+      m_bandwidthCallback(bandwidth);
+    }
+    return "OK";
+  }
+
+  case 'D': {
+    // De-emphasis mode (0 = 50us, 1 = 75us, 2 = off).
+    int deemph = 0;
+    if (!parseIntValue(arg, deemph)) {
+      return "ER";
+    }
+    deemph = std::clamp(deemph, 0, 2);
+    m_deemphasis = deemph;
+    if (m_deemphasisCallback) {
+      m_deemphasisCallback(deemph);
+    }
+    return "OK";
+  }
+
   default:
     return "ER";
   }

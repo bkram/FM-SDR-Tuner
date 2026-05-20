@@ -261,6 +261,32 @@ void parseProcessingSection(const std::string &key, const std::string &value,
     if (parseBool(value, parsed)) {
       processing.stereo = parsed;
     }
+  } else if (key == "pilot_canceller") {
+    bool parsed = false;
+    if (parseBool(value, parsed)) {
+      processing.pilot_canceller = parsed;
+    }
+  } else if (key == "hicut") {
+    const std::string parsed = toLower(trim(value));
+    if (parsed == "off" || parsed == "gentle" || parsed == "strong") {
+      processing.hicut = parsed;
+    }
+  } else if (key == "adaptive_bandwidth") {
+    const std::string parsed = toLower(trim(value));
+    if (parsed == "off" || parsed == "conservative" ||
+        parsed == "aggressive") {
+      processing.adaptive_bandwidth = parsed;
+    }
+  } else if (key == "multipath_eq") {
+    const std::string parsed = toLower(trim(value));
+    if (parsed == "off" || parsed == "light" || parsed == "aggressive") {
+      processing.multipath_eq = parsed;
+    }
+  } else if (key == "multipath_eq_taps") {
+    int parsed = 0;
+    if (parseInt(value, parsed)) {
+      processing.multipath_eq_taps = std::clamp(parsed, 5, 65);
+    }
   }
 }
 

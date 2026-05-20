@@ -84,8 +84,15 @@ Hot path (IQ → audio/WAV):
 1. `TunerSession` wraps `TunerController` and talks to either `RtlSdrDevice` (direct USB, default) or `RtlTcpClient` (network).
 2. `RuntimeLoop` / `ProcessingRunner` pulls IQ bytes in fixed SDR-block chunks.
 3. `DspPipeline` (`src/dsp_pipeline.cpp`) runs complex decimation → `FMDemod` → `StereoDecoder` → `AFPostProcessor`, driven by `liquid-dsp` primitives wrapped in `src/dsp/liquid_primitives.cpp` and the runtime in `src/dsp/runtime.cpp`. The pipeline emits L/R at `48000 Hz` (audio rate is fixed).
-4. The MPX tap feeds `RdsWorker`, which runs the `src/redsea_port/` port of redsea on a dedicated thread so RDS decode cannot stall audio.
-5. Outputs are demuxed to `AudioOutput` (Core Audio / ALSA / WinMM via `#ifdef`), `WavWriter`, and/or raw IQ capture.
+4. The MPX tap feeds `RdsWorker`, which runs the `src/redsea_port/` port of redsea on a dedicated thread so RDS decode cannot stall audio. The MPX tap is also the source for `--mpx-wav` capture (optionally resampled by `WavWriter`) and `--mpx-audio` live routing to a system audio device (`MpxAudioOutput`, independent of the 48 kHz stereo audio path).
+5. Outputs are demuxed to `AudioOutput` (48 kHz stereo audio; Core Audio / ALSA / WinMM via `#ifdef`), `WavWriter` (mono MPX + stereo audio capture), `MpxAudioOutput` (live mono MPX → audio device; Core Audio / ALSA only — WinMM is rejected because its 48 kHz cap aliases the subcarriers), and/or raw IQ capture.
+
+Optional DSP features (all gated by config; default off except `pilot_canceller`):
+
+- **Pilot canceller** (`src/stereo_decoder.cpp`): two-tap LMS subtracting a phase-locked 19 kHz copy from the mono audio path.
+- **Adaptive de-emphasis "HiCut"** (`src/af_post_processor.cpp`): per-channel pair of de-emphasis IIRs, crossfaded by stereo quality.
+- **Adaptive channel bandwidth** (`src/adaptive_bandwidth.cpp` + `src/runtime_loop.cpp::maybeAdjustAdaptiveBandwidth`): SNR-driven policy with 2 s hysteresis, plumbed through the existing `requestedBandwidthHz` atomic so changes flow through the regular retune path. Waits for `isfinite(signal.snrDb)` before the first decision.
+- **Multipath equalizer** (`src/dsp/multipath_eq.cpp`): dispersion-form CMA (Godard 1980) inserted in `FMDemod::demodulate{,Complex}` between the channel FIR and the discriminator. Adaptation gated by `m_stereo.isStereo()` and pulled toward a centered-delta tap via leak regularization to avoid CMA's known phase-ambiguity on FM.
 
 ### Control plane
 
@@ -93,7 +100,14 @@ Hot path (IQ → audio/WAV):
 
 ### Configuration surface
 
-`fm-sdr-tuner.ini` is the primary control surface (CLI is meant for transient overrides). `Config` (`src/config.cpp`) parses the `[tuner]`, `[audio]`, `[sdr]`, `[processing]`, `[xdr]` sections. Signal-meter calibration keys (`signal_floor_dbfs`, `signal_ceil_dbfs`, `signal_bias_db`) and DSP keys (`w0_bandwidth_hz`, `dsp_agc`, `stereo_blend`, `agc_mode`) all flow through here and down into `DspPipeline` / `SignalLevel`. The README's "Setup And Tuning Guide" is the canonical reference for what each knob does in practice — consult it before changing defaults.
+`fm-sdr-tuner.ini` is the primary control surface (CLI is meant for transient overrides). `Config` (`src/config.cpp`) parses the `[tuner]`, `[audio]`, `[sdr]`, `[processing]`, `[xdr]` sections. Signal-meter calibration keys (`signal_floor_dbfs`, `signal_ceil_dbfs`, `signal_bias_db`; default window is `-65`/`-5`/`0` = 60 dB range) and DSP keys (`w0_bandwidth_hz`, `dsp_agc`, `stereo_blend`, `agc_mode`, `pilot_canceller`, `hicut`, `adaptive_bandwidth`, `multipath_eq`, `multipath_eq_taps`) all flow through here and down into `DspPipeline` / `SignalLevel`. The README's "Setup And Tuning Guide" is the canonical reference for what each knob does in practice — consult it before changing defaults.
+
+Diagnostic log prefixes (grep-friendly):
+- `[SIG]` — per-block signal stats (dbfs, compensated, floor, snr, level, clip).
+- `[ST]` — stereo decoder state (pilot magnitude, lock, quality, blend).
+- `[METER]` — calibration window at startup and periodic session min/max with floor/ceil suggestions.
+- `[BW]` — adaptive bandwidth controller decisions and applied changes.
+- `[EQ]` — multipath equalizer's smoothed envelope-error metric (only emitted when the equalizer is enabled and verbose logging is on).
 
 ### Platform conditionals
 

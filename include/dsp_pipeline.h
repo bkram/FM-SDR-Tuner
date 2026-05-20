@@ -66,6 +66,12 @@ private:
   size_t m_iqStagingReadPos = 0;
   size_t m_iqStagingWritePos = 0;
   size_t m_iqStagingSize = 0;
+  // Deferred-reset gate. setBandwidthHz / setDeemphasisMode previously called
+  // m_stereo.reset() + m_afPost.reset() inline, so two back-to-back retune
+  // setters (common on fast XDR retunes) would zero the audio-chain IIR state
+  // twice mid-block and produce audible thumps. Now those setters mark this
+  // flag; process() consumes it once at the next block boundary.
+  bool m_pendingAudioReset = false;
   std::vector<std::complex<float>> m_iqDecimatedComplex;
   std::vector<float> m_demodBuffer;
   std::vector<float> m_stereoLeft;

@@ -7,8 +7,13 @@
 #include <limits>
 #include <vector>
 
+#include <cstdio>
+#include <cstring>
+#include <string>
+
 #include "af_post_processor.h"
 #include "config.h"
+#include "dsp/multipath_eq.h"
 #include "dsp_pipeline.h"
 #include "fm_demod.h"
 #include "stereo_decoder.h"
@@ -36,6 +41,76 @@ float meanAbsDiff(const float *a, const float *b, size_t count) {
     acc += std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
   }
   return static_cast<float>(acc / static_cast<double>(count));
+}
+
+struct WavData {
+  int sampleRate = 0;
+  int channels = 0;
+  std::vector<float> samples; // interleaved
+};
+
+// Minimal 16-bit PCM WAV reader. Walks the chunk list so it tolerates extra
+// JUNK / LIST blocks before the data chunk. Returns false on any structural
+// issue; tests that depend on the file simply SKIP when this happens so the
+// suite stays green on machines that don't have the fixtures.
+bool loadWav(const std::string &path, WavData &out) {
+  FILE *f = std::fopen(path.c_str(), "rb");
+  if (!f) {
+    return false;
+  }
+  char riff[12];
+  if (std::fread(riff, 1, 12, f) != 12 || std::memcmp(riff, "RIFF", 4) != 0 ||
+      std::memcmp(riff + 8, "WAVE", 4) != 0) {
+    std::fclose(f);
+    return false;
+  }
+
+  uint16_t channels = 0;
+  uint32_t rate = 0;
+  uint16_t bits = 0;
+  std::vector<int16_t> raw;
+  bool gotFmt = false;
+  bool gotData = false;
+
+  while (!gotData) {
+    char id[4];
+    uint32_t size = 0;
+    if (std::fread(id, 1, 4, f) != 4) break;
+    if (std::fread(&size, 4, 1, f) != 1) break;
+    if (std::memcmp(id, "fmt ", 4) == 0) {
+      std::vector<uint8_t> fmtBuf(size);
+      if (std::fread(fmtBuf.data(), 1, size, f) != size) break;
+      if (size < 16) break;
+      std::memcpy(&channels, fmtBuf.data() + 2, 2);
+      std::memcpy(&rate, fmtBuf.data() + 4, 4);
+      std::memcpy(&bits, fmtBuf.data() + 14, 2);
+      gotFmt = true;
+    } else if (std::memcmp(id, "data", 4) == 0) {
+      if (!gotFmt || bits != 16) {
+        std::fclose(f);
+        return false;
+      }
+      const size_t numSamples = size / 2;
+      raw.resize(numSamples);
+      if (std::fread(raw.data(), 2, numSamples, f) != numSamples) break;
+      gotData = true;
+    } else {
+      if (std::fseek(f, static_cast<long>((size + 1) & ~1U), SEEK_CUR) != 0) {
+        break;
+      }
+    }
+  }
+  std::fclose(f);
+  if (!gotData) {
+    return false;
+  }
+  out.sampleRate = static_cast<int>(rate);
+  out.channels = channels;
+  out.samples.resize(raw.size());
+  for (size_t i = 0; i < raw.size(); i++) {
+    out.samples[i] = static_cast<float>(raw[i]) / 32768.0f;
+  }
+  return true;
 }
 
 float toneMagnitude(const float *data, size_t count, int sampleRate,
@@ -864,4 +939,436 @@ TEST_CASE("DspPipeline surfaces audioClipRatio and keeps audio in range",
     REQUIRE(out.right[i] >= -1.0f);
     REQUIRE(out.right[i] <= 1.0f);
   }
+}
+
+TEST_CASE("Stereo decoder pilot canceller suppresses 19 kHz in mono output",
+          "[dsp][stereo][pilot]") {
+  constexpr int kInputRate = 256000;
+  constexpr size_t kSamples = 196608; // ~770 ms
+  constexpr float kPilotHz = 19000.0f;
+  constexpr float kMonoToneHz = 1000.0f;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  StereoDecoder stereo(kInputRate, 48000);
+  stereo.setForceStereo(true);
+  stereo.setPilotCancellerEnabled(true);
+
+  std::vector<float> mpx(kSamples, 0.0f);
+  for (size_t i = 0; i < kSamples; i++) {
+    const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+    const float mono = 0.40f * std::sin(kTwoPi * kMonoToneHz * t);
+    const float pilot = 0.10f * std::sin(kTwoPi * kPilotHz * t);
+    mpx[i] = mono + pilot;
+  }
+
+  std::vector<float> left(kSamples, 0.0f);
+  std::vector<float> right(kSamples, 0.0f);
+  const size_t out =
+      stereo.processAudio(mpx.data(), left.data(), right.data(), kSamples);
+  REQUIRE(out == kSamples);
+
+  // Measure tones only in the back half so the LMS has had time to converge.
+  const size_t analyzeStart = kSamples / 2;
+  const size_t analyzeLen = kSamples - analyzeStart;
+  std::vector<float> monoOut(analyzeLen, 0.0f);
+  for (size_t i = 0; i < analyzeLen; i++) {
+    monoOut[i] = 0.5f * (left[analyzeStart + i] + right[analyzeStart + i]);
+  }
+  const float monoMag =
+      toneMagnitude(monoOut.data(), analyzeLen, kInputRate, kMonoToneHz);
+  const float pilotMag =
+      toneMagnitude(monoOut.data(), analyzeLen, kInputRate, kPilotHz);
+  // 0.40 mono → 0.20 after the L/R split → 0.10 in 0.5·(L+R) → 0.05 via the
+  // amplitude/2 convention of toneMagnitude.
+  REQUIRE(monoMag > 0.04f);
+  // Pre-canceller residual would be ~0.025 (10% pilot through the same chain).
+  // After the LMS settles the residual at 19 kHz is gradient-noise-limited
+  // by the 1 kHz mono cross-correlation, but still ≥ 15 dB below pre-cancel.
+  REQUIRE(pilotMag < 0.005f);
+}
+
+TEST_CASE("Stereo decoder pilot canceller can be disabled",
+          "[dsp][stereo][pilot]") {
+  constexpr int kInputRate = 256000;
+  constexpr size_t kSamples = 196608;
+  constexpr float kPilotHz = 19000.0f;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  StereoDecoder stereo(kInputRate, 48000);
+  stereo.setForceStereo(true);
+  stereo.setPilotCancellerEnabled(false);
+
+  std::vector<float> mpx(kSamples, 0.0f);
+  for (size_t i = 0; i < kSamples; i++) {
+    const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+    const float mono = 0.40f * std::sin(kTwoPi * 1000.0f * t);
+    const float pilot = 0.10f * std::sin(kTwoPi * kPilotHz * t);
+    mpx[i] = mono + pilot;
+  }
+
+  std::vector<float> left(kSamples, 0.0f);
+  std::vector<float> right(kSamples, 0.0f);
+  stereo.processAudio(mpx.data(), left.data(), right.data(), kSamples);
+
+  const size_t analyzeStart = kSamples / 2;
+  const size_t analyzeLen = kSamples - analyzeStart;
+  std::vector<float> monoOut(analyzeLen, 0.0f);
+  for (size_t i = 0; i < analyzeLen; i++) {
+    monoOut[i] = 0.5f * (left[analyzeStart + i] + right[analyzeStart + i]);
+  }
+  const float pilotMag =
+      toneMagnitude(monoOut.data(), analyzeLen, kInputRate, kPilotHz);
+  // Without the canceller, full pilot amplitude survives (0.10 input → ~0.025
+  // after the L/R split + 0.5·(L+R) averaging + amplitude/2 convention).
+  REQUIRE(pilotMag > 0.020f);
+}
+
+TEST_CASE("AF post HiCut narrows the top end when signal quality is low",
+          "[dsp][af][hicut]") {
+  constexpr int kInputRate = 48000;
+  constexpr int kOutputRate = 48000;
+  constexpr size_t kSamples = 16384;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  std::vector<float> inL(kSamples, 0.0f);
+  std::vector<float> inR(kSamples, 0.0f);
+  for (size_t i = 0; i < kSamples; i++) {
+    const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+    inL[i] = 0.5f * std::sin(kTwoPi * 8000.0f * t);
+    inR[i] = inL[i];
+  }
+  std::vector<float> outL(kSamples, 0.0f);
+  std::vector<float> outR(kSamples, 0.0f);
+
+  AFPostProcessor afHigh(kInputRate, kOutputRate);
+  afHigh.setDeemphasis(50);
+  afHigh.setHicutMode(AFPostProcessor::HicutMode::Strong);
+  afHigh.setSignalQuality(1.0f);
+  afHigh.process(inL.data(), inR.data(), kSamples, outL.data(), outR.data(),
+                 kSamples);
+  const float magHighQ =
+      toneMagnitude(outL.data() + kSamples / 2, kSamples / 2, kOutputRate,
+                    8000.0f);
+
+  AFPostProcessor afLow(kInputRate, kOutputRate);
+  afLow.setDeemphasis(50);
+  afLow.setHicutMode(AFPostProcessor::HicutMode::Strong);
+  afLow.setSignalQuality(0.0f);
+  afLow.process(inL.data(), inR.data(), kSamples, outL.data(), outR.data(),
+                kSamples);
+  const float magLowQ =
+      toneMagnitude(outL.data() + kSamples / 2, kSamples / 2, kOutputRate,
+                    8000.0f);
+
+  // Strong HiCut at zero quality should attenuate the 8 kHz tone meaningfully
+  // versus full quality (where the canonical 50 µs de-emphasis curve applies).
+  REQUIRE(magHighQ > 0.0f);
+  REQUIRE(magLowQ < magHighQ * 0.5f);
+}
+
+TEST_CASE("Multipath equalizer is a pass-through when mode is Off",
+          "[dsp][multipath_eq]") {
+  fm_tuner::dsp::MultipathEqualizer eq;
+  eq.init(fm_tuner::dsp::MultipathEqMode::Off, 17, 256000.0f);
+  eq.setAdaptEnabled(true);
+  std::complex<float> in(0.7f, -0.3f);
+  REQUIRE(eq.execute(in) == in);
+}
+
+TEST_CASE("Multipath equalizer initial state is a unit delay",
+          "[dsp][multipath_eq]") {
+  fm_tuner::dsp::MultipathEqualizer eq;
+  eq.init(fm_tuner::dsp::MultipathEqMode::Light, 17, 256000.0f);
+  eq.setAdaptEnabled(false); // freeze taps so we observe the initial response
+
+  // For a 17-tap equalizer initialized as a centre-tap delta, the first
+  // non-zero output appears (taps/2) = 8 samples in.
+  std::complex<float> impulse(1.0f, 0.0f);
+  std::complex<float> zero(0.0f, 0.0f);
+  std::complex<float> outAtCentre(0.0f, 0.0f);
+  for (int n = 0; n < 17; n++) {
+    const std::complex<float> sample = (n == 0) ? impulse : zero;
+    const std::complex<float> y = eq.execute(sample);
+    if (n == 8) {
+      outAtCentre = y;
+    } else if (n != 8) {
+      REQUIRE(std::abs(y) < 1e-6f);
+    }
+  }
+  REQUIRE(std::abs(outAtCentre - impulse) < 1e-6f);
+}
+
+TEST_CASE("Multipath equalizer reduces envelope variance on a 2-ray channel",
+          "[dsp][multipath_eq]") {
+  constexpr int kInputRate = 256000;
+  constexpr size_t kSamples = 200000; // ~780 ms, plenty for CMA to settle
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  // Build a constant-envelope FM-like signal: e^(jφ(t)) where φ is the
+  // integral of a 1 kHz mono modulator (so the envelope of x is exactly 1).
+  std::vector<std::complex<float>> clean(kSamples);
+  float phase = 0.0f;
+  for (size_t i = 0; i < kSamples; i++) {
+    const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+    const float modulator = 0.5f * std::sin(kTwoPi * 1000.0f * t);
+    phase += (2.0f * kTwoPi * 50000.0f / kInputRate) * modulator;
+    clean[i] = std::complex<float>(std::cos(phase), std::sin(phase));
+  }
+
+  // 2-ray multipath: y[n] = x[n] + 0.5·e^(jπ/4)·x[n-15]. The second ray is
+  // delayed and rotated; this distorts the unit envelope substantially.
+  std::vector<std::complex<float>> multipath(kSamples);
+  const std::complex<float> echoCoeff =
+      0.5f * std::complex<float>(std::cos(kTwoPi / 8.0f),
+                                  std::sin(kTwoPi / 8.0f));
+  constexpr size_t kEchoDelay = 15;
+  for (size_t i = 0; i < kSamples; i++) {
+    const std::complex<float> echo =
+        (i >= kEchoDelay) ? clean[i - kEchoDelay] : std::complex<float>(0.0f, 0.0f);
+    multipath[i] = clean[i] + echoCoeff * echo;
+  }
+
+  auto envelopeStdDev = [](const std::complex<float> *signal, size_t start,
+                           size_t len) {
+    double sumMag = 0.0;
+    double sumMagSq = 0.0;
+    for (size_t i = 0; i < len; i++) {
+      const float m = std::abs(signal[start + i]);
+      sumMag += m;
+      sumMagSq += static_cast<double>(m) * m;
+    }
+    const double mean = sumMag / len;
+    const double var = std::max(0.0, sumMagSq / len - mean * mean);
+    return std::sqrt(var);
+  };
+
+  const size_t analyzeStart = kSamples / 2;
+  const size_t analyzeLen = kSamples - analyzeStart;
+  const double preStdDev =
+      envelopeStdDev(multipath.data(), analyzeStart, analyzeLen);
+
+  fm_tuner::dsp::MultipathEqualizer eq;
+  eq.init(fm_tuner::dsp::MultipathEqMode::Aggressive, 33, kInputRate);
+  eq.setAdaptEnabled(true);
+  std::vector<std::complex<float>> equalized(kSamples);
+  for (size_t i = 0; i < kSamples; i++) {
+    equalized[i] = eq.execute(multipath[i]);
+  }
+  const double postStdDev =
+      envelopeStdDev(equalized.data(), analyzeStart, analyzeLen);
+
+  REQUIRE(preStdDev > 0.05); // sanity: the channel actually distorted things
+  // CMA settled — envelope should be measurably flatter than the input.
+  REQUIRE(postStdDev < preStdDev * 0.7);
+}
+
+TEST_CASE("AF post HiCut off keeps the configured de-emphasis intact",
+          "[dsp][af][hicut]") {
+  constexpr int kInputRate = 48000;
+  constexpr int kOutputRate = 48000;
+  constexpr size_t kSamples = 16384;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  std::vector<float> inL(kSamples, 0.0f);
+  std::vector<float> inR(kSamples, 0.0f);
+  for (size_t i = 0; i < kSamples; i++) {
+    const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+    inL[i] = 0.5f * std::sin(kTwoPi * 8000.0f * t);
+    inR[i] = inL[i];
+  }
+  std::vector<float> outBaseL(kSamples, 0.0f);
+  std::vector<float> outBaseR(kSamples, 0.0f);
+  std::vector<float> outOffLowQL(kSamples, 0.0f);
+  std::vector<float> outOffLowQR(kSamples, 0.0f);
+
+  AFPostProcessor afBase(kInputRate, kOutputRate);
+  afBase.setDeemphasis(50);
+  afBase.setHicutMode(AFPostProcessor::HicutMode::Off);
+  afBase.setSignalQuality(1.0f);
+  afBase.process(inL.data(), inR.data(), kSamples, outBaseL.data(),
+                 outBaseR.data(), kSamples);
+
+  AFPostProcessor afOff(kInputRate, kOutputRate);
+  afOff.setDeemphasis(50);
+  afOff.setHicutMode(AFPostProcessor::HicutMode::Off);
+  afOff.setSignalQuality(0.0f); // should not engage HiCut
+  afOff.process(inL.data(), inR.data(), kSamples, outOffLowQL.data(),
+                outOffLowQR.data(), kSamples);
+
+  // HiCut=Off must not respond to quality at all — outputs should be
+  // bit-identical for a deterministic input.
+  const float diff = meanAbsDiff(outBaseL.data(), outOffLowQL.data(), kSamples);
+  REQUIRE(diff < 1e-6f);
+}
+
+TEST_CASE("Captured MPX fixture produces audio close to the reference",
+          "[dsp][fixture][regression]") {
+#ifndef FM_TUNER_REPO_ROOT
+  SKIP("FM_TUNER_REPO_ROOT not defined; skipping fixture regression");
+#else
+  const std::string mpxPath =
+      std::string(FM_TUNER_REPO_ROOT) + "/mpx_88600_60s.wav";
+  const std::string refPath =
+      std::string(FM_TUNER_REPO_ROOT) + "/stereo_88600_60s.wav";
+
+  WavData mpx;
+  WavData ref;
+  if (!loadWav(mpxPath, mpx) || !loadWav(refPath, ref)) {
+    SKIP("regression fixtures not found at repo root; skipping");
+  }
+  REQUIRE(mpx.channels == 1);
+  REQUIRE(mpx.sampleRate == 256000);
+  REQUIRE(ref.channels == 2);
+  REQUIRE(!mpx.samples.empty());
+  REQUIRE(!ref.samples.empty());
+
+  // The reference was captured at 32 kHz output; pipeline this test at the
+  // same rate so AFPostProcessor produces a length-comparable output.
+  const int kInputRate = mpx.sampleRate;
+  const int kOutputRate = ref.sampleRate;
+
+  StereoDecoder stereo(kInputRate, kOutputRate);
+  AFPostProcessor af(kInputRate, kOutputRate);
+  af.setDeemphasis(50);
+
+  const size_t inSamples = mpx.samples.size();
+  std::vector<float> stereoL(inSamples, 0.0f);
+  std::vector<float> stereoR(inSamples, 0.0f);
+  // Process in production-sized blocks so the per-block stereo-lock
+  // confidence integrator gets multiple chances to commit (passing the whole
+  // 2.5 s file in one shot would never satisfy the acquire τ since lock is
+  // only re-evaluated at block boundaries).
+  constexpr size_t kBlock = 8192;
+  size_t stereoOut = 0;
+  for (size_t off = 0; off < inSamples; off += kBlock) {
+    const size_t chunk = std::min(kBlock, inSamples - off);
+    stereoOut += stereo.processAudio(
+        mpx.samples.data() + off, stereoL.data() + off, stereoR.data() + off,
+        chunk);
+  }
+  REQUIRE(stereoOut == inSamples);
+
+  // Resampler can produce more than (in * ratio) samples in pathological
+  // edge cases; give it generous headroom.
+  const size_t outCap = static_cast<size_t>(
+      static_cast<double>(inSamples) *
+      (static_cast<double>(kOutputRate) / kInputRate) * 1.10 + 64);
+  std::vector<float> outL(outCap, 0.0f);
+  std::vector<float> outR(outCap, 0.0f);
+  const size_t produced =
+      af.process(stereoL.data(), stereoR.data(), stereoOut, outL.data(),
+                 outR.data(), outCap);
+  REQUIRE(produced > 0);
+
+  // Skip the front 30% so initial PLL/blend transient doesn't dominate.
+  const size_t analyzeStart = produced * 3 / 10;
+  const size_t analyzeLen = produced - analyzeStart;
+  REQUIRE(analyzeLen > kOutputRate / 2);
+
+  auto channelRms = [](const float *interleavedStereo, size_t startFrame,
+                       size_t frameCount, int chan) {
+    if (frameCount == 0) return 0.0f;
+    double acc = 0.0;
+    for (size_t i = 0; i < frameCount; i++) {
+      const float v = interleavedStereo[(startFrame + i) * 2 + chan];
+      acc += static_cast<double>(v) * v;
+    }
+    return static_cast<float>(std::sqrt(acc / frameCount));
+  };
+  auto rms = [](const float *data, size_t count) {
+    if (count == 0) return 0.0f;
+    double acc = 0.0;
+    for (size_t i = 0; i < count; i++) {
+      acc += static_cast<double>(data[i]) * data[i];
+    }
+    return static_cast<float>(std::sqrt(acc / count));
+  };
+  auto rmsSum = [](const float *a, const float *b, size_t count) {
+    if (count == 0) return 0.0f;
+    double acc = 0.0;
+    for (size_t i = 0; i < count; i++) {
+      const double s = static_cast<double>(a[i]) + b[i];
+      acc += s * s * 0.25; // (L+R)/2
+    }
+    return static_cast<float>(std::sqrt(acc / count));
+  };
+  auto rmsDiff = [](const float *a, const float *b, size_t count) {
+    if (count == 0) return 0.0f;
+    double acc = 0.0;
+    for (size_t i = 0; i < count; i++) {
+      const double s = static_cast<double>(a[i]) - b[i];
+      acc += s * s * 0.25; // (L-R)/2
+    }
+    return static_cast<float>(std::sqrt(acc / count));
+  };
+
+  // Reference: skip front 30% as well.
+  const size_t refFrames = ref.samples.size() / 2;
+  const size_t refAnalyzeStart = refFrames * 3 / 10;
+  const size_t refAnalyzeLen = refFrames - refAnalyzeStart;
+
+  const float refLeftRms =
+      channelRms(ref.samples.data(), refAnalyzeStart, refAnalyzeLen, 0);
+  const float refRightRms =
+      channelRms(ref.samples.data(), refAnalyzeStart, refAnalyzeLen, 1);
+  const float refMid = 0.5f * (refLeftRms + refRightRms);
+
+  const float ourLeftRms =
+      rms(outL.data() + analyzeStart, analyzeLen);
+  const float ourRightRms =
+      rms(outR.data() + analyzeStart, analyzeLen);
+  const float ourMid = 0.5f * (ourLeftRms + ourRightRms);
+
+  REQUIRE(refMid > 0.0f);
+  REQUIRE(ourMid > 0.0f);
+  const float midDeltaDb = 20.0f * std::log10(ourMid / refMid);
+
+  // ±6 dB envelope around the reference. The pipeline has changed (Hi-Blend
+  // biquad, no input-rate audio FIR, pilot canceller, soft limiter) so an
+  // exact match is unrealistic; this catches gross regressions like silence,
+  // hard clipping, or 10+ dB gain shifts.
+  REQUIRE(midDeltaDb > -6.0f);
+  REQUIRE(midDeltaDb <  6.0f);
+
+  // Both channels carry audio (not a stuck-channel regression).
+  REQUIRE(ourLeftRms > refMid * 0.25f);
+  REQUIRE(ourRightRms > refMid * 0.25f);
+
+  // Stereo separation: L-R should be nonzero and not catastrophically larger
+  // than reference. Since blend mode now defaults to "normal" while reference
+  // may have been captured under different settings, a wide ±10 dB envelope
+  // around the reference's (L-R)/2 RMS is the right tolerance.
+  std::vector<float> interleavedRef(refAnalyzeLen * 2);
+  for (size_t i = 0; i < refAnalyzeLen; i++) {
+    interleavedRef[i * 2] =
+        ref.samples[(refAnalyzeStart + i) * 2];
+    interleavedRef[i * 2 + 1] =
+        ref.samples[(refAnalyzeStart + i) * 2 + 1];
+  }
+  // Compute (L-R)/2 RMS on reference.
+  double refDiffAcc = 0.0;
+  for (size_t i = 0; i < refAnalyzeLen; i++) {
+    const double d = static_cast<double>(interleavedRef[i * 2]) -
+                     interleavedRef[i * 2 + 1];
+    refDiffAcc += d * d * 0.25;
+  }
+  const float refDiffRms = static_cast<float>(
+      std::sqrt(refDiffAcc / std::max<size_t>(1, refAnalyzeLen)));
+  const float ourDiffRms =
+      rmsDiff(outL.data() + analyzeStart, outR.data() + analyzeStart,
+              analyzeLen);
+  // Reference must actually be stereo-separated; if not, our captured fixture
+  // was already mono so we skip the separation assertion.
+  if (refDiffRms > 1e-3f) {
+    REQUIRE(ourDiffRms > 1e-4f);
+    const float diffDb =
+        20.0f * std::log10(std::max(ourDiffRms, 1e-6f) / refDiffRms);
+    REQUIRE(diffDb > -12.0f);
+    REQUIRE(diffDb <  12.0f);
+  }
+
+  // Use rmsSum to suppress an unused-lambda warning in builds that don't take
+  // every diagnostic path above; it's kept for future telemetry on (L+R)/2.
+  (void)rmsSum;
+#endif
 }

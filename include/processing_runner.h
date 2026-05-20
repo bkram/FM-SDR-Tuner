@@ -8,6 +8,7 @@
 #include "audio_output.h"
 #include "config.h"
 #include "dsp_pipeline.h"
+#include "mpx_audio_output.h"
 #include "rds_worker.h"
 #include "signal_level.h"
 #include "wav_writer.h"
@@ -26,7 +27,8 @@ bool processAudioBlock(
     bool targetForceMono, bool &appliedEffectiveForceMono, DspPipeline &dspPipeline,
     RdsWorker &rdsWorker, XDRServer &xdrServer,
     size_t &retuneMuteSamplesRemaining, size_t &retuneMuteTotalSamples,
-    AudioOutput &audioOut, WavWriter *mpxWavOut);
+    AudioOutput &audioOut, WavWriter *mpxWavOut,
+    MpxAudioOutput *mpxAudioOut = nullptr);
 
 } // namespace processing_runner
 

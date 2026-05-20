@@ -2,6 +2,7 @@
 #define FM_DEMOD_H
 
 #include "dsp/liquid_primitives.h"
+#include "dsp/multipath_eq.h"
 #include <array>
 #include <complex>
 #include <stddef.h>
@@ -32,6 +33,14 @@ public:
   void setBandwidthHz(int bwHz);
   void setW0BandwidthHz(int bwHz);
   void setDspAgcMode(DspAgcMode mode);
+  void setMultipathEqMode(fm_tuner::dsp::MultipathEqMode mode,
+                          std::uint32_t taps = 17);
+  void setMultipathAdaptEnabled(bool enabled) {
+    m_liquidMultipathEq.setAdaptEnabled(enabled);
+  }
+  float getMultipathEnvelopeError() const {
+    return m_liquidMultipathEq.envelopeError();
+  }
   bool isClipping() const { return m_clipping; }
   float getClippingRatio() const { return m_clippingRatio; }
   double getFilteredChannelPowerDbfs() const { return m_filteredChannelPowerDbfs; }
@@ -64,6 +73,7 @@ private:
   fm_tuner::dsp::liquid::IIRFilterReal m_liquidMonoDcBlock;
   fm_tuner::dsp::liquid::Resampler m_liquidMonoResampler;
   fm_tuner::dsp::liquid::AGC m_liquidIqAgc;
+  fm_tuner::dsp::MultipathEqualizer m_liquidMultipathEq;
   std::array<float, fm_tuner::dsp::liquid::Resampler::kMaxOutput>
       m_liquidResampleTmp{};
 };

@@ -12,6 +12,7 @@
 
 class AudioOutput;
 class CPUFeatures;
+class MpxAudioOutput;
 class TunerSession;
 class WavWriter;
 class XDRServer;
@@ -29,6 +30,8 @@ private:
   FILE *openIqCapture(AudioOutput &audioOut, TunerSession &tunerSession) const;
   bool initMpxCapture(WavWriter &mpxWavOut, TunerSession &tunerSession,
                       uint32_t sampleRate) const;
+  bool initMpxAudio(MpxAudioOutput &mpxAudioOut, TunerSession &tunerSession,
+                    uint32_t sourceSampleRate) const;
   bool readIqSamples(
       const std::function<size_t(uint8_t *, size_t)> &tunerReadIQ,
       const std::function<void(const uint8_t *, size_t)> &writeIqCapture,

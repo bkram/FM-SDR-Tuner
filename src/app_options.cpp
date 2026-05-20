@@ -46,13 +46,23 @@ void printUsage(const char *prog) {
       << "  -b, --blend <mode>    Stereo blend: soft|normal|aggressive (default: "
          "config, normal)\n"
       << "  -w, --wav <file>      Output WAV file\n"
-      << "      --mpx-wav <file>  Output decoded MPX WAV file (mono, 256000 Hz)\n"
+      << "      --mpx-wav <file>  Output decoded MPX WAV file (mono)\n"
+      << "      --mpx-rate <hz>   MPX sample rate (default: match IQ rate;"
+         " 192000 = common rate for RDS/spectrum analysis & FM exciter input;"
+         " applies to both --mpx-wav and --mpx-audio)\n"
+      << "      --mpx-audio       Send live MPX to an audio device (mono, "
+         "uses --mpx-rate, defaults to 192000)\n"
+      << "      --mpx-audio-device <id>\n"
+      << "                        Audio device for live MPX output (name "
+         "substring or default-device if empty)\n"
       << "  -i, --iq <file>       Capture raw IQ bytes to file\n"
       << "      --low-latency-iq  Keep newest IQ samples (drop backlog on "
          "overload)\n"
       << "      --auto-start      Start tuner immediately without waiting for "
          "an XDR start command\n"
       << "  -s, --audio           Enable audio output\n"
+      << "      --no-audio        Disable the 48 kHz audio output (overrides "
+         "[audio] enable_audio=true); use with --mpx-audio / -w / -i\n"
       << "  -l, --list-audio      List available audio output devices\n"
       << "  -d, --device <id>     Audio output device (index or name)\n"
       << "  -P, --password <pwd>   XDR server password\n"
@@ -194,6 +204,12 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
       result.outcome = AppParseOutcome::ExitSuccess;
       return result;
     }
+    if (arg == "--no-audio") {
+      // Explicit override that wins over [audio] enable_audio = true. Useful
+      // for runs that only want --mpx-audio / --mpx-wav / -i and no speaker.
+      opts.enableSpeaker = false;
+      continue;
+    }
     if (arg == "-s" || arg == "--audio") {
       opts.enableSpeaker = true;
       continue;
@@ -314,6 +330,45 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
       opts.mpxWavFile = value;
       continue;
     }
+    if (arg == "--mpx-audio") {
+      opts.mpxAudioEnabled = true;
+      continue;
+    }
+    if (arg == "--mpx-audio-device" ||
+        arg.rfind("--mpx-audio-device=", 0) == 0) {
+      const std::string value = readValue(i, arg, "mpx-audio-device");
+      if (value.empty()) {
+        std::cerr << "[CLI] missing value for --mpx-audio-device\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      opts.mpxAudioDevice = value;
+      opts.mpxAudioEnabled = true;
+      continue;
+    }
+    if (arg == "--mpx-rate" || arg.rfind("--mpx-rate=", 0) == 0) {
+      const std::string value = readValue(i, arg, "mpx-rate");
+      if (value.empty()) {
+        std::cerr << "[CLI] missing value for --mpx-rate\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      try {
+        const long parsed = std::stol(value);
+        if (parsed < 8000 || parsed > 384000) {
+          std::cerr << "[CLI] --mpx-rate out of range [8000, 384000]: " << value
+                    << "\n";
+          result.outcome = AppParseOutcome::ExitFailure;
+          return result;
+        }
+        opts.mpxWavSampleRate = static_cast<uint32_t>(parsed);
+      } catch (const std::exception &) {
+        std::cerr << "[CLI] invalid --mpx-rate value: " << value << "\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      continue;
+    }
     if (arg == "-i" || arg == "--iq" || arg.rfind("--iq=", 0) == 0) {
       const std::string value = readValue(i, arg, "iq");
       if (value.empty()) {
@@ -366,9 +421,9 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
   }
 
   if (opts.wavFile.empty() && opts.mpxWavFile.empty() && opts.iqFile.empty() &&
-      !opts.enableSpeaker) {
+      !opts.enableSpeaker && !opts.mpxAudioEnabled) {
     std::cerr << "[CLI] error: must specify at least one output: -w (wav), -i "
-                 "(iq), --mpx-wav, or -s (audio)\n";
+                 "(iq), --mpx-wav, --mpx-audio, or -s (audio)\n";
     printUsage(argv[0]);
     result.outcome = AppParseOutcome::ExitFailure;
     return result;
