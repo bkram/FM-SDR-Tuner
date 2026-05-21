@@ -2,6 +2,11 @@
 
 #include <sstream>
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <immintrin.h>
+#include <intrin.h>
+#endif
+
 CPUFeatures detectCPUFeatures() {
   CPUFeatures out;
 
@@ -15,6 +20,26 @@ CPUFeatures detectCPUFeatures() {
   out.avx = __builtin_cpu_supports("avx");
   out.avx2 = __builtin_cpu_supports("avx2");
   out.fma = __builtin_cpu_supports("fma");
+#elif defined(_MSC_VER)
+  int regs[4] = {0, 0, 0, 0};
+  __cpuid(regs, 1);
+  out.sse2 = (regs[3] & (1 << 26)) != 0;
+  out.sse41 = (regs[2] & (1 << 19)) != 0;
+  const bool osxsave = (regs[2] & (1 << 27)) != 0;
+  const bool cpuAvx = (regs[2] & (1 << 28)) != 0;
+  const bool cpuFma = (regs[2] & (1 << 12)) != 0;
+  bool osYmm = false;
+  if (osxsave && cpuAvx) {
+    const unsigned long long xcr0 = _xgetbv(0);
+    osYmm = (xcr0 & 0x6ULL) == 0x6ULL;
+  }
+  out.avx = cpuAvx && osYmm;
+  out.fma = cpuFma && out.avx;
+  if (out.avx) {
+    int regs7[4] = {0, 0, 0, 0};
+    __cpuidex(regs7, 7, 0);
+    out.avx2 = (regs7[1] & (1 << 5)) != 0;
+  }
 #endif
 #endif
 

@@ -59,7 +59,8 @@ FIRFilter::~FIRFilter() {
     }
 }
 
-void FIRFilter::init(std::uint32_t length, float cutoff, float stopBandAtten, float center) {
+void FIRFilter::init(std::uint32_t length, float cutoff, float stopBandAtten, float center,
+                      bool l1Normalize) {
     if (m_object != nullptr) {
         firfilt_crcf_destroy(m_object);
     }
@@ -67,15 +68,52 @@ void FIRFilter::init(std::uint32_t length, float cutoff, float stopBandAtten, fl
     m_cutoff = cutoff;
     m_stopBandAtten = stopBandAtten;
     m_center = center;
+    m_l1Normalize = l1Normalize;
     m_useDirectTaps = false;
 
     if (std::abs(m_center) < 1e-6f) {
-        m_object = firfilt_crcf_create_kaiser(length, cutoff, stopBandAtten, 0.0f);
-        if (m_object == nullptr) {
-            throw std::runtime_error("failed to create liquid firfilt_crcf");
+        if (!l1Normalize) {
+            // Original Kaiser-create shortcut: liquid handles the design + scaling
+            // internally. Scale = 2·cutoff is the standard passband-gain
+            // compensation for lowpass Kaiser FIRs. L1 norm is not guaranteed.
+            m_object = firfilt_crcf_create_kaiser(length, cutoff, stopBandAtten, 0.0f);
+            if (m_object == nullptr) {
+                throw std::runtime_error("failed to create liquid firfilt_crcf");
+            }
+            m_taps.clear();
+            m_scale = 2.0f * m_cutoff;
+            firfilt_crcf_set_scale(m_object, m_scale);
+            return;
         }
-        m_taps.clear();
-        m_scale = 2.0f * m_cutoff;
+
+        // L1-normalized lowpass: design taps explicitly, compute sum(|tap|),
+        // and clamp the post-design scale so scale·L1 ≤ 1. The DC passband
+        // gain (scale·sum(tap)) shifts at most by min(1, 2·cutoff·L1) → 1,
+        // i.e. it drops by 20·log10(2·cutoff·L1) dB when L1 > 1/(2·cutoff).
+        // For typical FM lowpass at cutoff ≈ 0.45 the shift is < 1 dB.
+        m_taps.assign(length, 0.0f);
+#if FM_TUNER_LIQUID_FIRDES_KAISER_RETURNS_VOID
+        liquid_firdes_kaiser(length, cutoff, stopBandAtten, 0.0f, m_taps.data());
+#else
+        if (liquid_firdes_kaiser(length, cutoff, stopBandAtten, 0.0f, m_taps.data()) != LIQUID_OK) {
+            throw std::runtime_error("failed to design liquid kaiser taps");
+        }
+#endif
+        double sumAbs = 0.0;
+        for (float tap : m_taps) {
+            sumAbs += std::abs(tap);
+        }
+        const float nominalScale = 2.0f * m_cutoff;
+        // If the nominal scale already keeps L1·scale ≤ 1, leave it alone.
+        // Otherwise clamp scale to 1/L1 — gives |y| ≤ max|x|.
+        const float l1NormScale = (sumAbs > 1e-12)
+            ? static_cast<float>(1.0 / sumAbs)
+            : nominalScale;
+        m_scale = std::min(nominalScale, l1NormScale);
+        m_object = firfilt_crcf_create(m_taps.data(), length);
+        if (m_object == nullptr) {
+            throw std::runtime_error("failed to create liquid firfilt_crcf (L1 path)");
+        }
         firfilt_crcf_set_scale(m_object, m_scale);
         return;
     }

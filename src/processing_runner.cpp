@@ -38,7 +38,8 @@ bool processAudioBlock(
     bool targetForceMono, bool &appliedEffectiveForceMono, DspPipeline &dspPipeline,
     RdsWorker &rdsWorker, XDRServer &xdrServer,
     size_t &retuneMuteSamplesRemaining, size_t &retuneMuteTotalSamples,
-    AudioOutput &audioOut, WavWriter *mpxWavOut) {
+    AudioOutput &audioOut, WavWriter *mpxWavOut,
+    MpxAudioOutput *mpxAudioOut) {
   SignalLevelResult signal = computeSignalLevel(
       iqBuffer, samples, effectiveAppliedGainDb, signalGainCompFactor,
       config.sdr.signal_bias_db, config.sdr.signal_floor_dbfs,
@@ -58,6 +59,9 @@ bool processAudioBlock(
         rdsWorker.enqueue(mpx, count);
         if (mpxWavOut != nullptr) {
           (void)mpxWavOut->enqueueMonoFloat(mpx, count);
+        }
+        if (mpxAudioOut != nullptr && mpxAudioOut->isOpen()) {
+          (void)mpxAudioOut->enqueueMpx(mpx, count);
         }
       },
       dspOut);
@@ -89,6 +93,41 @@ bool processAudioBlock(
   if (verboseLogging) {
     static uint32_t signalLogCount = 0;
     const uint32_t count = ++signalLogCount;
+
+    // [METER] observability: print the active calibration window once, and
+    // track the observed min/max compensated dBFS so the user can see whether
+    // their floor/ceil is too narrow (saturating the meter) or too wide
+    // (compressing the range). Suggested floor/ceil are reported every 100
+    // blocks once we have a usable spread.
+    static bool meterIntroLogged = false;
+    static double meterMinCompensated = std::numeric_limits<double>::infinity();
+    static double meterMaxCompensated = -std::numeric_limits<double>::infinity();
+    if (!meterIntroLogged) {
+      std::cout << "[METER] mapping window: floor=" << std::fixed
+                << std::setprecision(1) << config.sdr.signal_floor_dbfs
+                << " dBFS, ceil=" << config.sdr.signal_ceil_dbfs
+                << " dBFS (range "
+                << (config.sdr.signal_ceil_dbfs - config.sdr.signal_floor_dbfs)
+                << " dB), bias=" << config.sdr.signal_bias_db << " dB\n";
+      meterIntroLogged = true;
+    }
+    if (std::isfinite(displaySignal.compensatedDbfs)) {
+      meterMinCompensated =
+          std::min(meterMinCompensated, displaySignal.compensatedDbfs);
+      meterMaxCompensated =
+          std::max(meterMaxCompensated, displaySignal.compensatedDbfs);
+    }
+    if ((count % 100) == 0 && std::isfinite(meterMinCompensated) &&
+        std::isfinite(meterMaxCompensated) &&
+        (meterMaxCompensated - meterMinCompensated) > 5.0) {
+      std::cout << "[METER] session observed: min="
+                << std::setprecision(1) << meterMinCompensated
+                << " dBFS, max=" << meterMaxCompensated
+                << " dBFS — for full-scale meter consider floor≈"
+                << std::round(meterMinCompensated - 3.0)
+                << ", ceil≈" << std::round(meterMaxCompensated + 3.0) << "\n";
+    }
+
     if (count <= 5 || (count % 100) == 0) {
       std::cout << "[SIG] dbfs="
                 << formatMaybeDouble(displaySignal.dbfs, 2)
@@ -104,7 +143,11 @@ bool processAudioBlock(
       std::cout << "[ST] pilot=" << pilotTenthsKHz
                 << " stereo=" << (stereoDetected ? 1 : 0)
                 << " quality=" << std::setprecision(3) << stereoQuality
-                << " blend=" << stereoBlend << "\n";
+                << " blend=" << stereoBlend;
+      if (effectiveForceMono) {
+        std::cout << " forced=mono";
+      }
+      std::cout << "\n";
     }
 
     static bool overloadGhostHintActive = false;
@@ -130,9 +173,14 @@ bool processAudioBlock(
   const size_t outSamples = dspOut.outSamples;
   float *audioLeft = dspOut.left;
   float *audioRight = dspOut.right;
-  const bool stereoIndicator = stereoDetected ||
-                               (effectiveForceMono && config.processing.stereo &&
-                                pilotTenthsKHz >= 20);
+  // When the user has forced mono, the audio we deliver is mono regardless of
+  // what the decoder detects on the MPX. Clear the stereo indicator in that
+  // case so clients show a coherent "mono" state on both the audio and the
+  // signal-status flag. The forcedMono argument to updateSignal still
+  // distinguishes "forced mono" from "no pilot at all" via the XDR mode
+  // character ('M' / 'S' uppercase vs 'm' / 's' lowercase) for clients that
+  // honour the convention.
+  const bool stereoIndicator = stereoDetected && !effectiveForceMono;
   xdrServer.updateSignal(rfLevelFiltered, stereoIndicator, effectiveForceMono, -1,
                          -1);
   xdrServer.updatePilot(pilotTenthsKHz);

@@ -14,6 +14,7 @@
 #include "cpu_features.h"
 #include "dsp/runtime.h"
 #include "dsp_pipeline.h"
+#include "mpx_audio_output.h"
 #include "processing_runner.h"
 #include "rds_worker.h"
 #include "runtime_loop.h"
@@ -114,16 +115,88 @@ bool Application::initMpxCapture(WavWriter &mpxWavOut,
   if (m_options.mpxWavFile.empty()) {
     return true;
   }
-  if (!mpxWavOut.init(m_options.mpxWavFile, sampleRate, 1,
-                      m_options.verboseLogging, "MPX WAV")) {
+  // sampleRate is the rate at which MPX samples arrive from the DSP pipeline
+  // (= post-decimation IQ rate). If the user asked for a different on-disk
+  // rate we tell WavWriter to resample inline; otherwise the WAV is written
+  // at the native MPX rate (current behaviour).
+  const uint32_t targetRate = (m_options.mpxWavSampleRate != 0)
+                                  ? m_options.mpxWavSampleRate
+                                  : sampleRate;
+  if (!mpxWavOut.init(m_options.mpxWavFile, targetRate, 1,
+                      m_options.verboseLogging, "MPX WAV", sampleRate)) {
     std::cerr << "[MPX] failed to initialize MPX WAV output: "
               << m_options.mpxWavFile << "\n";
     tunerSession.disconnect();
     return false;
   }
   if (m_options.verboseLogging) {
-    std::cout << "[MPX] capture enabled: " << m_options.mpxWavFile
-              << " (" << sampleRate << " Hz mono)\n";
+    std::cout << "[MPX] capture enabled: " << m_options.mpxWavFile << " ("
+              << targetRate << " Hz mono";
+    if (targetRate != sampleRate) {
+      std::cout << ", resampled from " << sampleRate << " Hz";
+    }
+    std::cout << ")\n";
+  }
+  return true;
+}
+
+bool Application::initMpxAudio(MpxAudioOutput &mpxAudioOut,
+                               TunerSession &tunerSession,
+                               uint32_t sourceSampleRate) const {
+  if (!m_options.mpxAudioEnabled) {
+    return true;
+  }
+
+  // Collision guard: routing the 48 kHz stereo audio AND the live MPX to the
+  // same audio device produces a mix that's useless for both paths (Core
+  // Audio / ALSA will sum both streams onto the device). Best-effort check —
+  // we compare the (case-insensitive, trimmed) selectors. If both end up
+  // resolving to the same physical device we'd need OS-specific device-ID
+  // lookups; the string check catches the common cases (same name, both
+  // empty meaning system default).
+  if (m_options.enableSpeaker) {
+    auto normalize = [](std::string s) {
+      while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+        s.erase(s.begin());
+      }
+      while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+        s.pop_back();
+      }
+      std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+      return s;
+    };
+    const std::string audioSel = normalize(
+        !m_options.audioDevice.empty() ? m_options.audioDevice
+                                       : m_options.config.audio.device);
+    const std::string mpxSel = normalize(m_options.mpxAudioDevice);
+    const bool bothDefault = audioSel.empty() && mpxSel.empty();
+    const bool sameName = !audioSel.empty() && audioSel == mpxSel;
+    if (bothDefault || sameName) {
+      std::cerr
+          << "[MPX-AUDIO] refusing to start: the 48 kHz audio output and the "
+             "live MPX output are pointed at the same device "
+          << (bothDefault ? "(both unset → system default)" :
+                          ("('" + audioSel + "')"))
+          << ". They would be summed on the device and the MPX would be "
+             "corrupted. Pick a different --mpx-audio-device, or pass "
+             "--no-audio to disable the 48 kHz audio output.\n";
+      tunerSession.disconnect();
+      return false;
+    }
+  }
+
+  // Pick a target rate that preserves the full MPX spectrum (up to 75 kHz
+  // RDS sideband). Defaults to 192 kHz unless --mpx-rate overrides — same
+  // knob as the WAV path so the two sinks stay consistent.
+  const uint32_t targetRate =
+      (m_options.mpxWavSampleRate != 0) ? m_options.mpxWavSampleRate : 192000;
+  if (!mpxAudioOut.init(m_options.mpxAudioDevice, sourceSampleRate, targetRate,
+                        m_options.verboseLogging)) {
+    std::cerr << "[MPX-AUDIO] failed to initialize live MPX audio output\n";
+    tunerSession.disconnect();
+    return false;
   }
   return true;
 }
@@ -219,6 +292,8 @@ int Application::run() {
   auto &requestedVolume = xdrState.requestedVolume;
   auto &requestedDeemphasis = xdrState.requestedDeemphasis;
   auto &requestedForceMono = xdrState.requestedForceMono;
+  auto &requestedBlendMode = xdrState.requestedBlendMode;
+  auto &pendingBlendMode = xdrState.pendingBlendMode;
   auto &pendingFrequency = xdrState.pendingFrequency;
   auto &pendingGain = xdrState.pendingGain;
   auto &pendingAGC = xdrState.pendingAGC;
@@ -432,6 +507,7 @@ int Application::run() {
 
   AudioOutput audioOut;
   WavWriter mpxWavOut;
+  MpxAudioOutput mpxAudioOut;
   if (!initAudioOutput(audioOut, tunerSession, requestedVolume)) {
     return 1;
   }
@@ -439,9 +515,15 @@ int Application::run() {
     audioOut.shutdown();
     return 1;
   }
+  if (!initMpxAudio(mpxAudioOut, tunerSession, INPUT_RATE)) {
+    mpxWavOut.shutdown();
+    audioOut.shutdown();
+    return 1;
+  }
 
   FILE *iqHandle = openIqCapture(audioOut, tunerSession);
   if (!m_options.iqFile.empty() && !iqHandle) {
+    mpxAudioOut.shutdown();
     mpxWavOut.shutdown();
     return 1;
   }
@@ -517,6 +599,20 @@ int Application::run() {
   auto lastGainDown =
       std::chrono::steady_clock::now() - std::chrono::seconds(5);
   auto lastGainUp = std::chrono::steady_clock::now() - std::chrono::seconds(5);
+  fm_tuner::AdaptiveBandwidthState adaptiveBwState;
+  fm_tuner::AdaptiveBandwidthMode adaptiveBwMode =
+      fm_tuner::AdaptiveBandwidthMode::Off;
+  {
+    std::string raw = config.processing.adaptive_bandwidth;
+    std::transform(raw.begin(), raw.end(), raw.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    if (raw == "conservative") {
+      adaptiveBwMode = fm_tuner::AdaptiveBandwidthMode::Conservative;
+    } else if (raw == "aggressive") {
+      adaptiveBwMode = fm_tuner::AdaptiveBandwidthMode::Aggressive;
+    }
+  }
   auto restoreAfterScan = [&](uint32_t restoreFreqHz, int restoreBandwidthHz) {
     requestedBandwidthHz = restoreBandwidthHz;
     pendingBandwidth = true;
@@ -575,6 +671,23 @@ int Application::run() {
       appliedForceMono = targetForceMono;
     }
 
+    if (pendingBlendMode.exchange(false)) {
+      const int blend = std::clamp(requestedBlendMode.load(), 0, 2);
+      StereoDecoder::BlendMode mode = StereoDecoder::BlendMode::Normal;
+      const char *label = "normal";
+      if (blend == 0) {
+        mode = StereoDecoder::BlendMode::Soft;
+        label = "soft";
+      } else if (blend == 2) {
+        mode = StereoDecoder::BlendMode::Aggressive;
+        label = "aggressive";
+      }
+      dspPipeline.setBlendMode(mode);
+      if (verboseLogging) {
+        std::cout << "[XDR] stereo blend -> " << label << "\n";
+      }
+    }
+
     size_t samples = 0;
     if (!readIqSamples(tunerReadIQ, writeIqCapture, iqBuffer, SDR_BUF_SAMPLES,
                        noDataSleep, tunerSession, verboseLogging, samples)) {
@@ -591,14 +704,18 @@ int Application::run() {
               useSdrppGainStrategy, gain, isImsAgcEnabled(), requestedAGCMode,
               pendingAGC, lastGainDown, lastGainUp, signal, clipRatio,
               rfLevelFiltered, verboseLogging, agcModeToGainDb);
+          runtime_loop::maybeAdjustAdaptiveBandwidth(
+              adaptiveBwMode, adaptiveBwState, requestedBandwidthHz,
+              pendingBandwidth, appliedBandwidthHz, signal, verboseLogging);
         },
         targetForceMono, appliedEffectiveForceMono, dspPipeline, rdsWorker,
         xdrServer, retuneMuteSamplesRemaining, retuneMuteTotalSamples, audioOut,
-        &mpxWavOut);
+        &mpxWavOut, m_options.mpxAudioEnabled ? &mpxAudioOut : nullptr);
   }
 
   rdsWorker.stop();
 
+  mpxAudioOut.shutdown();
   shutdownResources(audioOut, iqHandle, mpxWavOut, xdrServer, tunerSession);
 
   std::cout << "[APP] shutdown complete.\n";

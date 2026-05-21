@@ -126,4 +126,32 @@ void maybeAdjustAutoGain(
   }
 }
 
+void maybeAdjustAdaptiveBandwidth(
+    fm_tuner::AdaptiveBandwidthMode mode,
+    fm_tuner::AdaptiveBandwidthState &state,
+    std::atomic<int> &requestedBandwidthHz, std::atomic<bool> &pendingBandwidth,
+    int currentAppliedBandwidthHz, const SignalLevelResult &signal,
+    bool verboseLogging) {
+  if (mode == fm_tuner::AdaptiveBandwidthMode::Off) {
+    return;
+  }
+  const int proposed = fm_tuner::pickAdaptiveBandwidthHz(mode, signal.snrDb);
+  if (proposed <= 0) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  const int change = fm_tuner::applyAdaptiveBandwidthHysteresis(
+      state, proposed, currentAppliedBandwidthHz, now);
+  if (change <= 0) {
+    return;
+  }
+  requestedBandwidthHz = change;
+  pendingBandwidth = true;
+  if (verboseLogging) {
+    std::cout << "[BW] adaptive: snr=" << std::fixed << std::setprecision(1)
+              << signal.snrDb << " dB, requesting " << change << " Hz (from "
+              << currentAppliedBandwidthHz << ")\n";
+  }
+}
+
 } // namespace runtime_loop

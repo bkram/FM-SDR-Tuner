@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 
+#include "adaptive_bandwidth.h"
 #include "audio_output.h"
 #include "config.h"
 #include "dsp/runtime.h"
@@ -46,6 +47,17 @@ void maybeAdjustAutoGain(
     const SignalLevelResult &signal, double clipRatio, float rfLevelFiltered,
     bool verboseLogging,
     const std::function<int(int)> &agcModeToGainDb);
+
+// Honors processing.adaptive_bandwidth. Reads SNR from `signal`, picks a
+// channel bandwidth via the policy in adaptive_bandwidth.h, and requests it
+// via the (requestedBandwidthHz, pendingBandwidth) atomics so runtime_loop's
+// existing bandwidth path applies the change. No-op if mode == Off.
+void maybeAdjustAdaptiveBandwidth(
+    fm_tuner::AdaptiveBandwidthMode mode,
+    fm_tuner::AdaptiveBandwidthState &state,
+    std::atomic<int> &requestedBandwidthHz, std::atomic<bool> &pendingBandwidth,
+    int currentAppliedBandwidthHz, const SignalLevelResult &signal,
+    bool verboseLogging);
 
 } // namespace runtime_loop
 

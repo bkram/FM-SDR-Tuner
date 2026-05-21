@@ -115,6 +115,11 @@ void XdrFacade::installCallbacks(
   m_server.setForceMonoCallback(
       [&](bool forceMono) { m_state.requestedForceMono = forceMono; });
 
+  m_server.setBlendModeCallback([&](int blend) {
+    m_state.requestedBlendMode = std::clamp(blend, 0, 2);
+    m_state.pendingBlendMode = true;
+  });
+
   m_server.setStartCallback([&, onStartCb]() {
     if (m_options.verboseLogging) {
       std::cout << "[XDR] tuner started by client\n";

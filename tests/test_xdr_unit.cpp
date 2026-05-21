@@ -149,6 +149,23 @@ TEST_CASE("XDR processCommand updates state and invokes callbacks", "[xdr_unit]"
   REQUIRE(xdr.processCommand("B1", true, false) == "B1");
   REQUIRE(mono.load());
 
+  // Stereo blend live-control via 'Fb<n>'.
+  std::atomic<int> blendMode{-1};
+  xdr.setBlendModeCallback([&](int b) { blendMode = b; });
+  REQUIRE(xdr.processCommand("Fb0", true, false) == "Fb0");
+  REQUIRE(blendMode.load() == 0);
+  REQUIRE(xdr.processCommand("Fb2", true, false) == "Fb2");
+  REQUIRE(blendMode.load() == 2);
+  REQUIRE(xdr.processCommand("Fb1", true, false) == "Fb1");
+  REQUIRE(blendMode.load() == 1);
+  // Out-of-range arg is clamped.
+  REQUIRE(xdr.processCommand("Fb9", true, false) == "Fb2");
+  REQUIRE(blendMode.load() == 2);
+  // Unknown F-subcommand returns empty without touching the callback.
+  blendMode = 7;
+  REQUIRE(xdr.processCommand("Fz5", true, false).empty());
+  REQUIRE(blendMode.load() == 7);
+
   REQUIRE(xdr.processCommand("x", true, false) == "OK");
   REQUIRE(xdr.processCommand("X", true, false) == "X");
   REQUIRE(startCalls.load() == 1);

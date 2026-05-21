@@ -1,5 +1,7 @@
 #include "fm_demod.h"
 
+#include "dsp/iq_saturation.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -34,7 +36,7 @@ FMDemod::FMDemod(int inputRate, int outputRate)
       m_filteredChannelPowerDbfs(-120.0) {
   const float iqCutoffNorm =
       std::clamp(110000.0f / static_cast<float>(m_inputRate), 0.01f, 0.45f);
-  m_liquidIqFilter.init(81, iqCutoffNorm);
+  m_liquidIqFilter.init(81, iqCutoffNorm, 60.0f, 0.0f, m_iqFirL1Normalize);
   m_liquidIqDcBlockI.initDCBlocker(0.0005f);
   m_liquidIqDcBlockQ.initDCBlocker(0.0005f);
   const float ratio =
@@ -44,6 +46,8 @@ FMDemod::FMDemod(int inputRate, int outputRate)
   setDeviation(75000.0);
   setDeemphasis(50);
   setDspAgcMode(DspAgcMode::Off);
+  m_liquidMultipathEq.init(fm_tuner::dsp::MultipathEqMode::Off, 17,
+                           static_cast<float>(m_inputRate));
 }
 
 FMDemod::~FMDemod() = default;
@@ -88,6 +92,7 @@ void FMDemod::reset() {
   if (m_liquidIqAgc.ready()) {
     m_liquidIqAgc.reset();
   }
+  m_liquidMultipathEq.reset();
 }
 
 void FMDemod::setBandwidthMode(int mode) {
@@ -134,12 +139,34 @@ void FMDemod::setBandwidthHz(int bwHz) {
       (selectedBwHz > 0 && selectedBwHz <= 73000) ? 121U : 81U;
   const float stopBandAtten =
       (selectedBwHz > 0 && selectedBwHz <= 42000) ? 70.0f : 60.0f;
-  m_liquidIqFilter.init(filterLen, cutoffNorm, stopBandAtten);
+  m_liquidIqFilter.init(filterLen, cutoffNorm, stopBandAtten, 0.0f,
+                        m_iqFirL1Normalize);
   reset();
+}
+
+void FMDemod::setIqFirL1Normalize(bool enabled) {
+  if (enabled == m_iqFirL1Normalize) {
+    return;
+  }
+  m_iqFirL1Normalize = enabled;
+  // Re-design the IQ FIR with the current bandwidth + new normalization flag.
+  // Forcing a re-init by bumping the mode through a sentinel keeps the
+  // setBandwidthHz path canonical (it owns the cutoff/taps math).
+  const int currentBw = (m_bandwidthMode >= 0 &&
+                         m_bandwidthMode < static_cast<int>(kXdrFmBwHz.size()))
+                            ? kXdrFmBwHz[static_cast<size_t>(m_bandwidthMode)]
+                            : 0;
+  m_bandwidthMode = -1;
+  setBandwidthHz(currentBw > 0 ? currentBw : m_w0BandwidthHz);
 }
 
 void FMDemod::setW0BandwidthHz(int bwHz) {
   m_w0BandwidthHz = std::clamp(bwHz, 0, 400000);
+}
+
+void FMDemod::setMultipathEqMode(fm_tuner::dsp::MultipathEqMode mode,
+                                 std::uint32_t taps) {
+  m_liquidMultipathEq.init(mode, taps, static_cast<float>(m_inputRate));
 }
 
 void FMDemod::setDspAgcMode(DspAgcMode mode) {
@@ -165,7 +192,8 @@ void FMDemod::demodulate(const uint8_t *iq, float *audio, size_t len) {
     const uint8_t iByte = iqPtr[0];
     const uint8_t qByte = iqPtr[1];
     iqPtr += 2;
-    if (iByte == 0 || iByte == 255 || qByte == 0 || qByte == 255) {
+    if (fm_tuner::dsp::isRtlSdrIqByteSaturated(iByte) ||
+        fm_tuner::dsp::isRtlSdrIqByteSaturated(qByte)) {
       clipCount++;
     }
 
@@ -182,6 +210,9 @@ void FMDemod::demodulate(const uint8_t *iq, float *audio, size_t len) {
     if (m_dspAgcMode != DspAgcMode::Off) {
       iqDemodIn = m_liquidIqAgc.execute(iqDemodIn);
     }
+    // Multipath equalizer (CMA). No-op when mode == Off. Sits *after* the
+    // channel FIR and IF AGC so the CMA sees a normalized envelope.
+    iqDemodIn = m_liquidMultipathEq.execute(iqDemodIn);
     audio[i] = m_liquidFreqDemod.execute(iqDemodIn);
   }
 
@@ -223,6 +254,7 @@ void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
     if (m_dspAgcMode != DspAgcMode::Off) {
       iqDemodIn = m_liquidIqAgc.execute(iqDemodIn);
     }
+    iqDemodIn = m_liquidMultipathEq.execute(iqDemodIn);
     audio[i] = m_liquidFreqDemod.execute(iqDemodIn);
   }
 

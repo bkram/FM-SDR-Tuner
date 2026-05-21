@@ -15,8 +15,9 @@ struct XdrCommandState {
       : requestedFrequencyHz(frequencyHz), requestedCustomGain(customGain),
         requestedAGCMode(agcMode), requestedBandwidthHz(bandwidthHz),
         requestedVolume(volumePercent), requestedDeemphasis(deemphasisMode),
-        requestedForceMono(forceMono), pendingFrequency(false),
-        pendingGain(false), pendingAGC(false), pendingBandwidth(false) {}
+        requestedForceMono(forceMono), requestedBlendMode(-1),
+        pendingFrequency(false), pendingGain(false), pendingAGC(false),
+        pendingBandwidth(false), pendingBlendMode(false) {}
 
   std::atomic<uint32_t> requestedFrequencyHz;
   std::atomic<int> requestedCustomGain;
@@ -25,10 +26,14 @@ struct XdrCommandState {
   std::atomic<int> requestedVolume;
   std::atomic<int> requestedDeemphasis;
   std::atomic<bool> requestedForceMono;
+  // -1 = no live request (use startup INI/CLI value); 0=soft, 1=normal,
+  // 2=aggressive when set by an XDR 'Fb<n>' command.
+  std::atomic<int> requestedBlendMode;
   std::atomic<bool> pendingFrequency;
   std::atomic<bool> pendingGain;
   std::atomic<bool> pendingAGC;
   std::atomic<bool> pendingBandwidth;
+  std::atomic<bool> pendingBlendMode;
 };
 
 class XdrFacade {

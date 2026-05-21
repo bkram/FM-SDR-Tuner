@@ -1,6 +1,7 @@
 #include "signal_level.h"
 
 #include "cpu_features.h"
+#include "dsp/iq_saturation.h"
 #include "dsp/liquid_primitives.h"
 #include <algorithm>
 #include <array>
@@ -35,6 +36,10 @@ constexpr double kSignalLevelSnrCeilDb = 30.0;
 #elif defined(__GNUC__)
 #define SIGLEV_HAS_AVX2 1
 #define SIGLEV_AVX2_TARGET __attribute__((target("avx2,fma")))
+#endif
+#if !defined(SIGLEV_HAS_AVX2) && defined(_MSC_VER) && defined(__AVX2__)
+#define SIGLEV_HAS_AVX2 1
+#define SIGLEV_AVX2_TARGET
 #endif
 #endif
 
@@ -329,7 +334,8 @@ SignalLevelResult computeWidebandSignalLevel(const uint8_t *iq, size_t samples) 
     sumII += iNorm * iNorm;
     sumQQ += qNorm * qNorm;
 
-    if (iByte <= 1 || iByte >= 254 || qByte <= 1 || qByte >= 254) {
+    if (fm_tuner::dsp::isRtlSdrIqByteSaturated(iByte) ||
+        fm_tuner::dsp::isRtlSdrIqByteSaturated(qByte)) {
       hardClipCount += 2;
     }
     if (iByte <= 8 || iByte >= 247 || qByte <= 8 || qByte >= 247) {
@@ -346,7 +352,11 @@ SignalLevelResult computeWidebandSignalLevel(const uint8_t *iq, size_t samples) 
 
   out.dbfs = 20.0 * std::log10(rms + 1e-12);
   out.noiseFloorDbfs = out.dbfs;
-  out.snrDb = 0.0;
+  // NaN signals "no channel-aware estimate available". Downstream consumers
+  // (adaptive bandwidth controller, auto-gain) can use std::isfinite() to
+  // distinguish a missing measurement from a genuine SNR ≈ 0 reading. If the
+  // FFT-based estimator runs successfully it overrides this with a real value.
+  out.snrDb = std::numeric_limits<double>::quiet_NaN();
 
   const double iqValues = static_cast<double>(samples * 2);
   out.hardClipRatio =

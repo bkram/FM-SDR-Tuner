@@ -35,6 +35,91 @@ constexpr float kPilotEnvSmooth = 0.9995f;
 constexpr float kPilotEnvInject = 1.0f - kPilotEnvSmooth;
 constexpr float kPilotIqSmooth = 0.9995f;
 constexpr float kPilotIqInject = 1.0f - kPilotIqSmooth;
+// Gear-shifted pilot PLL bandwidth. The acquire value matches the historical
+// pre-gear-shift fixed loop bandwidth (0.01) — it preserves weak-signal lock
+// sensitivity that wider acquire bandwidths sacrifice for slightly faster
+// retune lock. The hold value (0.003) is the actual improvement: once we're
+// locked, narrowing the loop reduces pilot jitter and improves stereo
+// separation on strong signals. Both values are in liquid_dsp's normalized
+// loop-bandwidth units.
+constexpr float kPilotPllBwAcquire = 0.01f;
+constexpr float kPilotPllBwHold = 0.003f;
+
+// Hi-Blend biquad coefficient refresh rate. The cutoff scales with
+// m_stereoBlend², which evolves on a tens-of-ms time scale; recomputing the
+// biquad coefficients (and therefore calling tan() to pre-warp omega) at
+// the full 256 kHz sample rate was wasted CPU. Refreshing every 64 samples
+// = ~4 kHz design rate keeps the cutoff lag well below audibility while
+// removing 63/64 of the per-sample tan() calls. The first sample of every
+// processAudio() call always re-designs so blend changes since the previous
+// call show up immediately.
+constexpr uint32_t kHiBlendCoeffRefreshMask = 63;
+
+constexpr float kHalfPi = 1.5707963267948966f;
+constexpr float kTwoPi = 6.28318530717959f;
+
+// 1024-entry sin/cos LUT with linear interpolation (N+1 entries so the
+// upper-bound interpolation lookup doesn't need a separate wrap). Max
+// error ~1.9e-5 (~13.7 bits) — well under the PLL's phase jitter and far
+// below the FM noise floor. The two per-sample sincos pairs in
+// processAudio (one for phaseNow, one for m_pllPhase) were ~95 leaf
+// samples / ~4% of active CPU in the post-Tier-2A profile; this swaps
+// the libm __sincosf_stret call for an L1-cache hit plus two multiplies.
+struct PhaseLUT {
+  static constexpr unsigned N = 1024;
+  float sinTbl[N + 1];
+  float cosTbl[N + 1];
+  PhaseLUT() {
+    for (unsigned i = 0; i <= N; ++i) {
+      const float p = static_cast<float>(i) * kTwoPi / static_cast<float>(N);
+      sinTbl[i] = std::sin(p);
+      cosTbl[i] = std::cos(p);
+    }
+  }
+};
+
+inline const PhaseLUT &phaseLUT() {
+  static const PhaseLUT lut;
+  return lut;
+}
+
+inline void fast_sincosf(float phase, float &s, float &c) {
+  // liquid NCO output is wrapped to [-π, π]; bring negative values into
+  // [0, 2π) so the integer-cast + mask gives a valid LUT index.
+  if (phase < 0.0f) phase += kTwoPi;
+  if (phase >= kTwoPi) phase -= kTwoPi;
+  constexpr float kInvTwoPi = 1.0f / kTwoPi;
+  const float scaled = phase * (static_cast<float>(PhaseLUT::N) * kInvTwoPi);
+  const unsigned idx = static_cast<unsigned>(scaled);
+  const unsigned i = idx & (PhaseLUT::N - 1U);
+  const float f = scaled - static_cast<float>(idx);
+  const auto &lut = phaseLUT();
+  s = lut.sinTbl[i] + f * (lut.sinTbl[i + 1] - lut.sinTbl[i]);
+  c = lut.cosTbl[i] + f * (lut.cosTbl[i + 1] - lut.cosTbl[i]);
+}
+
+// Polynomial approximation of atan2 — max error ~0.0015 rad (~0.09°), more
+// than tight enough for the pilot-PLL phase detector at 19 kHz. Replaces
+// libm's atan2f in the inner loop where the profile showed ~150 samples /
+// ~1.25% of one core spent in atan2f. Branch-light to keep the hot path
+// predictable.
+inline float fast_atan2f(float y, float x) {
+  if (x == 0.0f) {
+    return (y > 0.0f) ? kHalfPi : (y < 0.0f) ? -kHalfPi : 0.0f;
+  }
+  constexpr float kPiOver4 = 0.7853981633974483f;
+  const float ax = std::fabs(x);
+  const float ay = std::fabs(y);
+  const bool xDom = (ax >= ay);
+  const float a = xDom ? (ay / ax) : (ax / ay);
+  // Rajan / Volder polynomial: angle ≈ a·(π/4 - (a-1)(0.2447 + 0.0663·a))
+  const float base = a * (kPiOver4 - (a - 1.0f) * (0.2447f + 0.0663f * a));
+  float result = xDom ? base : (kHalfPi - base);
+  if (x < 0.0f) {
+    result = kPi - result;
+  }
+  return (y < 0.0f) ? -result : result;
+}
 } // namespace
 
 StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
@@ -48,11 +133,22 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
       m_pllFreq(2.0f * kPi * 19000.0f / static_cast<float>(inputRate)),
       m_pllMinFreq(2.0f * kPi * 18750.0f / static_cast<float>(inputRate)),
       m_pllMaxFreq(2.0f * kPi * 19250.0f / static_cast<float>(inputRate)),
-      m_pilotConfidence(0.0f), m_hiBlendLrState(0.0f), m_delayPos(0),
-      m_delaySamples(0) {
+      m_pilotConfidence(0.0f), m_hiBlendZ1(0.0f), m_hiBlendZ2(0.0f),
+      m_hiBlendB0(1.0f), m_hiBlendB1(0.0f), m_hiBlendB2(0.0f),
+      m_hiBlendA1(0.0f), m_hiBlendA2(0.0f),
+      m_pilotCancelGainI(0.0f), m_pilotCancelGainQ(0.0f),
+      m_pilotCancellerEnabled(true), m_delayPos(0), m_delaySamples(0) {
   constexpr float pilotCenterHz = 19000.0f;
   constexpr float pilotHalfBandwidthHz = 250.0f;
-  constexpr float pilotTransitionHz = 3000.0f;
+  // Wider transition than spec-tight (was 3 kHz → 325 taps @ 256 kHz). The
+  // 19 kHz pilot is a single narrow tone with nothing immediately adjacent
+  // to discriminate against — L+R audio ends at 15 kHz, L-R DSB-SC starts
+  // near 23 kHz — so 4 kHz still rejects both with margin. Tap count drops
+  // to ~243 (~25% fewer complex MACs/sec). Tried 5 kHz first but it lets
+  // enough broadband noise leak in that the quality metric (which uses
+  // pilotBand/mpx ratio) starts over-reporting on noisy signals. 4 kHz is
+  // the sweet spot.
+  constexpr float pilotTransitionHz = 4000.0f;
   int pilotTapCount =
       static_cast<int>(std::ceil(3.8 * static_cast<double>(m_inputRate) /
                                  static_cast<double>(pilotTransitionHz)));
@@ -66,10 +162,10 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
       pilotHalfBandwidthHz / static_cast<float>(m_inputRate), 0.0005f, 0.45f);
   m_liquidPilotBandFilter.init(static_cast<std::uint32_t>(pilotTapCount),
                                pilotCutoffNorm, 60.0f, pilotCenterNorm);
-  const float audioCutoffNorm =
-      std::clamp(15000.0f / static_cast<float>(m_inputRate), 0.01f, 0.45f);
-  m_liquidMonoAudioFilter.init(121, audioCutoffNorm);
-  m_liquidLrAudioFilter.init(121, audioCutoffNorm);
+  // No dedicated audio LPF at the input rate. The 19 kHz pilot / 38 kHz
+  // L-R subcarrier / 57 kHz RDS subcarrier are all rejected by the
+  // anti-aliasing filter in AFPostProcessor's resampler; the residual
+  // pilot leakage is mopped up by the LMS pilot canceller above.
 
   m_delaySamples = std::max(0, (pilotTapCount - 1) / 2);
   m_delayLine.assign(static_cast<size_t>(std::max(1, m_delaySamples + 1)),
@@ -77,7 +173,7 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
   const float nominalPllFreq =
       2.0f * kPi * 19000.0f / static_cast<float>(m_inputRate);
   m_liquidPilotPll.init(LIQUID_VCO, nominalPllFreq);
-  m_liquidPilotPll.setPLLBandwidth(0.01f);
+  m_liquidPilotPll.setPLLBandwidth(kPilotPllBwAcquire);
 }
 
 StereoDecoder::~StereoDecoder() = default;
@@ -98,14 +194,16 @@ void StereoDecoder::reset() {
   m_pllPhase = 0.0f;
   m_pllFreq = 2.0f * kPi * 19000.0f / static_cast<float>(m_inputRate);
   m_pilotConfidence = 0.0f;
-  m_hiBlendLrState = 0.0f;
+  m_hiBlendZ1 = 0.0f;
+  m_hiBlendZ2 = 0.0f;
+  m_pilotCancelGainI = 0.0f;
+  m_pilotCancelGainQ = 0.0f;
   m_delayPos = 0;
   std::fill(m_delayLine.begin(), m_delayLine.end(),
             std::complex<float>(0.0f, 0.0f));
   m_liquidPilotBandFilter.reset();
   m_liquidPilotPll.reset();
-  m_liquidMonoAudioFilter.reset();
-  m_liquidLrAudioFilter.reset();
+  m_liquidPilotPll.setPLLBandwidth(kPilotPllBwAcquire);
 }
 
 void StereoDecoder::setForceStereo(bool force) { m_forceStereo = force; }
@@ -218,6 +316,10 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     return 0.0f;
   };
 
+  constexpr float kButterQ = 0.7071067811865476f; // 1/√2, Butterworth Q
+  const float fs = static_cast<float>(m_inputRate);
+  const float kPiOverFs = kPi / fs;
+
   size_t outCount = 0;
   for (size_t i = 0; i < numSamples; i++) {
     const float mpx = mono[i];
@@ -229,9 +331,12 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     m_mpxMagnitude =
         (m_mpxMagnitude * kPilotEnvSmooth) + (std::abs(mpx) * kPilotEnvInject);
     const float phaseNow = m_liquidPilotPll.phase();
-    const std::complex<float> vco(std::cos(phaseNow), std::sin(phaseNow));
+    float vcoSin;
+    float vcoCos;
+    fast_sincosf(phaseNow, vcoSin, vcoCos);
+    const std::complex<float> vco(vcoCos, vcoSin);
     const std::complex<float> mixedPilot = pilot * std::conj(vco);
-    const float error = std::atan2(mixedPilot.imag(), mixedPilot.real());
+    const float error = fast_atan2f(mixedPilot.imag(), mixedPilot.real());
     m_liquidPilotPll.stepPLL(error);
     m_liquidPilotPll.step();
     const float phaseNext = m_liquidPilotPll.phase();
@@ -274,11 +379,35 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     // 1) take delayed MPX as complex (real, imag=0),
     // 2) multiply by conjugated PLL output twice (38 kHz downconversion),
     // 3) take real part and apply 2x gain.
-    const std::complex<float> pll(std::cos(m_pllPhase), std::sin(m_pllPhase));
+    float pllSin;
+    float pllCos;
+    fast_sincosf(m_pllPhase, pllSin, pllCos);
+    const std::complex<float> pll(pllCos, pllSin);
     const std::complex<float> lrMixed =
         delayedMpx * std::conj(pll) * std::conj(pll);
-    const float monoRaw = delayedMpx.real();
+    float monoRaw = delayedMpx.real();
     const float lrRaw = 2.0f * lrMixed.real();
+
+    // 19 kHz pilot canceller. Two-tap LMS: subtracts gI·cos(pllPhase) +
+    // gQ·sin(pllPhase) from the mono path. Using both in-phase and quadrature
+    // references lets the canceller kill the pilot regardless of the
+    // single-sample PLL timing offset between phaseNow (used inside the loop
+    // filter) and phaseNext (used here for the L-R recovery). Convergence time
+    // constant is ~2/μ samples ≈ 80 ms at 256 kHz; steady-state residual is
+    // gradient-noise-limited by the cross-correlation of mono program content
+    // with the pilot reference (smaller μ = less noise, slower lock).
+    if (m_pilotCancellerEnabled) {
+      const float refI = pll.real();
+      const float refQ = pll.imag();
+      const float monoAfter =
+          monoRaw - (m_pilotCancelGainI * refI + m_pilotCancelGainQ * refQ);
+      if (m_stereoDetected || m_forceStereo) {
+        constexpr float kPilotCancelMu = 1.0e-4f;
+        m_pilotCancelGainI += kPilotCancelMu * monoAfter * refI;
+        m_pilotCancelGainQ += kPilotCancelMu * monoAfter * refQ;
+      }
+      monoRaw = monoAfter;
+    }
     m_lrRawMagnitude =
         (m_lrRawMagnitude * kPilotEnvSmooth) + (std::abs(lrRaw) * kPilotEnvInject);
     const float targetStereoBlend = computeBlendTarget(
@@ -294,37 +423,42 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     }
     m_stereoBlend += (targetStereoBlend - m_stereoBlend) * blendAlpha;
 
-    // Hi-Blend: the L-R signal is multiplied by the current blend target (as
-    // before) AND passed through a time-varying one-pole LPF whose cutoff
-    // scales with blend². Cutoff spans 200 Hz → 15 kHz; at full blend the
-    // filter is ~transparent around the 15 kHz audio edge, at low blend only
-    // LF stereo survives (HF — which carries most of the stereo-decoded
-    // noise — is rolled off cleanly rather than hard-muted). Scaling the
-    // filter input by m_stereoBlend also guarantees that blend = 0 drives
-    // the L-R state to zero exactly, preserving the force-mono invariant.
-    const float lrScaled = lrRaw * m_stereoBlend;
-    const float hiBlendCutoffHz =
-        200.0f + 14800.0f * m_stereoBlend * m_stereoBlend;
-    const float hiBlendAlpha = std::clamp(
-        1.0f -
-            std::exp(-2.0f * kPi * hiBlendCutoffHz /
-                     static_cast<float>(m_inputRate)),
-        0.0f, 1.0f);
-    m_hiBlendLrState += hiBlendAlpha * (lrScaled - m_hiBlendLrState);
-    const float lrAdapted = m_hiBlendLrState;
+    // Hi-Blend: scale L-R by blend (so blend=0 mutes stereo exactly) and
+    // pass through a 2nd-order Butterworth LPF whose cutoff scales with
+    // blend². The blend scaling stays per-sample so blend=0 mutes stereo
+    // exactly; the coefficient design itself only refreshes every
+    // (kHiBlendCoeffRefreshMask + 1) samples — blend evolves on a ms time
+    // scale, so a 4 kHz design rate is wholly adequate and saves the
+    // libm tan() call at 256 kHz. 12 dB/oct above cutoff rejects stereo
+    // noise cleanly during weak reception.
+    const float blendClamped = std::clamp(m_stereoBlend, 0.0f, 1.0f);
+    if ((static_cast<uint32_t>(i) & kHiBlendCoeffRefreshMask) == 0U) {
+      const float cutoffHz = 200.0f + 14800.0f * blendClamped * blendClamped;
+      const float omega = std::tan(kPiOverFs * cutoffHz);
+      const float omega2 = omega * omega;
+      const float invNorm = 1.0f / (1.0f + omega / kButterQ + omega2);
+      m_hiBlendB0 = omega2 * invNorm;
+      m_hiBlendB1 = 2.0f * m_hiBlendB0;
+      m_hiBlendB2 = m_hiBlendB0;
+      m_hiBlendA1 = 2.0f * (omega2 - 1.0f) * invNorm;
+      m_hiBlendA2 = (1.0f - omega / kButterQ + omega2) * invNorm;
+    }
+
+    const float lrScaled = lrRaw * blendClamped;
+    const float biquadOut = m_hiBlendB0 * lrScaled + m_hiBlendZ1;
+    m_hiBlendZ1 =
+        m_hiBlendB1 * lrScaled - m_hiBlendA1 * biquadOut + m_hiBlendZ2;
+    m_hiBlendZ2 = m_hiBlendB2 * lrScaled - m_hiBlendA2 * biquadOut;
+    const float lrAdapted = biquadOut;
 
     const float leftRaw = 0.5f * (monoRaw + lrAdapted);
     const float rightRaw = 0.5f * (monoRaw - lrAdapted);
-    m_liquidMonoAudioFilter.push(std::complex<float>(leftRaw, 0.0f));
-    m_liquidLrAudioFilter.push(std::complex<float>(rightRaw, 0.0f));
-    const float leftFilt = m_liquidMonoAudioFilter.execute().real();
-    const float rightFilt = m_liquidLrAudioFilter.execute().real();
     m_lrAudioMagnitude =
         (m_lrAudioMagnitude * kPilotEnvSmooth) +
-        (0.5f * (std::abs(leftFilt - rightFilt)) * kPilotEnvInject);
+        (0.5f * std::abs(leftRaw - rightRaw) * kPilotEnvInject);
 
-    left[outCount] = leftFilt;
-    right[outCount] = rightFilt;
+    left[outCount] = leftRaw;
+    right[outCount] = rightRaw;
     outCount++;
   }
 
@@ -367,9 +501,11 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     if (!m_stereoDetected &&
         m_pilotConfidence >= kPilotAcquireConfidence) {
       m_stereoDetected = true;
+      m_liquidPilotPll.setPLLBandwidth(kPilotPllBwHold);
     } else if (m_stereoDetected &&
                m_pilotConfidence <= kPilotHoldConfidence) {
       m_stereoDetected = false;
+      m_liquidPilotPll.setPLLBandwidth(kPilotPllBwAcquire);
     }
   }
 

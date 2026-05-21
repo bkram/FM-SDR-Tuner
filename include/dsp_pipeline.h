@@ -11,6 +11,7 @@
 #include "af_post_processor.h"
 #include "config.h"
 #include "dsp/liquid_primitives.h"
+#include "dsp/squelch.h"
 #include "fm_demod.h"
 #include "stereo_decoder.h"
 
@@ -60,12 +61,19 @@ private:
   StereoDecoder m_stereo;
   AFPostProcessor m_afPost;
   fm_tuner::dsp::liquid::ComplexDecimator m_iqDecimator;
+  fm_tuner::dsp::Squelch m_squelch;
 
   std::vector<uint8_t> m_iqStagingRing;
   std::vector<uint8_t> m_iqLinearizedBlock;
   size_t m_iqStagingReadPos = 0;
   size_t m_iqStagingWritePos = 0;
   size_t m_iqStagingSize = 0;
+  // Deferred-reset gate. setBandwidthHz / setDeemphasisMode previously called
+  // m_stereo.reset() + m_afPost.reset() inline, so two back-to-back retune
+  // setters (common on fast XDR retunes) would zero the audio-chain IIR state
+  // twice mid-block and produce audible thumps. Now those setters mark this
+  // flag; process() consumes it once at the next block boundary.
+  bool m_pendingAudioReset = false;
   std::vector<std::complex<float>> m_iqDecimatedComplex;
   std::vector<float> m_demodBuffer;
   std::vector<float> m_stereoLeft;

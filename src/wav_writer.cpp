@@ -14,13 +14,13 @@ constexpr size_t kWriterChunkSamples = 8192;
 WavWriter::WavWriter()
     : m_handle(nullptr), m_threadRunning(false), m_fatalError(false),
       m_dataSize(0), m_sampleRate(0), m_channels(0), m_verboseLogging(true),
-      m_readPos(0), m_writePos(0), m_size(0) {}
+      m_readPos(0), m_writePos(0), m_size(0), m_resampleEnabled(false) {}
 
 WavWriter::~WavWriter() { shutdown(); }
 
 bool WavWriter::init(const std::string &filename, uint32_t sampleRate,
-                     uint16_t channels, bool verboseLogging,
-                     const char *label) {
+                     uint16_t channels, bool verboseLogging, const char *label,
+                     uint32_t resampleFromHz) {
   shutdown();
   if (filename.empty() || sampleRate == 0 || channels == 0) {
     return false;
@@ -43,6 +43,28 @@ bool WavWriter::init(const std::string &filename, uint32_t sampleRate,
   m_ring.assign(static_cast<size_t>(sampleRate) * channels * kDefaultQueueSeconds,
                 0);
   m_encodeScratch.clear();
+  m_resampleEnabled = false;
+  m_resampleAccum.clear();
+
+  if (resampleFromHz != 0 && resampleFromHz != sampleRate && channels == 1) {
+    const float ratio =
+        static_cast<float>(sampleRate) / static_cast<float>(resampleFromHz);
+    try {
+      m_resampler.init(ratio);
+      m_resampleEnabled = true;
+      if (m_verboseLogging) {
+        std::cout << "[AUDIO] " << m_label << " resample "
+                  << resampleFromHz << " Hz -> " << sampleRate << " Hz (ratio "
+                  << ratio << ")\n";
+      }
+    } catch (const std::exception &ex) {
+      std::cerr << "[AUDIO] " << m_label
+                << " resampler init failed: " << ex.what() << "\n";
+      std::fclose(m_handle);
+      m_handle = nullptr;
+      return false;
+    }
+  }
 
   if (!writeHeader()) {
     std::fclose(m_handle);
@@ -193,7 +215,27 @@ bool WavWriter::enqueueMonoFloat(const float *samples, size_t sampleCount) {
   if (m_channels != 1) {
     return false;
   }
-  return enqueueInterleavedFloat(samples, sampleCount);
+  if (!m_resampleEnabled) {
+    return enqueueInterleavedFloat(samples, sampleCount);
+  }
+  // Push each input sample through the resampler and collect outputs into the
+  // accumulator. Once the accumulator has data we flush it through the
+  // existing path so the rest of the pipeline is unchanged.
+  if (m_resampleAccum.capacity() == 0) {
+    m_resampleAccum.reserve(sampleCount); // typical 1 in -> ~1 out
+  }
+  m_resampleAccum.clear();
+  for (size_t i = 0; i < sampleCount; i++) {
+    const std::uint32_t produced =
+        m_resampler.execute(samples[i], m_resampleTmp);
+    for (std::uint32_t p = 0; p < produced; p++) {
+      m_resampleAccum.push_back(m_resampleTmp[p]);
+    }
+  }
+  if (m_resampleAccum.empty()) {
+    return true; // nothing to write yet — common when downsampling
+  }
+  return enqueueInterleavedFloat(m_resampleAccum.data(), m_resampleAccum.size());
 }
 
 void WavWriter::runWriterThread() {

@@ -719,8 +719,19 @@ void AudioOutput::runWinMMOutputThread() {
     headers[i].lpData = reinterpret_cast<LPSTR>(buffers[i].data());
     headers[i].dwBufferLength =
         static_cast<DWORD>(kSamplesPerBuffer * sizeof(int16_t));
-    headers[i].dwFlags = WHDR_DONE;
-    waveOutPrepareHeader(m_waveOut, &headers[i], sizeof(WAVEHDR));
+    const MMRESULT pr =
+        waveOutPrepareHeader(m_waveOut, &headers[i], sizeof(WAVEHDR));
+    if (pr != MMSYSERR_NOERROR) {
+      if (m_verboseLogging) {
+        std::cerr << "[AUDIO] WinMM waveOutPrepareHeader failed for buffer "
+                  << i << ": " << pr << "\n";
+      }
+      for (size_t j = 0; j < i; j++) {
+        waveOutUnprepareHeader(m_waveOut, &headers[j], sizeof(WAVEHDR));
+      }
+      m_winmmThreadRunning = false;
+      return;
+    }
   }
 
   while (m_winmmThreadRunning.load()) {

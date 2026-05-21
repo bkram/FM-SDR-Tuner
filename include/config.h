@@ -24,9 +24,15 @@ struct Config {
     std::string gain_strategy = "tef"; // tef|sdrpp
     bool sdrpp_rtl_agc = false;
     int sdrpp_rtl_agc_gain_db = 18;
-    double signal_floor_dbfs = -50.0;
-    double signal_ceil_dbfs = -18.0;
-    double signal_bias_db = -4.0;
+    // Meter calibration window: maps (compensated dBFS) → 0..120 linearly.
+    // Old defaults (-50/-18) covered only 32 dB and saturated at both ends on
+    // a typical mixed band (strong locals → 120, fringe → 0). The wider 60 dB
+    // window below leaves headroom: strong locals settle near 90-100, fringe
+    // stations register meaningfully around 20-40. Override per site in the
+    // INI; the active values are logged at startup as [METER].
+    double signal_floor_dbfs = -65.0;
+    double signal_ceil_dbfs = -5.0;
+    double signal_bias_db = 0.0;
     bool low_latency_iq = false;
   } sdr;
 
@@ -51,6 +57,21 @@ struct Config {
     std::string dsp_agc = "off"; // off|fast|slow
     std::string stereo_blend = "aggressive";
     bool stereo = true;
+    bool pilot_canceller = true;
+    std::string hicut = "off"; // off|gentle|strong
+    std::string adaptive_bandwidth = "off"; // off|conservative|aggressive
+    std::string multipath_eq = "off"; // off|light|aggressive
+    int multipath_eq_taps = 17;
+    // When true, the IQ channel FIR is L1-normalized at design time so that
+    // |y[n]| ≤ max|x[n]| for every output sample. Defaults to false to
+    // preserve existing meter calibration; enable when ADC-rail clipping is
+    // observed and downstream consumers rely on |IQ| ≤ 1.
+    bool iq_fir_l1_normalize = false;
+    // Squelch threshold on the post-DSP channel power (compensated dBFS).
+    // -120 = disabled (default). Useful for scan / unattended workflows
+    // where silence on empty channels is preferable to hiss. Hysteresis is
+    // a fixed 3 dB above the open threshold.
+    double squelch_dbfs = -120.0;
   } processing;
 
   struct DebugSection {

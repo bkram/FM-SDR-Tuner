@@ -27,14 +27,19 @@ Current architecture:
 
 - Direct USB RTL-SDR support (`--source rtl_sdr`) as default mode
 - `rtl_tcp` network source support (`--source rtl_tcp`)
-- FM stereo demod (polar discriminator + PLL-locked 19 kHz pilot) with runtime bandwidth/deemphasis control
-- Adaptive Hi-Blend stereo: L−R path runs through a blend-modulated low-pass so weak reception narrows the stereo image instead of hard-dropping to mono
-- Continuous-quality blend gate (no more mono pops on marginal signals)
+- FM stereo demod with gear-shifted PLL on the 19 kHz pilot (wide acquire, narrow hold)
+- 2nd-order Butterworth adaptive Hi-Blend on the L−R path — narrows stereo image as reception worsens, with 12 dB/oct rejection of stereo-decoded HF noise instead of 6 dB/oct
+- LMS pilot canceller: subtracts a phase-locked 19 kHz copy from the mono path (~20 dB extra suppression beyond the audio LPF; on by default)
+- Optional adaptive de-emphasis ("HiCut"): narrows the top end on fringe stations to suppress hiss without affecting strong locals
+- Optional adaptive channel bandwidth: narrows the channel FIR when SNR is low, widens when it recovers (hysteresis-gated)
+- Optional CMA multipath equalizer (Godard 1980, patent-free): cancels FM ghosting on real multipath, stays transparent on clean signals via dispersion target + leak regularization
+- Continuous-quality blend gate (no mono pops on marginal signals)
 - Soft-knee audio limiter with metered clip ratio
 - RDS decode in dedicated worker thread (redsea-port: 171 kHz, 57 kHz PLL, RRC symbol sync, BPSK, block-sync state machine)
 - XDR protocol compatibility for FM-DX clients on port 7373
 - Audio output at 48 kHz (native Core Audio / ALSA / WinMM)
-- Output to speaker (`-s`), WAV (`-w`), MPX WAV (`--mpx-wav`), and/or raw IQ capture (`-i`)
+- Output to speaker (`-s`), WAV (`-w`), MPX WAV (`--mpx-wav`, with configurable rate via `--mpx-rate` for downstream RDS / spectrum / decoder analysis or feeding an FM exciter that accepts raw MPX), live MPX → audio device (`--mpx-audio` on macOS/Linux, typically into BlackHole / snd-aloop for re-encoding or directly into a TX accepting line-in MPX), and/or raw IQ capture (`-i`)
+- Self-documenting signal meter: startup `[METER]` log reports the active calibration window and periodically suggests narrower floor/ceil based on observed session min/max
 
 ## Quick Start
 
@@ -53,11 +58,14 @@ This opens the XDR server on `127.0.0.1:7373` and waits for a client (xdr-gtk, F
 Useful one-shot overrides (all still valid without a config file):
 
 ```bash
-./build/fm-sdr-tuner -f 101100                # start at 101.1 MHz
-./build/fm-sdr-tuner -b soft                  # soft stereo blend profile
-./build/fm-sdr-tuner -P secret                # require XDR password 'secret'
-./build/fm-sdr-tuner -w capture.wav           # also record to WAV
-./build/fm-sdr-tuner -l                       # list audio output devices
+./build/fm-sdr-tuner -f 101100                              # start at 101.1 MHz
+./build/fm-sdr-tuner -b soft                                # soft stereo blend profile
+./build/fm-sdr-tuner -P secret                              # require XDR password 'secret'
+./build/fm-sdr-tuner -w capture.wav                         # also record audio to WAV
+./build/fm-sdr-tuner --mpx-wav mpx.wav --mpx-rate 192000    # capture MPX at 192 kHz for downstream RDS/spectrum analysis or feeding an FM exciter
+./build/fm-sdr-tuner --mpx-audio --mpx-audio-device "BlackHole" --mpx-rate 192000   # macOS: live MPX into a virtual loopback at 192 kHz
+./build/fm-sdr-tuner -l                                     # list audio output devices
+./build/fm-sdr-tuner --calibrate                            # one-shot band sweep — prints stations + recommended signal_floor_dbfs / signal_ceil_dbfs for this location/antenna
 ```
 
 ## Requirements
@@ -89,7 +97,18 @@ sudo dnf install -y cmake alsa-lib-devel pkgconf-pkg-config openssl-devel rtl-sd
 
 ### Windows
 
-Use vcpkg and install at least OpenSSL plus `librtlsdr` and `liquid-dsp` for your triplet.
+**Before building anything, get the RTL-SDR dongle working on the system first.** Windows does not ship a usable driver for these dongles; the WinUSB driver has to be installed manually via Zadig.
+
+Recommended one-time setup, in order:
+
+1. Plug in the dongle.
+2. Download and run [Zadig](https://zadig.akeo.ie/). Under *Options* enable "List All Devices", select the RTL2832U interface (named "Bulk-In, Interface (Interface 0)" or similar), and install the **WinUSB** driver.
+3. Download [SDR#](https://airspy.com/download/) (or any other known-working RTL-SDR app such as SDRConsole) and verify the dongle tunes a known local FM station and produces audio. If SDR# does not work, `fm-sdr-tuner` will not work either — fix the driver/Zadig step first.
+4. Only then build and run `fm-sdr-tuner`.
+
+Build dependencies: use vcpkg and install at least OpenSSL plus `librtlsdr` and `liquid-dsp` for your triplet.
+
+If `fm-sdr-tuner` reports `[SDR] no rtl_sdr device found at index 0` even after SDR# works, close SDR# first — only one application can hold the dongle at a time.
 
 ## Audio Loopback (optional)
 
@@ -106,6 +125,8 @@ brew install --cask blackhole-2ch
 ```
 
 Set the tuner's output to `BlackHole 2ch`, and configure the consumer (FM-DX-Webserver, etc.) to record from `BlackHole 2ch`. To also monitor on real speakers, build a Multi-Output Device in Audio MIDI Setup that contains both BlackHole and the speaker, and select that aggregate as the tuner output.
+
+For routing the raw MPX (not the 48 kHz stereo audio) into BlackHole at 192 kHz — useful for RDS decoders, broadcast analysis software, or feeding a software FM transmitter — see the [`--mpx-audio` section below](#live-mpx--audio-device---mpx-audio).
 
 ### Linux — ALSA `snd-aloop`
 
@@ -280,6 +301,69 @@ If you want immediate local speaker audio without waiting for an XDR client:
 That launcher uses `--auto-start` and is intended for manual local listening,
 not for testing XDR client-controlled start/stop behavior.
 
+## Live MPX → audio device (`--mpx-audio`)
+
+Routes the post-discriminator multiplex (MPX) signal — mono baseband containing the 0–15 kHz L+R audio, 19 kHz stereo pilot, 23–53 kHz L−R DSB-SC subcarrier, and 57 kHz RDS subcarrier — to a system audio output device in real time. Independent of the regular 48 kHz stereo audio output, so you can keep listening on speakers while the MPX streams elsewhere.
+
+Two main reasons to use it:
+- **Re-encoding / analysis**: route MPX into a virtual loopback (BlackHole on macOS, `snd-aloop` on Linux) so a downstream consumer — RDS decoder, spectrum analyzer, broadcast monitor — picks it up as a regular audio input. No file in the middle.
+- **Direct TX line-in**: many FM exciters / software TXs accept raw MPX as line-in audio at 192 kHz. The tuner becomes a clean MPX source for the transmitter.
+
+The MPX bandwidth extends to ~75 kHz (RDS sidebands), so the audio device must be capable of **at least 192 kHz** sample rate to avoid aliasing the 19/38/57 kHz subcarriers into the audible band.
+
+```bash
+# macOS: stream MPX to BlackHole at 192 kHz
+./build/fm-sdr-tuner -f 88600 --mpx-audio --mpx-audio-device "BlackHole" --mpx-rate 192000 -G
+
+# Linux: stream MPX to snd-aloop at 192 kHz
+./build/fm-sdr-tuner -f 88600 --mpx-audio --mpx-audio-device "hw:Loopback,0,0" --mpx-rate 192000 -G
+
+# Default device, default rate (192 kHz):
+./build/fm-sdr-tuner -f 88600 --mpx-audio -G
+```
+
+### MPX-only output (no 48 kHz audio)
+
+The most common use case for `--mpx-audio` is *clean MPX into a downstream consumer with no other audio on the same machine* — a 192 kHz DAC wired to an FM exciter, an SDR-based software TX, or a broadcast monitor box. In that mode you do not want the regular 48 kHz stereo audio output competing for the audio device or the speakers. Pair `--mpx-audio` with `--no-audio`:
+
+```bash
+./build/fm-sdr-tuner \
+  --auto-start \
+  --source rtl_sdr --rtl-device 0 --iq-rate 256000 \
+  -f 88600 \
+  --no-audio \
+  --mpx-audio --mpx-audio-device "Headphones" \
+  --mpx-rate 192000 \
+  -G
+```
+
+Why this layout makes sense:
+- `--no-audio` skips the 48 kHz `AudioOutput` entirely — no FM-decoded stereo plays anywhere. The DSP pipeline still produces stereo internally so RDS and meter still work, the audio is simply not routed to a device.
+- `--mpx-audio --mpx-audio-device "Headphones"` opens a single Core Audio (macOS) or ALSA (Linux) stream straight from the MPX tap. `"Headphones"` here is a *device name substring* — match whatever your DAC reports under `./build/fm-sdr-tuner -l`. The name has no relationship to actual headphones; the example device is a 192 kHz DAC that happens to be labelled "Headphones" by Core Audio.
+- `--mpx-rate 192000` preserves the 19/38/57 kHz subcarriers (192 kHz Nyquist = 96 kHz, well above the ~75 kHz MPX top end). Lower rates would alias the subcarriers into the audible band and break downstream RDS / stereo decoding.
+- `-G` skips XDR authentication so you can run head-less without a client.
+
+If the target device only accepts a 2-channel format, the tuner automatically duplicates the mono MPX to both L and R — no extra flags needed. You'll see `[MPX-AUDIO] device rejected mono format; using stereo (MPX duplicated to L=R)` in the startup log when that fallback engages.
+
+You'll see a startup line like:
+```text
+[MPX-AUDIO] CoreAudio device: 'BlackHole 2ch' (selector 'BlackHole')
+[MPX-AUDIO] streaming mono @ 192000 Hz (resampled from 256000 Hz)
+```
+
+If the device cannot negotiate the requested rate (ALSA will fall back to whatever it supports), the tool warns and the MPX gets band-limited accordingly. On macOS Core Audio you may need an aggregate device or BlackHole specifically to hit 192 kHz; built-in speakers usually max out at 96 kHz.
+
+### Windows: not currently supported
+
+The built-in Windows audio backend (WinMM) is the legacy MultiMediaExtensions API and is effectively capped at 48 kHz on common configurations. At that rate the 19/38/57 kHz subcarriers fold into the audible band and the MPX becomes useless for the downstream tools this feature is designed to feed. `--mpx-audio` on Windows therefore refuses to start with a clear error message instead of producing aliased junk.
+
+Workarounds on Windows:
+- Use `--mpx-wav --mpx-rate 192000` to capture MPX to a file (works fine on Windows) and feed downstream tools from there.
+- Run a Linux VM with USB pass-through to the RTL-SDR if live MPX-to-audio is essential.
+- Switch host platform: macOS or Linux supports `--mpx-audio` natively.
+
+A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; not yet implemented.
+
 ## Runtime Behavior
 
 - Audio output is enabled by default. CLI flags can add WAV (`-w`), MPX WAV (`--mpx-wav`), and/or raw IQ (`-i`) outputs; use `-s` to re-enable audio when a config has explicitly disabled it.
@@ -322,14 +406,19 @@ Important sections:
 - `[xdr]`: server port/password/guest mode
 
 Signal meter related keys (`[sdr]`):
-- `signal_floor_dbfs`
-- `signal_ceil_dbfs`
-- `signal_bias_db`
+- `signal_floor_dbfs` (default `-65.0`)
+- `signal_ceil_dbfs` (default `-5.0`)
+- `signal_bias_db` (default `0.0`)
 
-Weak-signal tuning keys:
-- `processing.w0_bandwidth_hz`
-- `processing.dsp_agc = off|fast|slow`
-- `processing.stereo_blend = soft|normal|aggressive`
+Weak-signal tuning keys (all default to off / static):
+- `processing.w0_bandwidth_hz` — static channel bandwidth
+- `processing.dsp_agc = off|fast|slow` — I/Q AGC before the discriminator
+- `processing.stereo_blend = soft|normal|aggressive` — how aggressively to collapse stereo
+- `processing.pilot_canceller = true|false` — 19 kHz pilot residual canceller (default on)
+- `processing.hicut = off|gentle|strong` — adaptive de-emphasis HiCut
+- `processing.adaptive_bandwidth = off|conservative|aggressive` — SNR-driven channel narrowing
+- `processing.multipath_eq = off|light|aggressive` — CMA multipath equalizer
+- `processing.multipath_eq_taps` — equalizer tap count (default 17)
 
 ## Setup And Tuning Guide
 
@@ -348,7 +437,9 @@ clipping.
 
 ### 1. Start From A Known-Good Baseline
 
-The binary already ships with sensible defaults (`gain_strategy = tef`, `agc_mode = 2`, `w0_bandwidth_hz = 194000`, `stereo_blend = aggressive`, `signal_floor_dbfs = -50`, `signal_ceil_dbfs = -18`, deemph 50 µs). For a dedicated site profile, put overrides in `fm-sdr-tuner.ini`:
+The binary ships with wide, safe defaults (`gain_strategy = tef`, `agc_mode = 2`, `w0_bandwidth_hz = 194000`, `stereo_blend = aggressive`, `signal_floor_dbfs = -65`, `signal_ceil_dbfs = -5`, `signal_bias_db = 0`, deemph 50 µs, `pilot_canceller = true`). The optional adaptive features (`hicut`, `adaptive_bandwidth`, `multipath_eq`) default to off so the audio is identical to a passive demod chain until you opt in.
+
+For a dedicated site profile, put overrides in `fm-sdr-tuner.ini`:
 
 ```ini
 [sdr]
@@ -356,9 +447,10 @@ gain_strategy = tef
 rtl_gain_db = -1
 default_custom_gain_flags = 1
 freq_correction_ppm = 0
-signal_floor_dbfs = -50.0
-signal_ceil_dbfs = -18.0
-signal_bias_db = -4.0
+# Wide default; watch [METER] log and narrow once you know the local range.
+signal_floor_dbfs = -65.0
+signal_ceil_dbfs = -5.0
+signal_bias_db = 0.0
 
 [processing]
 agc_mode = 2
@@ -366,6 +458,11 @@ w0_bandwidth_hz = 194000
 dsp_agc = off
 stereo_blend = aggressive
 stereo = true
+pilot_canceller = true
+# Optional adaptive features — leave off until you have a stable baseline.
+hicut = off
+adaptive_bandwidth = off
+multipath_eq = off
 client_gain_allowed = false
 ```
 
@@ -627,37 +724,51 @@ Do not narrow bandwidth first when the real issue is overload.
 ### 8. Calibrate The Signal Meter For Your Location
 
 These keys are display calibration only:
-- `signal_floor_dbfs`
-- `signal_ceil_dbfs`
-- `signal_bias_db`
+- `signal_floor_dbfs` (compensated dBFS that maps to meter value 0)
+- `signal_ceil_dbfs` (compensated dBFS that maps to meter value 120)
+- `signal_bias_db` (overall offset; usually keep at 0)
 
 They do not fix RF overload, wrong tuning, or ghosting.
 
-Procedure:
-1. Tune an empty or very weak frequency and note typical `dbfs`
-2. Tune a strong clean local station and note typical `dbfs`
-3. Set:
-   - `signal_floor_dbfs` near the empty-frequency value
-   - `signal_ceil_dbfs` near the strong-station value
-   - `signal_bias_db` only if you want the displayed scale nudged up or down
+The default 60 dB window (`-65` floor, `-5` ceil) is intentionally wide so it works on most sites without saturating either end. The `[METER]` log line shipped in every run does the legwork for you:
 
-Example:
-- empty frequency around `-52 dBFS`
-- strong local around `-14 dBFS`
-
-Starting point:
-
-```ini
-[sdr]
-signal_floor_dbfs = -52.0
-signal_ceil_dbfs = -14.0
-signal_bias_db = -6.0
+```text
+[METER] mapping window: floor=-65.0 dBFS, ceil=-5.0 dBFS (range 60.0 dB), bias=0.0 dB
+[METER] session observed: min=-53.5 dBFS, max=-26.9 dBFS — for full-scale meter consider floor≈-56, ceil≈-24
 ```
+
+Two procedures, both work end-to-end:
+
+**Procedure A — One-shot band sweep (recommended).** Use the built-in calibration tool. It opens the RTL-SDR, sweeps 87.5–108 MHz, prints all detected stations sorted by quality, and emits copy-paste-ready INI values tuned to your antenna + location:
+
+```bash
+./fm-sdr-tuner --calibrate
+```
+
+The output includes:
+- a per-frequency table (dBFS + meter level at every 100 kHz step)
+- a sorted list of detected stations (level120 > 30)
+- a recommendation block with `signal_floor_dbfs`, `signal_ceil_dbfs`, and `signal_bias_db` chosen so the 0..120 meter spans the actual signal envelope at your site
+
+Paste the recommendation block into the `[sdr]` section of your INI and restart. Takes ~45 seconds, no XDR client or audio backend needed. Re-run any time the antenna or location changes.
+
+**Procedure B — Live auto-suggester (for tweaking while listening).**
+1. Start the tuner with the default wide window.
+2. Tune through your representative stations (strong local, mid, fringe, empty) over ~1 minute.
+3. Read the `[METER] session observed` line. It tracks the running min/max of compensated dBFS and recommends `floor ≈ min − 3 dB`, `ceil ≈ max + 3 dB` so the meter spans 0..120 across your real signal range.
+4. Apply those values to `[sdr]` in your INI.
+5. Restart and confirm: strong locals now settle near 100–110 (with room for exceptional signals), and fringe stations register meaningfully around 20–40.
+
+Manual fallback (if you prefer the by-hand approach):
+1. Tune an empty or very weak frequency and note typical `dbfs`/`compensated`.
+2. Tune a strong clean local station and note typical `compensated`.
+3. Set `signal_floor_dbfs` ≈ empty-frequency compensated − 3 dB; `signal_ceil_dbfs` ≈ strong-station compensated + 3 dB.
 
 Symptoms of bad meter calibration:
 - empty channels always look too strong: floor is too high, or gain is still wrong
-- every strong station saturates near the top: ceil is too low
+- every strong station saturates at 120: ceil is too low
 - everything looks compressed into the middle: floor/ceil window is too wide
+- weak stations clamp to 0: floor is too high (raise the window's bottom; the `[METER]` suggester catches this automatically)
 
 ### 9. Wrong Frequency / Ghosting Troubleshooting
 
@@ -753,11 +864,22 @@ Suburban / mixed conditions:
 - if weak stations are too soft, try `agc_mode = 1`
 - if noise on weak stereo is annoying, use `stereo_blend = aggressive`
 
-Rural / weak-signal / DX:
+Rural / weak-signal / DX (incl. indoor + telescopic antenna):
 - start with `tef`, `agc_mode = 1`
-- if still too weak, try fixed `rtl_gain_db = 24 .. 36`
-- if strong locals occasionally overload, back off by `3 .. 6 dB`
-- keep `stereo_blend = normal` first; use `soft` only if stations are clean enough to justify it
+- if still too weak, try fixed `rtl_gain_db = 24 .. 36` (R820T tops out near 49.6 dB; 36 dB is usually the sweet spot before adjacent strong locals overload)
+- enable `dsp_agc = fast` — normalizes the IF envelope before the discriminator, helping the demodulator stay in its linear range on AM-modulated multipath/fading
+- enable `adaptive_bandwidth = aggressive` — the DSP equivalent of TEF's adaptive IF; narrows the channel FIR when SNR drops, widens when it recovers (with hysteresis)
+- if a station is right at the threshold of lock, try `w0_bandwidth_hz = 142000` or `95000` manually for that station
+- if strong locals occasionally overload at high gain, back off by `3 .. 6 dB`
+- keep `stereo_blend = normal` first; use `soft` only if stations are clean enough to justify it; use `aggressive` for cleanest mono-on-weak behavior
+
+#### Reality check: antenna quality dominates
+
+An external roof antenna can have 15–25 dB more gain (plus far less noise) than an indoor telescopic. A station that's "easy" on the external can be "below the noise floor" on the telescopic — that's RF physics, not a software regression. Verify with the same antenna across config changes before blaming DSP.
+
+#### Reality check: R820T vs TEF sensitivity gap
+
+This software runs on an RTL-SDR (R820T tuner). A dedicated TEF6686/TEF6687 hardware tuner has a lower-noise LNA, sharper analog IF filtering, and faster hardware AGC — roughly 10–15 dB more sensitive on fringe FM than R820T at the same antenna. The DSP knobs above close the gap as far as a software demod can; for deep DX an external antenna and ideally a TEF-based receiver remain the gold standard.
 
 ### 11. Recommended Validation Pass
 
@@ -792,7 +914,28 @@ Avoid fixed manual gain when:
 
 For general listening, strategy-managed gain is usually easier to keep sane.
 
-### 13. Fast Troubleshooting
+### 13. Optional Adaptive Features
+
+The pipeline ships four optional features that all default to off (or transparent) and can be turned on per-site once the basic gain/blend baseline is solid. Turning them all on at once is supported and tested; doing it without a stable baseline first will hide whether the improvements are real.
+
+| Key | Default | What it does | When to turn on |
+|---|---|---|---|
+| `pilot_canceller` | `true` | LMS-tracked 19 kHz tone removal from mono audio | Already on; turn off only to A/B |
+| `hicut = gentle\|strong` | `off` | Narrows top-end de-emphasis when signal quality drops | Fringe stations that hiss above 5 kHz |
+| `adaptive_bandwidth = conservative\|aggressive` | `off` | Closes channel FIR when SNR drops, reopens when it recovers | Crowded RF environments / adjacent-channel splatter |
+| `multipath_eq = light\|aggressive` | `off` | CMA equalizer cancelling I/Q multipath ghosting | Indoor antenna, urban multipath, mobile reception |
+
+Verification logs you should see when these are active:
+- `[BW] adaptive: snr=… dB, requesting …` — adaptive bandwidth picking a new target
+- `[BW] applied W… (previous W…)` — change committed by the runtime loop
+- `[EQ] env_err=…` — multipath equalizer's smoothed envelope error (should be small on clean signals and trend downward on real multipath)
+
+Worth knowing:
+- The multipath equalizer adapts only while stereo lock is reported, so it never trains on noise. On a clean signal the dispersion target + leak regularization hold it near a centered-delta (transparent) filter — `env_err` will sit near zero.
+- The adaptive bandwidth controller waits for at least one valid SNR measurement before its first policy decision (avoids spurious "snr=0 → narrow" at startup).
+- HiCut's two-filter crossfade is smooth (50 ms time constant), so quality changes don't ring or click.
+
+### 14. Fast Troubleshooting
 
 Strong station sounds rough or crunchy:
 - gain too high
@@ -817,6 +960,63 @@ Stations appear on the wrong frequency:
 Behavior changes when reconnecting XDR client:
 - set `client_gain_allowed = false`
 - keep all gain policy in `fm-sdr-tuner.ini`
+
+## Running On Low-CPU Devices (Raspberry Pi etc.)
+
+The full DSP pipeline at 256 kHz IQ rate is comfortably real-time on any 64-bit ARM since roughly the Raspberry Pi 4 era. Rough ballparks measured on Apple M1 Pro extrapolated by single-thread benchmark ratios:
+
+| Target | Default config | Headroom |
+|---|---|---|
+| Apple M1 / M2 / M3 / M4 | ~15-20% of one core | Plenty |
+| Modern x86 desktop / laptop | ~10-15% of one core | Plenty |
+| Raspberry Pi 5 (Cortex-A76) | ~25-30% of one core | Comfortable |
+| Raspberry Pi 4 (Cortex-A72) | ~45-55% of one core | Workable for dedicated-tuner use |
+| Raspberry Pi 3 / Zero 2 W | ≥90% of one core | Marginal; expect occasional dropouts |
+| Older / 32-bit ARM / Pi 1/2 | won't keep up real-time | Not supported |
+
+If you're targeting a constrained device, these knobs reduce CPU without hurting audio fidelity on normal stations:
+
+```ini
+[processing]
+# Keep these OFF — they add work on the inner DSP loop
+adaptive_bandwidth = off
+multipath_eq = off
+hicut = off
+
+# Optional: drop the LMS pilot canceller too. Default-on; setting it off
+# saves a few cycles per sample at the cost of marginally more 19 kHz
+# leakage in mono audio (well below audibility on real broadcasts).
+pilot_canceller = false
+
+# Stereo blend "aggressive" mutes stereo on weak signals quickly, avoiding
+# work in the L-R recovery loop when there's no real stereo to recover.
+stereo_blend = aggressive
+
+[debug]
+# Verbose logs aren't free at high block rates.
+log_level = 0
+```
+
+Build advice:
+
+```bash
+# ALWAYS Release build on RPi — Debug is several times slower.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+Runtime advice:
+
+- **Cooling matters.** RPi 4 throttles around 80 °C. A passive heatsink + airflow keeps the demod from stuttering under sustained load.
+- **Prefer direct USB RTL-SDR** (`--source rtl_sdr`) over `rtl_tcp` even on the same machine — the TCP roundtrip adds CPU and latency.
+- **USB 2.0 root port** is enough for 256 kHz, but avoid sharing the bus with other heavy USB devices.
+- **Skip audio output** if you only need the XDR control stream / WAV / MPX. Pass `--no-audio` and feed downstream consumers from `-w` or `--mpx-wav`.
+- **Avoid running other heavy workloads** (transcoders, browsers, GUIs) on the same Pi — the FM demod is real-time-sensitive.
+
+If even with all the above the Pi can't keep up:
+
+- Consider running `fm-sdr-tuner` on a more capable host and using `rtl_tcp` to pull IQ from the Pi (move the heavy DSP off the constrained device).
+- Or use a TEF-based hardware tuner. A real TEF6686/TEF6687 receiver does the demod in its own DSP silicon and the Pi only handles XDR protocol — basically zero CPU.
 
 ## CMake Options
 
@@ -884,6 +1084,7 @@ This software is based on or integrates ideas/components from:
 - redsea (RDS decoding pipeline; this project now uses redsea-derived components)
 - XDR-GTK and librdsparser (XDR ecosystem compatibility/parsing behavior)
 - FM-DX-Tuner and xdrd (protocol and tuner-control ecosystem references)
+- sdr-j-fm (algorithmic references for pilot recovery without bandpass FIR, adaptive Costas-style stereo separator, and squelch — see roadmap items P18-P20 in `plan.md`)
 
 Core third-party runtime/build dependencies used by this project include:
 
@@ -902,6 +1103,7 @@ Core third-party runtime/build dependencies used by this project include:
 | librdsparser | https://github.com/kkonradpl/librdsparser | GPL-3.0 | RDS/XDR parsing reference in ecosystem |
 | FM-DX-Tuner | https://github.com/kkonradpl/FM-DX-Tuner | GPL-3.0 | Protocol/tuner-control ecosystem reference |
 | xdrd | https://github.com/kkonradpl/xdrd | GPL-2.0 | Original XDR daemon/protocol reference |
+| sdr-j-fm | https://github.com/JvanKatwijk/sdr-j-fm | GPL-3.0 | Algorithmic references for pilot recovery without bandpass FIR, adaptive Costas-style stereo separator (PerfectStereoSeparation by Thomas Neder, 2023), and squelch behaviour. Roadmap items P18, P19, P20. |
 | OpenSSL | https://www.openssl.org/ | Apache-2.0 (plus OpenSSL terms) | Auth/security-related crypto/hash usage |
 | librtlsdr | https://github.com/osmocom/rtl-sdr | GPL-2.0 | RTL-SDR hardware I/O and rtl_tcp ecosystem support |
 

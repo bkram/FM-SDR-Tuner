@@ -1176,9 +1176,25 @@ std::string XDRServer::processCommand(const std::string &cmd,
     return "D" + std::to_string(deemph);
   }
 
-  case 'F':
-    // TEF-style backends report bandwidth using 'W'.
+  case 'F': {
+    // 'F' is a prefix for tuner-extension subcommands (TEF-style backends
+    // historically reported bandwidth here, hence the original no-op
+    // placeholder). 'Fb<n>' selects stereo blend mode (0=soft, 1=normal,
+    // 2=aggressive). Other 'F<x>' codes left as no-op for forward
+    // compatibility.
+    if (!arg.empty() && arg[0] == 'b') {
+      int blend = 0;
+      if (!parseIntValue(arg.substr(1), blend)) {
+        return "";
+      }
+      blend = std::clamp(blend, 0, 2);
+      if (m_blendModeCallback) {
+        m_blendModeCallback(blend);
+      }
+      return std::string("Fb") + std::to_string(blend);
+    }
     return "";
+  }
 
   case 'W': {
     int bandwidth = 0;
@@ -1323,6 +1339,9 @@ void XDRServer::setAlignmentCallback(IntCallback cb) {
 void XDRServer::setSamplingCallback(SamplingCallback cb) {
   assignCallback(m_samplingCallback, std::move(cb));
 }
+void XDRServer::setBlendModeCallback(IntCallback cb) {
+  assignCallback(m_blendModeCallback, std::move(cb));
+}
 void XDRServer::setForceMonoCallback(ForceMonoCallback cb) {
   assignCallback(m_forceMonoCallback, std::move(cb));
 }
@@ -1391,6 +1410,67 @@ std::string XDRServer::processFmdxCommand(const std::string &cmd) {
     std::ostringstream oss;
     oss << "F=" << m_frequency;
     return oss.str();
+  }
+
+  case 'B': {
+    // Force mono. Mirrors processCommand's 'B' handler in the XDR-GTK path so
+    // FM-DX clients (which speak this protocol after the 'x' handshake) can
+    // also toggle mono. Returns "OK" / "ER" to match the FM-DX convention.
+    int forceMono = 0;
+    if (!parseIntValue(arg, forceMono)) {
+      return "ER";
+    }
+    const bool mono = (forceMono != 0);
+    m_forceMono = mono;
+    if (m_forceMonoCallback) {
+      m_forceMonoCallback(mono);
+    }
+    return "OK";
+  }
+
+  case 'W': {
+    // Channel bandwidth in Hz — same units as processCommand's 'W'.
+    int bandwidth = 0;
+    if (!parseIntValue(arg, bandwidth)) {
+      return "ER";
+    }
+    m_bandwidth = bandwidth;
+    if (m_bandwidthCallback) {
+      m_bandwidthCallback(bandwidth);
+    }
+    return "OK";
+  }
+
+  case 'F': {
+    // Tuner-extension subcommand prefix. Currently supports stereo blend
+    // selection via 'Fb<n>' (0=soft, 1=normal, 2=aggressive), matching the
+    // XDR-GTK protocol path. Other 'F<x>' codes are reserved.
+    if (!arg.empty() && arg[0] == 'b') {
+      int blend = 0;
+      if (!parseIntValue(arg.substr(1), blend)) {
+        return "ER";
+      }
+      blend = std::clamp(blend, 0, 2);
+      if (m_blendModeCallback) {
+        m_blendModeCallback(blend);
+      }
+      return "OK";
+    }
+    return "ER";
+  }
+
+  case 'D': {
+    // De-emphasis mode (0 = 50us, 1 = 75us, 2 = off).
+    int deemph = 0;
+    if (!parseIntValue(arg, deemph)) {
+      return "ER";
+    }
+    deemph = std::clamp(deemph, 0, 2);
+    m_deemphasis = deemph;
+    if (m_deemphasisCallback) {
+      m_deemphasisCallback(deemph);
+    }
+    return "OK";
   }
 
   default:

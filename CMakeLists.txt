@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(fm-sdr-tuner VERSION 1.5.0 LANGUAGES CXX)
+project(fm-sdr-tuner VERSION 1.6.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -114,8 +114,12 @@ set(SOURCES
     src/redsea_port/util/util.cpp
     src/xdr_server.cpp
     src/audio_output.cpp
+    src/mpx_audio_output.cpp
     src/config.cpp
     src/signal_level.cpp
+    src/adaptive_bandwidth.cpp
+    src/calibration.cpp
+    src/dsp/multipath_eq.cpp
     src/main.cpp
 )
 
