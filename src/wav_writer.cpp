@@ -4,6 +4,8 @@
 #include <chrono>
 #include <iostream>
 
+#include <sys/stat.h>
+
 namespace {
 
 constexpr size_t kDefaultQueueSeconds = 2;
@@ -30,6 +32,13 @@ bool WavWriter::init(const std::string &filename, uint32_t sampleRate,
   if (!m_handle) {
     return false;
   }
+
+  // A pipe/FIFO/char device (e.g. --mpx-wav <fifo> or /dev/stdout) is not
+  // seekable: write the WAV header once, streaming, and never patch sizes on
+  // close. Only a regular file can have its header rewritten.
+  struct stat st {};
+  m_seekable =
+      (fstat(fileno(m_handle), &st) == 0) && S_ISREG(st.st_mode);
 
   m_sampleRate = sampleRate;
   m_channels = channels;
@@ -85,7 +94,10 @@ void WavWriter::shutdown() {
   if (m_thread.joinable()) {
     m_thread.join();
   }
-  if (!writeHeader() && !m_fatalError.load() && m_verboseLogging) {
+  // Patch the header sizes only on a seekable (regular) file. On a stream the
+  // header was already written once at the front; rewriting now would inject
+  // 44 bytes into the middle of the audio data.
+  if (m_seekable && !writeHeader() && !m_fatalError.load() && m_verboseLogging) {
     std::cerr << "[AUDIO] " << m_label << " final header write failed\n";
   }
   std::fclose(m_handle);
@@ -99,13 +111,17 @@ bool WavWriter::writeHeader() {
 
   const uint32_t byteRate = m_sampleRate * m_channels * BITS_PER_SAMPLE / 8;
   const uint16_t blockAlign = m_channels * BITS_PER_SAMPLE / 8;
-  const uint32_t dataSize = m_dataSize;
-  const uint32_t fileSize = 36u + dataSize;
+  // Streaming (non-seekable) output cannot have its sizes patched on close, so
+  // advertise the maximum -- downstream consumers read to EOF.
+  const uint32_t dataSize = m_seekable ? m_dataSize : 0xFFFFFFFFu;
+  const uint32_t fileSize = m_seekable ? (36u + m_dataSize) : 0xFFFFFFFFu;
   const uint32_t fmtSize = 16;
   const uint16_t audioFormat = 1;
   const uint16_t bitsPerSample = BITS_PER_SAMPLE;
 
-  if (std::fseek(m_handle, 0, SEEK_SET) != 0) {
+  // Only seek a regular file; on a pipe/FIFO the header is written in place
+  // at the start of the stream and never rewritten.
+  if (m_seekable && std::fseek(m_handle, 0, SEEK_SET) != 0) {
     if (m_verboseLogging) {
       std::cerr << "[AUDIO] " << m_label << " failed to seek WAV header\n";
     }

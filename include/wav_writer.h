@@ -47,6 +47,9 @@ private:
   uint32_t m_sampleRate;
   uint16_t m_channels;
   bool m_verboseLogging;
+  // False when the output is a pipe/FIFO/char device (not seekable): the
+  // header is written once, streaming, and never patched on close.
+  bool m_seekable = true;
   std::string m_label;
 
   std::mutex m_mutex;
