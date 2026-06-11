@@ -55,6 +55,10 @@ void printUsage(const char *prog) {
       << "      --mpx-audio-device <id>\n"
       << "                        Audio device for live MPX output (name "
          "substring or default-device if empty)\n"
+      << "      --mpx-gain-db <db>\n"
+      << "                        Gain on the MPX WAV/audio outputs (default: "
+         "-6; full scale = 150 kHz deviation). 0 restores the legacy 1.0 = "
+         "75 kHz scale, which clips on real broadcast peaks\n"
       << "  -i, --iq <file>       Capture raw IQ bytes to file\n"
       << "      --low-latency-iq  Keep newest IQ samples (drop backlog on "
          "overload)\n"
@@ -371,6 +375,29 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
         opts.mpxWavSampleRate = static_cast<uint32_t>(parsed);
       } catch (const std::exception &) {
         std::cerr << "[CLI] invalid --mpx-rate value: " << value << "\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      continue;
+    }
+    if (arg == "--mpx-gain-db" || arg.rfind("--mpx-gain-db=", 0) == 0) {
+      const std::string value = readValue(i, arg, "mpx-gain-db");
+      if (value.empty()) {
+        std::cerr << "[CLI] missing value for --mpx-gain-db\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      try {
+        const float parsed = std::stof(value);
+        if (parsed < -24.0f || parsed > 24.0f) {
+          std::cerr << "[CLI] --mpx-gain-db out of range [-24, 24]: " << value
+                    << "\n";
+          result.outcome = AppParseOutcome::ExitFailure;
+          return result;
+        }
+        opts.mpxGainDb = parsed;
+      } catch (const std::exception &) {
+        std::cerr << "[CLI] invalid --mpx-gain-db value: " << value << "\n";
         result.outcome = AppParseOutcome::ExitFailure;
         return result;
       }

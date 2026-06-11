@@ -46,6 +46,7 @@ bool WavWriter::init(const std::string &filename, uint32_t sampleRate,
   m_label = (label != nullptr) ? label : "WAV";
   m_dataSize = 0;
   m_fatalError.store(false);
+  m_gain = 1.0f;
   m_readPos = 0;
   m_writePos = 0;
   m_size = 0;
@@ -192,7 +193,7 @@ bool WavWriter::enqueueInterleavedFloat(const float *samples,
     m_encodeScratch.resize(sampleCount);
   }
   for (size_t i = 0; i < sampleCount; i++) {
-    const float clamped = std::clamp(samples[i], -1.0f, 1.0f);
+    const float clamped = std::clamp(samples[i] * m_gain, -1.0f, 1.0f);
     m_encodeScratch[i] = static_cast<int16_t>(clamped * kInt16Max);
   }
 

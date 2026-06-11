@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <iomanip>
@@ -129,6 +130,8 @@ bool Application::initMpxCapture(WavWriter &mpxWavOut,
     tunerSession.disconnect();
     return false;
   }
+  const float mpxGainLin = std::pow(10.0f, m_options.mpxGainDb / 20.0f);
+  mpxWavOut.setGain(mpxGainLin);
   if (m_options.verboseLogging) {
     std::cout << "[MPX] capture enabled: " << m_options.mpxWavFile << " ("
               << targetRate << " Hz mono";
@@ -136,6 +139,11 @@ bool Application::initMpxCapture(WavWriter &mpxWavOut,
       std::cout << ", resampled from " << sampleRate << " Hz";
     }
     std::cout << ")\n";
+    // Calibration line for downstream analyzers: the demod is 1.0 = 75 kHz
+    // deviation, so after output gain, digital full scale = 75/gain kHz.
+    std::cout << "[MPX] output gain " << m_options.mpxGainDb
+              << " dB (full scale = " << (75.0f / mpxGainLin)
+              << " kHz deviation)\n";
   }
   return true;
 }
@@ -197,6 +205,13 @@ bool Application::initMpxAudio(MpxAudioOutput &mpxAudioOut,
     std::cerr << "[MPX-AUDIO] failed to initialize live MPX audio output\n";
     tunerSession.disconnect();
     return false;
+  }
+  const float mpxGainLin = std::pow(10.0f, m_options.mpxGainDb / 20.0f);
+  mpxAudioOut.setGain(mpxGainLin);
+  if (m_options.verboseLogging) {
+    std::cout << "[MPX-AUDIO] output gain " << m_options.mpxGainDb
+              << " dB (full scale = " << (75.0f / mpxGainLin)
+              << " kHz deviation)\n";
   }
   return true;
 }
@@ -500,6 +515,11 @@ int Application::run() {
   bool appliedEffectiveForceMono = appliedForceMono;
   constexpr size_t kRetuneMuteSamples =
       static_cast<size_t>(OUTPUT_RATE / 25);
+  // Cold-start settle takes longer than a retune (RF AGC converging from
+  // scratch; glitches observed out to ~70 ms) and there is nothing to hear
+  // yet, so the start mute can afford a longer window: 120 ms.
+  constexpr size_t kStartMuteSamples =
+      static_cast<size_t>((OUTPUT_RATE * 3) / 25);
   SignalLevelSmoother rfLevelSmoother;
   dspPipeline.setDeemphasisMode(appliedDeemphasis);
   dspPipeline.setForceMono(appliedEffectiveForceMono);
@@ -592,8 +612,11 @@ int Application::run() {
   std::vector<uint8_t> iqBufferStorage(SDR_BUF_SAMPLES * 2, 0);
   uint8_t *iqBuffer = iqBufferStorage.data();
 
-  size_t retuneMuteSamplesRemaining = 0;
-  size_t retuneMuteTotalSamples = 0;
+  // Pre-armed so the very first processed samples after startup (including
+  // the --auto-start path, which connects before this loop) get the same
+  // settle mute as a retune. The counter only decrements while samples flow.
+  size_t retuneMuteSamplesRemaining = kStartMuteSamples;
+  size_t retuneMuteTotalSamples = kStartMuteSamples;
 
   ScanEngine scanEngine;
   auto lastGainDown =
@@ -638,6 +661,12 @@ int Application::run() {
     if (pendingStartRequest.exchange(false, std::memory_order_acq_rel)) {
       tunerSession.connect();
       dspRuntime.reset(fm_tuner::dsp::ResetReason::Start);
+      // Arm the settle mute on start as well as on retune: the demod's
+      // PLL/AGC settling emits a glitch burst (spikes to ~2x deviation full
+      // scale) for the first tens of ms, which otherwise reaches the audio
+      // AND the MPX outputs (WAV / live MPX / RDS) unmuted.
+      retuneMuteSamplesRemaining = kStartMuteSamples;
+      retuneMuteTotalSamples = kStartMuteSamples;
       tunerActive.store(rtlConnected, std::memory_order_release);
     }
 

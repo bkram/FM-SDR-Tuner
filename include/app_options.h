@@ -25,6 +25,12 @@ struct AppOptions {
   // 192000 Hz is a common target for downstream RDS / spectrum analysis tools
   // and for feeding FM exciters that accept raw MPX.
   uint32_t mpxWavSampleRate = 0;
+  // Gain (dB) applied to the MPX WAV / MPX audio outputs. The demod
+  // calibrates 75 kHz deviation to 1.0 full scale, and real broadcasts
+  // deviate to and beyond 75 kHz, so 0 dB hard-clips on peaks. The -6 dB
+  // default puts full scale at 150 kHz deviation: no clipping on any real
+  // signal, and a documented calibration for downstream analyzers.
+  float mpxGainDb = -6.0f;
   // Live MPX -> audio device routing (intended for virtual loopback like
   // BlackHole / snd-aloop, or for direct line-in into an FM exciter).
   bool mpxAudioEnabled = false;

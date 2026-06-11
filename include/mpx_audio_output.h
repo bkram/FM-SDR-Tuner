@@ -44,6 +44,12 @@ public:
   void shutdown();
   bool isOpen() const { return m_running.load(); }
 
+  // Linear gain applied at enqueue. Used for MPX headroom: the demod
+  // calibrates 75 kHz deviation to 1.0 full scale, so real broadcasts
+  // (which deviate to and beyond 75 kHz) would otherwise clip in the
+  // device-format conversion.
+  void setGain(float gain) { m_gain = gain; }
+
   // Push MPX samples at the source rate. Internally resampled (if needed) to
   // the target rate before being queued to the device.
   bool enqueueMpx(const float *samples, size_t sampleCount);
@@ -67,6 +73,8 @@ private:
   // callback then duplicates the same MPX sample to L and R via this field.
   unsigned int m_outChannels = 1;
   bool m_verboseLogging;
+  // Linear pre-conversion gain; see setGain().
+  float m_gain = 1.0f;
 
   std::atomic<bool> m_running;
 

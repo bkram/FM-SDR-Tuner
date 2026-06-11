@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <vector>
 
 namespace processing_runner {
 
@@ -52,16 +53,30 @@ bool processAudioBlock(
     appliedEffectiveForceMono = effectiveForceMono;
   }
 
+  // The retune/startup mute must also gate the MPX tap: the demod emits a
+  // glitch burst while the PLL/AGC settle after a frequency change (spikes to
+  // 2x deviation full scale), and unlike the 48 kHz audio path the MPX
+  // consumers (WAV capture, live MPX out -> exciter, RDS worker) previously
+  // received it unmuted. Zeros are substituted so stream timing is preserved.
+  const bool mpxMuted = retuneMuteSamplesRemaining > 0;
   DspPipeline::Result dspOut;
   const bool haveDsp = dspPipeline.process(
       iqBuffer, samples,
       [&](const float *mpx, size_t count) {
-        rdsWorker.enqueue(mpx, count);
+        static thread_local std::vector<float> mpxZeroBuf;
+        const float *out = mpx;
+        if (mpxMuted) {
+          if (mpxZeroBuf.size() < count) {
+            mpxZeroBuf.assign(count, 0.0f);
+          }
+          out = mpxZeroBuf.data();
+        }
+        rdsWorker.enqueue(out, count);
         if (mpxWavOut != nullptr) {
-          (void)mpxWavOut->enqueueMonoFloat(mpx, count);
+          (void)mpxWavOut->enqueueMonoFloat(out, count);
         }
         if (mpxAudioOut != nullptr && mpxAudioOut->isOpen()) {
-          (void)mpxAudioOut->enqueueMpx(mpx, count);
+          (void)mpxAudioOut->enqueueMpx(out, count);
         }
       },
       dspOut);
