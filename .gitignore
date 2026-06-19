@@ -16,3 +16,6 @@ build-*/
 
 # Local container build/test artifacts
 .docker-artifacts/
+
+# Personal runtime config — copy an example to this name and tune locally
+/fm-sdr-tuner.ini

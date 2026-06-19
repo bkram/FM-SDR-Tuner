@@ -104,7 +104,8 @@ jobs:
         mkdir -p dist/windows-mingw
         cp build/fm-sdr-tuner.exe dist/windows-mingw/
         cp README.md dist/windows-mingw/
-        cp fm-sdr-tuner.ini dist/windows-mingw/
+        cp fm-sdr-tuner.ini.example dist/windows-mingw/
+        cp scripts/rest_test_panel.py dist/windows-mingw/
 
         mapfile -t deps < <(
           ldd build/fm-sdr-tuner.exe \

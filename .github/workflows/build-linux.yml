@@ -46,6 +46,43 @@ jobs:
           build-coverage/coverage.xml
           build-coverage/coverage.html
 
+  # Compile-check the real SDRplay source path. The release artifacts ship
+  # WITHOUT SDRplay (the proprietary API can't be redistributed), so this job
+  # exists only so a regression in sdrplay_device.cpp's real path can't slip
+  # past CI. We fetch the vendor's public API package for its headers and build
+  # with the feature on; nothing here is uploaded or redistributed.
+  sdrplay-compile-check-ubuntu-24-04:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
+        $SUDO apt-get update
+        $SUDO apt-get install -y cmake g++ pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev catch2
+
+    - name: Fetch SDRplay API headers (no redistribution; compile check only)
+      run: |
+        # Public vendor download, no auth. makeself self-extractor: --noexec
+        # --target extracts the payload (incl. inc/sdrplay_api.h) without running
+        # the interactive installer. Pinned version — bump if it 404s.
+        curl -sSL --retry 3 --max-time 120 -o sdrplay.run \
+          https://www.sdrplay.com/software/SDRplay_RSP_API-Linux-3.15.2.run
+        sh sdrplay.run --noexec --target sdrplay_pkg
+        test -f sdrplay_pkg/inc/sdrplay_api.h
+
+    - name: Configure + build with SDRplay enabled
+      run: |
+        cmake -S . -B build-sdrplay -DCMAKE_BUILD_TYPE=Release \
+          -DFM_TUNER_ENABLE_SDRPLAY=ON \
+          -DSDRPLAY_INCLUDE_DIR="$PWD/sdrplay_pkg/inc" 2>&1 | tee cmake-sdrplay.log
+        # Fail loudly if the header wasn't picked up and we silently built the
+        # stub instead of the real path.
+        grep -q "SDRplay support enabled" cmake-sdrplay.log
+        cmake --build build-sdrplay -j"$(nproc)"
+
   build-ubuntu-24-04:
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -82,7 +119,8 @@ jobs:
         mkdir -p ../dist/linux
         cp ./*.deb ../dist/linux/
         cp ../README.md ../dist/linux/
-        cp ../fm-sdr-tuner.ini ../dist/linux/
+        cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -127,7 +165,8 @@ jobs:
         mkdir -p ../dist/linux
         cp ./*.deb ../dist/linux/
         cp ../README.md ../dist/linux/
-        cp ../fm-sdr-tuner.ini ../dist/linux/
+        cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -174,7 +213,8 @@ jobs:
         mkdir -p ../dist/linux
         cp ./*.rpm ../dist/linux/
         cp ../README.md ../dist/linux/
-        cp ../fm-sdr-tuner.ini ../dist/linux/
+        cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -221,7 +261,8 @@ jobs:
         mkdir -p ../dist/linux
         cp ./*.rpm ../dist/linux/
         cp ../README.md ../dist/linux/
-        cp ../fm-sdr-tuner.ini ../dist/linux/
+        cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4

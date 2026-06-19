@@ -116,7 +116,7 @@ If `fm-sdr-tuner` reports `[SDR] no rtl_sdr device found at index 0` even after 
 
 The tuner writes PCM to a single OS audio output device (Core Audio / ALSA / WinMM). It does not stream audio over the XDR control connection. If you want another application — FM-DX-Webserver, a streaming encoder, a recorder — to consume the tuner's audio, you need a virtual loopback that exposes the tuner's output as a recordable input on the host. Without a loopback the tuner can only play to a local speaker.
 
-List the devices the tuner can see with `./build/fm-sdr-tuner -l`, then point it at the loopback either per-run with `-d "<name>"` or persistently via `[audio] device = ...` in the INI. The bundled `fm-sdr-tuner.ini` already defaults to `BlackHole 2ch`.
+List the devices the tuner can see with `./build/fm-sdr-tuner -l`, then point it at the loopback either per-run with `-d "<name>"` or persistently via `[audio] device = ...` in the INI (e.g. `device = BlackHole 2ch`). The shipped example configs leave `device` empty (system default).
 
 ### macOS — BlackHole
 
@@ -529,13 +529,22 @@ A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; no
 
 ## Config-Driven Usage (optional)
 
-Once you know your site profile (gain, meter calibration, bandwidth), move the settings into a config file:
+The repo and release artifacts ship two documented example configs — copy the
+one for your hardware to `fm-sdr-tuner.ini` and tune it for your site (your
+personal `fm-sdr-tuner.ini` is git-ignored, so it is never committed):
 
 ```bash
+cp fm-sdr-tuner.ini.example fm-sdr-tuner.ini          # RTL-SDR (sane defaults)
+# or, for an SDRplay RSP (macOS/Linux, SDRplay build only):
+cp fm-sdr-tuner-sdrplay.ini.example fm-sdr-tuner.ini
+
 ./build/fm-sdr-tuner -c fm-sdr-tuner.ini
 ```
 
-The bundled `fm-sdr-tuner.ini` is documented and safe to copy. CLI flags override anything the config sets, which is useful for A/B testing:
+Both examples enable the REST control API (`[rest] enabled = true`, port 8080)
+and the bundled test panel (`scripts/rest_test_panel.py`, shipped in the
+artifact). CLI flags override anything the config sets, which is useful for A/B
+testing:
 
 ```bash
 # temporary frequency override on top of a baseline config
@@ -547,7 +556,10 @@ The bundled `fm-sdr-tuner.ini` is documented and safe to copy. CLI flags overrid
 
 ## Configuration (`fm-sdr-tuner.ini`)
 
-`fm-sdr-tuner.ini` is the primary control surface.
+`fm-sdr-tuner.ini` is the primary control surface. It is **git-ignored** — start
+from a shipped example (`fm-sdr-tuner.ini.example` for RTL-SDR,
+`fm-sdr-tuner-sdrplay.ini.example` for SDRplay) and copy it to
+`fm-sdr-tuner.ini`.
 
 Important sections:
 - `[tuner]`: source, device index, startup frequency, deemphasis
@@ -1233,9 +1245,14 @@ Artifacts currently uploaded by CI:
   - `fm-sdr-tuner-linux-rpm-fedora-43-x64`
   - `fm-sdr-tuner-linux-rpm-fedora-43-arm64`
 - macOS build job:
-  - `fm-sdr-tuner-macos` (binary + `README.md` + `fm-sdr-tuner.ini`)
+  - `fm-sdr-tuner-macos` (binary + `README.md` + both `*.ini.example` configs + `rest_test_panel.py` + `run_rest_panel.sh`)
 - Windows MinGW job:
-  - `fm-sdr-tuner-windows-mingw` (`.exe` + required DLLs + `dependencies.txt`)
+  - `fm-sdr-tuner-windows-mingw` (`.exe` + required DLLs + `dependencies.txt` + `fm-sdr-tuner.ini.example` + `rest_test_panel.py`)
+
+All release builds are produced **without** SDRplay support (the proprietary API
+can't be redistributed). Separate Linux/macOS CI jobs compile-check the SDRplay
+source path against the vendor's public API headers, but never ship it; to use an
+RSP, build from source with `-DFM_TUNER_ENABLE_SDRPLAY=ON` (macOS/Linux only).
 
 Notes:
 - Linux smoke-test jobs validate package installability in fresh containers, but
