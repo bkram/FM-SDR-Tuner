@@ -35,8 +35,14 @@ public:
   static constexpr float kDefaultVolumeScale = 0.85f;
   static constexpr float kInt16Max = 32767.0f;
   static constexpr size_t kCircularBufferSize = 65536;
+  // ~2 s of speaker-ring headroom. A gain change / retune briefly stalls the
+  // USB IQ read, then a backlog burst arrives and is demodulated faster than
+  // real time; a small ring dropped those samples (audible stutter on every
+  // auto-gain step). The output thread keeps up in steady state, so the ring
+  // runs near-empty and this larger capacity only absorbs bursts — it adds no
+  // steady-state latency.
   static constexpr size_t kSpeakerQueueSamples =
-      (static_cast<size_t>(SAMPLE_RATE) * CHANNELS) / 2;
+      static_cast<size_t>(SAMPLE_RATE) * CHANNELS * 2;
   static constexpr size_t kWavQueueSamples =
       static_cast<size_t>(SAMPLE_RATE) * CHANNELS * 2;
   static constexpr float kVolumeEpsilon = 1e-6f;

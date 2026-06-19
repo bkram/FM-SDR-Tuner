@@ -972,12 +972,21 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
       std::cout << "[AUDIO] winmm selector raw='" << deviceSelector
                 << "' normalized='" << normalizedSelector << "'\n";
     }
-    const UINT devId = selectWinMMDevice(normalizedSelector);
-    if (devId == UINT_MAX) {
-      std::cerr << "WinMM device not found for selector: " << normalizedSelector
-                << "\n";
-      listWinMMDevices();
-      return false;
+    // WAVE_MAPPER is (UINT)-1 == UINT_MAX, the same value selectWinMMDevice()
+    // returns for "not found". An empty selector (system default) must use the
+    // mapper directly and skip the not-found check, or that sentinel collision
+    // makes the default-device case look like a lookup failure and the audio
+    // backend refuses to start.
+    UINT openId = WAVE_MAPPER;
+    if (!normalizedSelector.empty()) {
+      const UINT devId = selectWinMMDevice(normalizedSelector);
+      if (devId == UINT_MAX) {
+        std::cerr << "WinMM device not found for selector: "
+                  << normalizedSelector << "\n";
+        listWinMMDevices();
+        return false;
+      }
+      openId = devId;
     }
 
     WAVEFORMATEX fmt{};
@@ -997,7 +1006,6 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
       return false;
     }
 
-    const UINT openId = normalizedSelector.empty() ? WAVE_MAPPER : devId;
     const MMRESULT wr = waveOutOpen(
         &m_waveOut, openId, &fmt,
         reinterpret_cast<DWORD_PTR>(m_winmmEvent), 0, CALLBACK_EVENT);
