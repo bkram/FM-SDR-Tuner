@@ -8,11 +8,12 @@
 
 [tuner]
 # Source: rtl_sdr (direct USB), rtl_tcp (network server), or sdrplay (RSP series).
-# NOTE: sdrplay requires a build with -DFM_TUNER_ENABLE_SDRPLAY=ON and the
-# SDRplay API service installed/running, and is supported on macOS and Linux
-# only (the runtime loader is POSIX dlopen — not available on Windows). The
-# prebuilt release binaries are built WITHOUT SDRplay; see the SDRplay example
-# config and the README. If no RSP is present, use rtl_sdr (or --source rtl_sdr).
+# NOTE: the macOS and Linux prebuilt binaries are SDRplay-capable — just install
+# the SDRplay API service (sdrplay.com) and set source=sdrplay. The SDRplay
+# library is dlopen'd at runtime, so the binary also runs fine on RTL-only
+# systems. Windows is RTL-only (no SDRplay loader). Building SDRplay from source
+# needs -DFM_TUNER_ENABLE_SDRPLAY=ON (macOS/Linux). If no RSP is present, use
+# rtl_sdr (or --source rtl_sdr).
 source = rtl_sdr
 
 # RTL-SDR device index when source=rtl_sdr

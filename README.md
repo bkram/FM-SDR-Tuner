@@ -1266,10 +1266,15 @@ Artifacts currently uploaded by CI:
 - Windows MinGW job:
   - `fm-sdr-tuner-windows-mingw` (`.exe` + required DLLs + `dependencies.txt` + `fm-sdr-tuner.ini.example` + `rest_test_panel.py`)
 
-All release builds are produced **without** SDRplay support (the proprietary API
-can't be redistributed). Separate Linux/macOS CI jobs compile-check the SDRplay
-source path against the vendor's public API headers, but never ship it; to use an
-RSP, build from source with `-DFM_TUNER_ENABLE_SDRPLAY=ON` (macOS/Linux only).
+The **macOS and Linux** release builds are **SDRplay-capable**: CI builds them
+with `-DFM_TUNER_ENABLE_SDRPLAY=ON` against the vendor's public API *headers*
+(fetched at build time). The SDRplay library is `dlopen`'d at runtime, never
+linked or bundled — so nothing proprietary is redistributed, no package
+dependency is added, and the binary still runs on RTL-only systems. To use an
+RSP with a prebuilt binary, just install the **SDRplay API service** from
+<https://www.sdrplay.com/>. The **Windows** build is RTL-only (no SDRplay
+loader). Building SDRplay from source needs `-DFM_TUNER_ENABLE_SDRPLAY=ON`
+(macOS/Linux only).
 
 Notes:
 - Linux smoke-test jobs validate package installability in fresh containers, but

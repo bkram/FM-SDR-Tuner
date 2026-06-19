@@ -23,10 +23,26 @@ jobs:
           fi
         done
 
-    - name: Build
+    # Fetch the SDRplay API *headers* so the shipped binary is SDRplay-capable.
+    # The library is dlopen'd at runtime (never linked/bundled), so this
+    # redistributes nothing proprietary and the binary still runs on RTL-only
+    # systems. Public vendor download, no auth; pkgutil --expand-full unpacks
+    # the .pkg payload without running the installer. Pinned version — bump if
+    # it 404s.
+    - name: Fetch SDRplay API headers
+      run: |
+        curl -sSL --retry 3 --max-time 120 -o sdrplay-mac.pkg \
+          https://www.sdrplay.com/software/SDRplayAPI-macos-installer-universal-3.15.1.pkg
+        pkgutil --expand-full sdrplay-mac.pkg sdrplay_pkg
+        echo "SDRPLAY_INC=$(dirname "$(find "$PWD/sdrplay_pkg" -name sdrplay_api.h | head -1)")" >> "$GITHUB_ENV"
+
+    - name: Build (SDRplay-enabled)
       run: |
         export OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
-        cmake -S . -B build
+        cmake -S . -B build -DFM_TUNER_ENABLE_SDRPLAY=ON \
+          -DSDRPLAY_INCLUDE_DIR="$SDRPLAY_INC" 2>&1 | tee cmake.log
+        # Fail loudly rather than silently ship an RTL-only binary.
+        grep -q "SDRplay support enabled" cmake.log
         cmake --build build -j$(sysctl -n hw.ncpu)
 
     - name: Run tests
@@ -49,38 +65,3 @@ jobs:
       with:
         name: fm-sdr-tuner-macos
         path: dist/macos
-
-  # Compile-check the real SDRplay source path (macOS supports SDRplay). The
-  # release artifact ships WITHOUT SDRplay; this job only fetches the vendor's
-  # public API package for its headers so a regression in sdrplay_device.cpp
-  # can't slip past CI. Nothing here is uploaded or redistributed.
-  sdrplay-compile-check:
-    runs-on: macos-latest
-
-    steps:
-    - uses: actions/checkout@v5
-
-    - name: Install dependencies
-      run: |
-        for pkg in cmake pkgconf libtool librtlsdr libusb liquid-dsp openssl@3 catch2; do
-          brew list --versions "$pkg" >/dev/null || brew install "$pkg"
-        done
-
-    - name: Fetch SDRplay API headers (no redistribution; compile check only)
-      run: |
-        # Public vendor download, no auth. pkgutil --expand-full unpacks the
-        # .pkg payload (incl. include/sdrplay_api.h) without running the
-        # installer. Pinned version — bump if it 404s.
-        curl -sSL --retry 3 --max-time 120 -o sdrplay-mac.pkg \
-          https://www.sdrplay.com/software/SDRplayAPI-macos-installer-universal-3.15.1.pkg
-        pkgutil --expand-full sdrplay-mac.pkg sdrplay_pkg
-        test -n "$(find sdrplay_pkg -name sdrplay_api.h)"
-
-    - name: Configure + build with SDRplay enabled
-      run: |
-        export OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
-        INC="$(dirname "$(find "$PWD/sdrplay_pkg" -name sdrplay_api.h | head -1)")"
-        cmake -S . -B build-sdrplay -DFM_TUNER_ENABLE_SDRPLAY=ON \
-          -DSDRPLAY_INCLUDE_DIR="$INC" 2>&1 | tee cmake-sdrplay.log
-        grep -q "SDRplay support enabled" cmake-sdrplay.log
-        cmake --build build-sdrplay -j"$(sysctl -n hw.ncpu)"
