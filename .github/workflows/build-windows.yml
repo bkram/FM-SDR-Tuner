@@ -11,7 +11,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Setup MSYS2 (MinGW-w64)
       uses: msys2/setup-msys2@v2
@@ -147,7 +147,7 @@ jobs:
         fi
 
     - name: Upload artifact (MinGW-w64)
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: fm-sdr-tuner-windows-mingw
         path: dist/windows-mingw
