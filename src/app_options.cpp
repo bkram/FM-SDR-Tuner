@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -107,6 +108,18 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
     if (arg == "--config" && i + 1 < argc) {
       opts.configPath = argv[++i];
       continue;
+    }
+  }
+
+  // If no explicit --config was given, auto-load fm-sdr-tuner.ini from the
+  // working directory when present. Users edit the bundled config next to the
+  // executable and expect it to take effect without remembering -c.
+  if (opts.configPath.empty()) {
+    std::ifstream probe("fm-sdr-tuner.ini");
+    if (probe.good()) {
+      opts.configPath = "fm-sdr-tuner.ini";
+      std::cout << "[Config] auto-loading fm-sdr-tuner.ini from the working "
+                   "directory (no --config given)\n";
     }
   }
 
