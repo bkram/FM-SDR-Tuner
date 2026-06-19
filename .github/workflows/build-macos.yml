@@ -40,6 +40,8 @@ jobs:
         cp build/fm-sdr-tuner dist/macos/
         cp README.md dist/macos/
         cp fm-sdr-tuner.ini.example fm-sdr-tuner-sdrplay.ini.example dist/macos/
+        # Ready-to-use config so auto-load (no -c) works on first run.
+        cp fm-sdr-tuner.ini.example dist/macos/fm-sdr-tuner.ini
         cp scripts/rest_test_panel.py scripts/run_rest_panel.sh dist/macos/
 
     - name: Upload artifact

@@ -120,6 +120,8 @@ jobs:
         cp ./*.deb ../dist/linux/
         cp ../README.md ../dist/linux/
         cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        # Ready-to-use config so auto-load (no -c) works on first run.
+        cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
         cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
@@ -166,6 +168,8 @@ jobs:
         cp ./*.deb ../dist/linux/
         cp ../README.md ../dist/linux/
         cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        # Ready-to-use config so auto-load (no -c) works on first run.
+        cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
         cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
@@ -214,6 +218,8 @@ jobs:
         cp ./*.rpm ../dist/linux/
         cp ../README.md ../dist/linux/
         cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        # Ready-to-use config so auto-load (no -c) works on first run.
+        cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
         cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
@@ -262,6 +268,8 @@ jobs:
         cp ./*.rpm ../dist/linux/
         cp ../README.md ../dist/linux/
         cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        # Ready-to-use config so auto-load (no -c) works on first run.
+        cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
         cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact

@@ -105,6 +105,8 @@ jobs:
         cp build/fm-sdr-tuner.exe dist/windows-mingw/
         cp README.md dist/windows-mingw/
         cp fm-sdr-tuner.ini.example dist/windows-mingw/
+        # Ready-to-use config so auto-load (no -c) works on first run.
+        cp fm-sdr-tuner.ini.example dist/windows-mingw/fm-sdr-tuner.ini
         cp scripts/rest_test_panel.py dist/windows-mingw/
 
         mapfile -t deps < <(

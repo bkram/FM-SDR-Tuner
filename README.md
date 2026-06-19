@@ -529,16 +529,30 @@ A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; no
 
 ## Config-Driven Usage (optional)
 
-The repo and release artifacts ship two documented example configs — copy the
-one for your hardware to `fm-sdr-tuner.ini` and tune it for your site (your
-personal `fm-sdr-tuner.ini` is git-ignored, so it is never committed):
+**Auto-load:** when you run the binary **without** `-c`/`--config`, it looks for
+`fm-sdr-tuner.ini` in the current working directory and loads it automatically
+(you'll see `[Config] auto-loading fm-sdr-tuner.ini …` at startup). So you can
+just edit the config next to the executable and run it — no `-c` needed. The
+release artifacts ship a ready-to-use `fm-sdr-tuner.ini` (a copy of the RTL
+example) for exactly this, so it works on first run:
+
+```bash
+./build/fm-sdr-tuner            # auto-loads ./fm-sdr-tuner.ini if present
+```
+
+An explicit `-c <file>` always wins over the auto-loaded file, and if no
+`fm-sdr-tuner.ini` is present the binary just uses its built-in defaults.
+
+The repo and release artifacts also ship two documented example configs — copy
+the one for your hardware over `fm-sdr-tuner.ini` and tune it for your site
+(your personal `fm-sdr-tuner.ini` is git-ignored, so it is never committed):
 
 ```bash
 cp fm-sdr-tuner.ini.example fm-sdr-tuner.ini          # RTL-SDR (sane defaults)
 # or, for an SDRplay RSP (macOS/Linux, SDRplay build only):
 cp fm-sdr-tuner-sdrplay.ini.example fm-sdr-tuner.ini
 
-./build/fm-sdr-tuner -c fm-sdr-tuner.ini
+./build/fm-sdr-tuner            # or: -c fm-sdr-tuner.ini to be explicit
 ```
 
 Both examples enable the REST control API (`[rest] enabled = true`, port 9090)
