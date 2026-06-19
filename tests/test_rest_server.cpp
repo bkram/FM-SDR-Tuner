@@ -1,18 +1,39 @@
 #include "catch_compat.h"
 
-#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <netinet/in.h>
 #include <string>
-#include <sys/socket.h>
 #include <thread>
+
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define CLOSESOCKET closesocket
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#define CLOSESOCKET ::close
+#endif
 
 #include "rest_server.h"
 
 namespace {
+
+#if defined(_WIN32)
+// Winsock must be initialized before any socket call; one static instance
+// covers the whole test process.
+struct WinsockInit {
+  WinsockInit() {
+    WSADATA d;
+    WSAStartup(MAKEWORD(2, 2), &d);
+  }
+  ~WinsockInit() { WSACleanup(); }
+};
+const WinsockInit g_winsockInit;
+#endif
 
 // Bind an ephemeral port to discover a free one, then release it for the
 // server to reuse (SO_REUSEADDR is set by RestServer).
@@ -27,7 +48,7 @@ uint16_t pickFreePort() {
   socklen_t len = sizeof(addr);
   REQUIRE(::getsockname(s, reinterpret_cast<sockaddr *>(&addr), &len) == 0);
   const uint16_t port = ntohs(addr.sin_port);
-  ::close(s);
+  CLOSESOCKET(s);
   return port;
 }
 
@@ -39,18 +60,18 @@ std::string httpRequest(uint16_t port, const std::string &raw) {
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = htons(port);
   if (::connect(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-    ::close(s);
+    CLOSESOCKET(s);
     return {};
   }
-  ::send(s, raw.data(), raw.size(), 0);
+  ::send(s, raw.data(), static_cast<int>(raw.size()), 0);
   std::string resp;
   char buf[1024];
   for (;;) {
-    const auto n = ::recv(s, buf, sizeof(buf), 0);
+    const auto n = ::recv(s, buf, static_cast<int>(sizeof(buf)), 0);
     if (n <= 0) break;
     resp.append(buf, static_cast<size_t>(n));
   }
-  ::close(s);
+  CLOSESOCKET(s);
   return resp;
 }
 
