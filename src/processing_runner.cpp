@@ -40,7 +40,9 @@ bool processAudioBlock(
     RdsWorker &rdsWorker, XDRServer &xdrServer,
     size_t &retuneMuteSamplesRemaining, size_t &retuneMuteTotalSamples,
     AudioOutput &audioOut, WavWriter *mpxWavOut,
-    MpxAudioOutput *mpxAudioOut) {
+    MpxAudioOutput *mpxAudioOut, const std::complex<float> *iqComplex,
+    const std::function<void(float, bool, float, float, float, float, float)>
+        &dspTelemetryHook) {
   SignalLevelResult signal = computeSignalLevel(
       iqBuffer, samples, effectiveAppliedGainDb, signalGainCompFactor,
       config.sdr.signal_bias_db, config.sdr.signal_floor_dbfs,
@@ -60,26 +62,31 @@ bool processAudioBlock(
   // received it unmuted. Zeros are substituted so stream timing is preserved.
   const bool mpxMuted = retuneMuteSamplesRemaining > 0;
   DspPipeline::Result dspOut;
-  const bool haveDsp = dspPipeline.process(
-      iqBuffer, samples,
-      [&](const float *mpx, size_t count) {
-        static thread_local std::vector<float> mpxZeroBuf;
-        const float *out = mpx;
-        if (mpxMuted) {
-          if (mpxZeroBuf.size() < count) {
-            mpxZeroBuf.assign(count, 0.0f);
-          }
-          out = mpxZeroBuf.data();
-        }
-        rdsWorker.enqueue(out, count);
-        if (mpxWavOut != nullptr) {
-          (void)mpxWavOut->enqueueMonoFloat(out, count);
-        }
-        if (mpxAudioOut != nullptr && mpxAudioOut->isOpen()) {
-          (void)mpxAudioOut->enqueueMpx(out, count);
-        }
-      },
-      dspOut);
+  auto rdsSink = [&](const float *mpx, size_t count) {
+    static thread_local std::vector<float> mpxZeroBuf;
+    const float *out = mpx;
+    if (mpxMuted) {
+      if (mpxZeroBuf.size() < count) {
+        mpxZeroBuf.assign(count, 0.0f);
+      }
+      out = mpxZeroBuf.data();
+    }
+    rdsWorker.enqueue(out, count);
+    if (mpxWavOut != nullptr) {
+      (void)mpxWavOut->enqueueMonoFloat(out, count);
+    }
+    if (mpxAudioOut != nullptr && mpxAudioOut->isOpen()) {
+      (void)mpxAudioOut->enqueueMpx(out, count);
+    }
+  };
+  // SDRplay (and other 16-bit sources) feed the demod the full-precision
+  // complex<float> samples; the uint8 iqBuffer is the quantized shadow used by
+  // the signal meter above. RTL sources pass iqComplex == nullptr and demod
+  // straight from the uint8 buffer.
+  const bool haveDsp =
+      (iqComplex != nullptr)
+          ? dspPipeline.process(iqComplex, samples, rdsSink, dspOut)
+          : dspPipeline.process(iqBuffer, samples, rdsSink, dspOut);
   if (!haveDsp) {
     return false;
   }
@@ -102,6 +109,11 @@ bool processAudioBlock(
   const int pilotTenthsKHz = dspOut.pilotTenthsKHz;
   const float stereoBlend = dspOut.stereoBlend;
   const float stereoQuality = dspOut.stereoQuality;
+  if (dspTelemetryHook) {
+    dspTelemetryHook(dspOut.pilotDeviationKHz, stereoDetected, stereoQuality,
+                     dspOut.mpxMagnitude, dspOut.mpxPeak, dspOut.rdsDeviationKHz,
+                     dspOut.demodSnrDb);
+  }
   const double clipRatio = std::max(signal.hardClipRatio, signal.nearClipRatio);
   const float rfLevelFiltered =
       smoothSignalLevel(displaySignal.level120, rfLevelSmoother);

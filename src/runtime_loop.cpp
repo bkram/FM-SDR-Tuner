@@ -29,7 +29,9 @@ bool handleControlAndScan(
     size_t sdrBufSamples, uint32_t iqSampleRate, int effectiveAppliedGainDb,
     double signalGainCompFactor, const Config::SDRSection &sdrConfig,
     const std::function<void(uint32_t, int)> &restoreAfterScan,
-    const std::function<bool()> &shouldRun) {
+    const std::function<bool()> &shouldRun,
+    const std::function<uint32_t(bool)> &setScanWideMode, bool &scanWideActive,
+    uint32_t &scanWideRate, const std::function<void()> &tunerFlush) {
   scanEngine.handleControl(xdrServer, requestedFrequencyHz.load(),
                            appliedBandwidthHz, rtlConnected, verboseLogging,
                            requestedBandwidthHz, pendingBandwidth,
@@ -38,6 +40,12 @@ bool handleControlAndScan(
   if (rtlConnected && pendingFrequency.exchange(false)) {
     const uint32_t targetFrequencyHz = requestedFrequencyHz.load();
     if (tunerSetFrequency(targetFrequencyHz)) {
+      // Reflect the applied frequency in the XDR server state regardless of who
+      // requested it (XDR command, REST API, scan restore, ...). The XDR/FM-DX
+      // command handlers set it themselves, but REST/internal retunes go only
+      // through the pending-frequency path, so without this an XDR client (e.g.
+      // FM-DX-Webserver) would report a stale frequency after a REST change.
+      xdrServer.setFrequencyState(targetFrequencyHz);
       audioOut.clearRealtimeQueue();
       dspRuntime.reset(fm_tuner::dsp::ResetReason::Retune);
       retuneMuteSamplesRemaining = kRetuneMuteSamples;
@@ -71,10 +79,28 @@ bool handleControlAndScan(
     }
   }
 
+  // SDRplay wide-bandwidth scan: when a sweep is active, drop the hardware
+  // decimation so each retune covers ~8x more spectrum (a full-band sweep is
+  // otherwise dominated by SDRplay's per-retune LO settling). Switch back to
+  // the 256 kHz audio rate the moment the scan ends. No-op for RTL (the lambda
+  // returns 0, so the normal rate is kept).
+  const bool scanActive = scanEngine.isActive();
+  if (scanActive && !scanWideActive) {
+    const uint32_t wide = setScanWideMode(true);
+    scanWideRate = (wide != 0) ? wide : iqSampleRate;
+    scanWideActive = true;
+  } else if (!scanActive && scanWideActive) {
+    setScanWideMode(false);
+    scanWideActive = false;
+    scanWideRate = iqSampleRate;
+  }
+  const uint32_t effectiveScanRate = scanWideActive ? scanWideRate : iqSampleRate;
+
   return scanEngine.runIfActive(
       xdrServer, rtlConnected, shouldRun, tunerSetFrequency, tunerReadIQ,
-      writeIqCapture, scanRetrySleep, iqBuffer, sdrBufSamples, iqSampleRate,
-      effectiveAppliedGainDb, signalGainCompFactor, sdrConfig, restoreAfterScan);
+      writeIqCapture, scanRetrySleep, iqBuffer, sdrBufSamples, effectiveScanRate,
+      effectiveAppliedGainDb, signalGainCompFactor, sdrConfig, restoreAfterScan,
+      tunerFlush);
 }
 
 void maybeAdjustAutoGain(

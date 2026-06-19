@@ -1,6 +1,7 @@
 #ifndef PROCESSING_RUNNER_H
 #define PROCESSING_RUNNER_H
 
+#include <complex>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -28,7 +29,12 @@ bool processAudioBlock(
     RdsWorker &rdsWorker, XDRServer &xdrServer,
     size_t &retuneMuteSamplesRemaining, size_t &retuneMuteTotalSamples,
     AudioOutput &audioOut, WavWriter *mpxWavOut,
-    MpxAudioOutput *mpxAudioOut = nullptr);
+    MpxAudioOutput *mpxAudioOut = nullptr,
+    const std::complex<float> *iqComplex = nullptr,
+    const std::function<void(float pilotDeviationKHz, bool stereo, float quality,
+                             float mpxMagnitude, float mpxPeak,
+                             float rdsDeviationKHz, float demodSnrDb)>
+        &dspTelemetryHook = {});
 
 } // namespace processing_runner
 

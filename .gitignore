@@ -13,3 +13,6 @@ __pycache__/
 *.egg-info/
 research/
 build-*/
+
+# Local container build/test artifacts
+.docker-artifacts/

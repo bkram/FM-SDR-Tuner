@@ -169,7 +169,7 @@ bool WavWriter::writeData(const int16_t *samples, size_t sampleCount) {
   }
   const size_t written =
       std::fwrite(samples, sizeof(int16_t), sampleCount, m_handle);
-  m_dataSize += static_cast<uint32_t>(written * sizeof(int16_t));
+  m_dataSize += static_cast<uint32_t>(written) * 2u;
   if (written != sampleCount) {
     if (m_verboseLogging) {
       std::cerr << "[AUDIO] " << m_label << " short WAV write (" << written

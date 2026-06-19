@@ -317,9 +317,20 @@ void AudioOutput::logSpeakerOverflow(const char *backendLabel,
   if (!m_verboseLogging) {
     return;
   }
+  if (count == 1) {
+    // First occurrence: explain the cause instead of a bare counter. The ring
+    // only overflows when the output device can't sustain 48 kHz stereo, so
+    // samples are being dropped (audible gaps).
+    std::cerr << "[AUDIO] " << backendLabel
+              << " output can't keep up with 48 kHz — dropping samples. The "
+                 "selected audio device/driver is draining too slowly. Try the "
+                 "system default device (-d / [audio] device), and re-run with "
+                 "--verbose to report.\n";
+    return;
+  }
   if (count <= 5 || (count % 50) == 0) {
     std::cerr << "[AUDIO] " << backendLabel << " queue overflow (" << count
-              << ")\n";
+              << " dropped bursts)\n";
   }
 }
 
@@ -706,10 +717,20 @@ void AudioOutput::shutdownAlsa() {
 
 #if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
 void AudioOutput::runWinMMOutputThread() {
-  // Lower WinMM device buffering to reduce end-to-end output latency.
-  constexpr size_t kFrames = 512;
+  // Event-driven WinMM output. The device is opened with CALLBACK_EVENT, so the
+  // driver signals m_winmmEvent on every buffer completion and this thread
+  // blocks on that event instead of polling. Polling with sleep_for() was
+  // throttled by Windows' ~15.6 ms default timer resolution to well below the
+  // 48 kHz the device consumes, which backed up the ring and dropped audio.
+  // ~170 ms of device buffering (8 x 1024 frames) absorbs scheduler jitter;
+  // latency is irrelevant for a broadcast tuner.
+  constexpr size_t kFrames = 1024;
   constexpr size_t kSamplesPerBuffer = kFrames * CHANNELS;
-  constexpr size_t kNumBuffers = 4;
+  constexpr size_t kNumBuffers = 8;
+
+  // Tighten the system timer so the fallback CV wait and any driver timing is
+  // fine-grained rather than rounded to the default ~15.6 ms tick.
+  timeBeginPeriod(1);
 
   std::vector<std::vector<int16_t>> buffers(
       kNumBuffers, std::vector<int16_t>(kSamplesPerBuffer, 0));
@@ -729,54 +750,65 @@ void AudioOutput::runWinMMOutputThread() {
       for (size_t j = 0; j < i; j++) {
         waveOutUnprepareHeader(m_waveOut, &headers[j], sizeof(WAVEHDR));
       }
+      timeEndPeriod(1);
       m_winmmThreadRunning = false;
       return;
     }
   }
 
   while (m_winmmThreadRunning.load()) {
-    WAVEHDR *hdr = nullptr;
-    std::vector<int16_t> *pcm = nullptr;
-    for (size_t i = 0; i < kNumBuffers; i++) {
-      if ((headers[i].dwFlags & WHDR_INQUEUE) == 0) {
-        hdr = &headers[i];
-        pcm = &buffers[i];
+    // Refill and submit *every* free buffer this wake (a completion may free
+    // several at once), draining the ring as fast as the device retires it.
+    bool submittedAny = false;
+    for (size_t i = 0; i < kNumBuffers && m_winmmThreadRunning.load(); i++) {
+      if ((headers[i].dwFlags & WHDR_INQUEUE) != 0) {
+        continue; // still owned by the driver
+      }
+
+      size_t copied = 0;
+      {
+        std::unique_lock<std::mutex> lock(m_speakerMutex);
+        copied =
+            popSpeakerSamplesLocked(m_speakerScratch.data(), kSamplesPerBuffer);
+      }
+      if (copied == 0) {
+        break; // ring empty — wait for more input or buffer completions
+      }
+
+      std::vector<int16_t> &pcm = buffers[i];
+      for (size_t s = 0; s < copied; s++) {
+        const float v = std::clamp(m_speakerScratch[s], -1.0f, 1.0f);
+        pcm[s] = static_cast<int16_t>(v * 32767.0f);
+      }
+      for (size_t s = copied; s < kSamplesPerBuffer; s++) {
+        pcm[s] = 0; // silence-pad a partial buffer
+      }
+
+      headers[i].dwBufferLength =
+          static_cast<DWORD>(kSamplesPerBuffer * sizeof(int16_t));
+      const MMRESULT wr = waveOutWrite(m_waveOut, &headers[i], sizeof(WAVEHDR));
+      if (wr != MMSYSERR_NOERROR) {
+        if (m_verboseLogging) {
+          std::cerr << "[AUDIO] WinMM write failed: " << wr << "\n";
+        }
         break;
       }
-    }
-    if (!hdr || !pcm) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      continue;
+      submittedAny = true;
     }
 
-    size_t copied = 0;
-    {
+    if (!m_winmmThreadRunning.load()) {
+      break;
+    }
+
+    // Block until the driver retires a buffer (signals m_winmmEvent) or new
+    // input arrives. The 100 ms timeout is only a shutdown-check fallback.
+    if (!submittedAny) {
       std::unique_lock<std::mutex> lock(m_speakerMutex);
-      m_speakerCv.wait_for(lock, std::chrono::milliseconds(10), [&]() {
+      m_speakerCv.wait_for(lock, std::chrono::milliseconds(100), [&]() {
         return !m_winmmThreadRunning.load() || m_speakerSize > 0;
       });
-
-      if (!m_winmmThreadRunning.load()) {
-        break;
-      }
-
-      copied = popSpeakerSamplesLocked(m_speakerScratch.data(), kSamplesPerBuffer);
-      for (size_t i = 0; i < copied; i++) {
-        float v = m_speakerScratch[i];
-        v = std::clamp(v, -1.0f, 1.0f);
-        (*pcm)[i] = static_cast<int16_t>(v * 32767.0f);
-      }
-      for (size_t i = copied; i < kSamplesPerBuffer; i++) {
-        (*pcm)[i] = 0;
-      }
-    }
-
-    hdr->dwBufferLength =
-        static_cast<DWORD>(kSamplesPerBuffer * sizeof(int16_t));
-    const MMRESULT wr = waveOutWrite(m_waveOut, hdr, sizeof(WAVEHDR));
-    if (wr != MMSYSERR_NOERROR && m_verboseLogging) {
-      std::cerr << "[AUDIO] WinMM write failed: " << wr << "\n";
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    } else {
+      WaitForSingleObject(m_winmmEvent, 100);
     }
   }
 
@@ -786,6 +818,7 @@ void AudioOutput::runWinMMOutputThread() {
   for (size_t i = 0; i < kNumBuffers; i++) {
     waveOutUnprepareHeader(m_waveOut, &headers[i], sizeof(WAVEHDR));
   }
+  timeEndPeriod(1);
 }
 #endif
 
@@ -803,7 +836,7 @@ AudioOutput::AudioOutput()
 #endif
 #if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
       ,
-      m_waveOut(nullptr), m_winmmThreadRunning(false)
+      m_waveOut(nullptr), m_winmmEvent(nullptr), m_winmmThreadRunning(false)
 #endif
 #if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
       ,
@@ -957,11 +990,21 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
     fmt.nAvgBytesPerSec = fmt.nBlockAlign * fmt.nSamplesPerSec;
     fmt.cbSize = 0;
 
+    // Auto-reset event signaled by the driver on every buffer completion.
+    m_winmmEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (m_winmmEvent == nullptr) {
+      std::cerr << "WinMM CreateEvent failed\n";
+      return false;
+    }
+
     const UINT openId = normalizedSelector.empty() ? WAVE_MAPPER : devId;
-    const MMRESULT wr =
-        waveOutOpen(&m_waveOut, openId, &fmt, 0, 0, CALLBACK_NULL);
+    const MMRESULT wr = waveOutOpen(
+        &m_waveOut, openId, &fmt,
+        reinterpret_cast<DWORD_PTR>(m_winmmEvent), 0, CALLBACK_EVENT);
     if (wr != MMSYSERR_NOERROR || !m_waveOut) {
       std::cerr << "WinMM open failed: " << wr << "\n";
+      CloseHandle(m_winmmEvent);
+      m_winmmEvent = nullptr;
       m_waveOut = nullptr;
       return false;
     }
@@ -1011,12 +1054,19 @@ void AudioOutput::shutdown() {
 #if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
   m_winmmThreadRunning = false;
   m_speakerCv.notify_all();
+  if (m_winmmEvent) {
+    SetEvent(m_winmmEvent); // wake the thread if it is blocked on the event
+  }
   if (m_winmmThread.joinable()) {
     m_winmmThread.join();
   }
   if (m_waveOut) {
     waveOutClose(m_waveOut);
     m_waveOut = nullptr;
+  }
+  if (m_winmmEvent) {
+    CloseHandle(m_winmmEvent);
+    m_winmmEvent = nullptr;
   }
 #endif
 
@@ -1113,7 +1163,7 @@ bool AudioOutput::writeWAVData(const int16_t *samples, size_t sampleCount) {
 
   const size_t written =
       fwrite(samples, sizeof(int16_t), sampleCount, m_wavHandle);
-  m_wavDataSize += static_cast<uint32_t>(written * sizeof(int16_t));
+  m_wavDataSize += static_cast<uint32_t>(written) * 2u;
   if (written != sampleCount) {
     if (m_verboseLogging) {
       std::cerr << "[AUDIO] short WAV write (" << written << "/" << sampleCount

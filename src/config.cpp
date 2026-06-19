@@ -185,7 +185,7 @@ void parseTunerSection(const std::string &key, const std::string &value,
                        Config::TunerSection &tuner) {
   if (key == "source") {
     const std::string parsed = toLower(trim(value));
-    if (parsed == "rtl_sdr" || parsed == "rtl_tcp") {
+    if (parsed == "rtl_sdr" || parsed == "rtl_tcp" || parsed == "sdrplay") {
       tuner.source = parsed;
     }
   } else if (key == "rtl_device") {
@@ -203,6 +203,51 @@ void parseTunerSection(const std::string &key, const std::string &value,
     int parsed = 0;
     if (parseInt(value, parsed)) {
       tuner.deemphasis = parsed;
+    }
+  }
+}
+
+void parseSdrplaySection(const std::string &key, const std::string &value,
+                         Config::SDRplaySection &sdrplay) {
+  if (key == "agc") {
+    bool parsed = false;
+    if (parseBool(value, parsed)) {
+      sdrplay.agc = parsed;
+    }
+  } else if (key == "lna_state") {
+    int parsed = 0;
+    if (parseInt(value, parsed) && parsed >= 0 && parsed <= 27) {
+      sdrplay.lna_state = parsed;
+    }
+  } else if (key == "antenna") {
+    int parsed = 0;
+    if (parseInt(value, parsed) && parsed >= 0 && parsed <= 2) {
+      sdrplay.antenna = parsed;
+    }
+  } else if (key == "bias_tee") {
+    bool parsed = false;
+    if (parseBool(value, parsed)) {
+      sdrplay.bias_tee = parsed;
+    }
+  }
+}
+
+void parseRestSection(const std::string &key, const std::string &value,
+                      Config::RestSection &rest) {
+  if (key == "enabled") {
+    bool parsed = false;
+    if (parseBool(value, parsed)) {
+      rest.enabled = parsed;
+    }
+  } else if (key == "port") {
+    int parsed = 0;
+    if (parseInt(value, parsed) && parsed >= 0 && parsed <= 65535) {
+      rest.port = static_cast<uint16_t>(parsed);
+    }
+  } else if (key == "bind_address") {
+    const std::string parsed = trim(value);
+    if (!parsed.empty()) {
+      rest.bind_address = parsed;
     }
   }
 }
@@ -287,6 +332,11 @@ void parseProcessingSection(const std::string &key, const std::string &value,
     if (parseInt(value, parsed)) {
       processing.multipath_eq_taps = std::clamp(parsed, 5, 65);
     }
+  } else if (key == "fade_mute") {
+    const std::string parsed = toLower(trim(value));
+    if (parsed == "off" || parsed == "gentle" || parsed == "strong") {
+      processing.fade_mute = parsed;
+    }
   } else if (key == "iq_fir_l1_normalize") {
     bool parsed = false;
     if (parseBool(value, parsed)) {
@@ -330,6 +380,10 @@ void parseSection(const std::string &section, const std::string &key,
     parseSdrSection(key, value, config.sdr);
   } else if (section == "tuner") {
     parseTunerSection(key, value, config.tuner);
+  } else if (section == "sdrplay") {
+    parseSdrplaySection(key, value, config.sdrplay);
+  } else if (section == "rest") {
+    parseRestSection(key, value, config.rest);
   } else if (section == "xdr") {
     parseXdrSection(key, value, config.xdr);
   } else if (section == "processing") {
@@ -348,6 +402,8 @@ void Config::loadDefaults() {
   audio = Config::AudioSection{};
   sdr = Config::SDRSection{};
   tuner = Config::TunerSection{};
+  sdrplay = Config::SDRplaySection{};
+  rest = Config::RestSection{};
   xdr = Config::XDRSection{};
   processing = Config::ProcessingSection{};
   debug = Config::DebugSection{};

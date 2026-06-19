@@ -303,6 +303,14 @@ size_t RTLSDRDevice::readIQ(uint8_t *buffer, size_t maxSamples) {
 #endif
 }
 
+void RTLSDRDevice::flushBuffers() {
+#if defined(FM_TUNER_HAS_RTLSDR)
+  std::lock_guard<std::mutex> lock(m_bufferMutex);
+  m_ringReadPos = m_ringWritePos;
+  m_ringFull = false;
+#endif
+}
+
 void RTLSDRDevice::asyncCallback(unsigned char *buf, uint32_t len, void *ctx) {
 #if defined(FM_TUNER_HAS_RTLSDR)
   auto *self = reinterpret_cast<RTLSDRDevice *>(ctx);

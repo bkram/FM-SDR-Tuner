@@ -118,6 +118,10 @@ private:
 
 #if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
   HWAVEOUT m_waveOut;
+  // Auto-reset event signaled by the audio driver on each buffer completion
+  // (CALLBACK_EVENT). The output thread blocks on this instead of polling, so
+  // it is not throttled by Windows' coarse default timer resolution.
+  HANDLE m_winmmEvent;
   std::thread m_winmmThread;
   std::atomic<bool> m_winmmThreadRunning;
 #endif

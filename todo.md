@@ -1,6 +1,6 @@
 # FM-SDR-Tuner Issues and Improvements
 
-Last verified against current source: 2026-05-20 (post v1.6.0)
+Last verified against current source: 2026-06-17 (post v1.6.2, on v1.6.3)
 
 This file is a short-form punch list of open work — see `plan.md` for the
 fuller analysis with rationale and validation strategy. Closed tickets are
@@ -10,9 +10,10 @@ not retained; consult `git log` and merged PR descriptions for history.
 
 ### High
 
-- **Tuner backend abstraction (P6)**: The `rtl_sdr` vs `rtl_tcp` source switch is
-  binary and transport-oriented. Adding `SoapySDR` cleanly requires a backend
-  interface that owns connect/tune/gain/capabilities — see `src/tuner_session.cpp`
+- **Tuner backend abstraction (P6)**: source selection is a `SourceKind`
+  switch (`rtl_sdr` / `rtl_tcp` / `sdrplay`), transport-oriented rather than
+  capability-based. Adding `SoapySDR` cleanly requires a backend interface
+  that owns connect/tune/gain/capabilities — see `src/tuner_session.cpp`
   and `src/tuner_controller.cpp`. Blocks any future Soapy / HackRF / Airspy
   work.
 - **Drop the pilot bandpass FIR (P18)**: today `StereoDecoder` runs a 243-tap
@@ -31,11 +32,11 @@ not retained; consult `git log` and merged PR descriptions for history.
   the front end into chronic ADC saturation. Add a refusal path that
   reports the chronic-clip ratio back through the XDR meter rather than
   silently mis-representing the level.
-- **Application::run() decomposition (P5)**: `src/application.cpp` is still
-  ~700 lines after the v1.5.1 / v1.6.0 work, owning session bootstrap, XDR
-  facade wiring, scan restore, mute windows, reconnect, and the main DSP
-  loop. Structural debt that makes backend work and future runtime fixes
-  harder than they need to be.
+- **Application::run() decomposition (P5)**: `src/application.cpp` still
+  owns session bootstrap, XDR facade wiring, scan restore, mute windows,
+  reconnect, and the main DSP loop in one large function. Structural debt
+  that makes backend work and future runtime fixes harder than they need to
+  be.
 
 ### Medium
 
@@ -97,13 +98,14 @@ These would catch regressions that current CI can't:
 - Off-thread WAV writer shutdown-flush.
 - High-IQ-rate (`--iq-rate 1024000` / `2048000`) decimation-path
   behaviour test.
-- Scan performance regression (FFT plan/buffer reuse, fallback retune
-  count bound).
+- Scan FFT plan / buffer reuse across retunes (the fallback retune-count
+  bound and the post-retune buffer flush are already covered in
+  `test_scan_engine`).
 - `recvLine()` overflow + auth truncation directly.
 - `WavWriter` / `AudioOutput::writeWAVData` 4 GiB boundary saturation
   + fatal-error propagation.
 - Analog-de-emphasis response-reference regression.
-- IF-AGC refusal path under chronic clip (depends on P17).
+- IF-AGC refusal path under chronic clip (depends on P17b).
 
 ## Future Milestones
 
@@ -119,11 +121,3 @@ These would catch regressions that current CI can't:
   (P5) into smaller responsibilities now that the backend layer is
   abstracted. Pick up the mixed-newline / preprocessor-style sweep
   alongside the affected subsystems.
-
-### Recently closed
-
-- **1.6.2** — P17a (IQ FIR L1 normalization, opt-in via
-  `[processing] iq_fir_l1_normalize`). Bounds post-filter envelope so
-  meter/downstream consumers never see |y| > max|x|.
-- **1.6.1** — P15b (runtime stereo_blend XDR command `Fb<n>`) and P20
-  (channel-power squelch with hysteresis + ramp). Shipped in PR #10.

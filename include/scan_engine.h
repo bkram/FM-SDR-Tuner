@@ -33,7 +33,12 @@ public:
       const std::chrono::milliseconds &scanRetrySleep, uint8_t *iqBuffer,
       size_t sdrBufSamples, uint32_t iqSampleRate, int effectiveAppliedGainDb,
       double signalGainCompFactor, const Config::SDRSection &sdrConfig,
-      const std::function<void(uint32_t, int)> &restoreAfterScan);
+      const std::function<void(uint32_t, int)> &restoreAfterScan,
+      const std::function<void()> &tunerFlush = {});
+
+  // True while a scan sweep is in progress (single or continuous). Used by the
+  // control loop to drive an SDRplay wide-bandwidth scan mode around the sweep.
+  bool isActive() const { return m_active; }
 
 private:
   struct FftState {

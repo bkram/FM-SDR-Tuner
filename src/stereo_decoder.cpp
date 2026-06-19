@@ -162,6 +162,93 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
       pilotHalfBandwidthHz / static_cast<float>(m_inputRate), 0.0005f, 0.45f);
   m_liquidPilotBandFilter.init(static_cast<std::uint32_t>(pilotTapCount),
                                pilotCutoffNorm, 60.0f, pilotCenterNorm);
+  // Calibrate the band-pass gain at 19 kHz: feed a unit-amplitude 19 kHz
+  // cosine and measure the steady-state output magnitude. The centered FIR is
+  // L1-normalized (sub-unity gain), so this factor converts the smoothed pilot
+  // magnitude to a true deviation in getPilotDeviationKHz().
+  {
+    const double w = 2.0 * static_cast<double>(kPi) *
+                     static_cast<double>(pilotCenterHz) /
+                     static_cast<double>(m_inputRate);
+    const int warm = pilotTapCount * 3;
+    double accum = 0.0;
+    int counted = 0;
+    for (int k = 0; k < warm; k++) {
+      const float s = static_cast<float>(std::cos(w * static_cast<double>(k)));
+      m_liquidPilotBandFilter.push(std::complex<float>(s, 0.0f));
+      const std::complex<float> o = m_liquidPilotBandFilter.execute();
+      if (k >= pilotTapCount * 2) {
+        accum += static_cast<double>(std::abs(o));
+        counted++;
+      }
+    }
+    m_pilotFilterGain =
+        (counted > 0) ? static_cast<float>(accum / counted) : 0.5f;
+    if (m_pilotFilterGain < 1e-4f) {
+      m_pilotFilterGain = 0.5f;
+    }
+    m_liquidPilotBandFilter.reset();
+  }
+
+  // 57 kHz RDS subcarrier band-pass + gain calibration, for the RDS deviation
+  // meter (mirrors the pilot path). RDS occupies 57 kHz ± ~2.4 kHz.
+  {
+    constexpr float rdsCenterHz = 57000.0f;
+    // RDS biphase mainlobe is 57 kHz ± ~2.4 kHz. Keep the band tight and the
+    // skirt sharp so the 38 kHz L-R subcarrier (upper edge ~53 kHz) and
+    // broadband noise don't leak in and inflate the measured deviation.
+    constexpr float rdsHalfBandwidthHz = 2400.0f;
+    // 6 kHz transition -> ~163 taps at 256 kHz. The lower skirt still has to
+    // reject the 38 kHz L-R subcarrier's upper edge (~53 kHz, 1.6 kHz below the
+    // 54.6 kHz passband edge), so we don't widen this further; a sharper edge
+    // would only add taps for marginal selectivity the deviation meter doesn't
+    // need. The self-calibrated m_rdsFilterGain absorbs the passband-gain shift.
+    constexpr float rdsTransitionHz = 6000.0f;
+    int rdsTapCount = static_cast<int>(
+        std::ceil(3.8 * static_cast<double>(m_inputRate) /
+                  static_cast<double>(rdsTransitionHz)));
+    rdsTapCount = std::clamp(rdsTapCount, 63, 511);
+    if ((rdsTapCount % 2) == 0) {
+      rdsTapCount++;
+    }
+    const float rdsCenterNorm = std::clamp(
+        rdsCenterHz / static_cast<float>(m_inputRate), 0.001f, 0.49f);
+    const float rdsCutoffNorm = std::clamp(
+        rdsHalfBandwidthHz / static_cast<float>(m_inputRate), 0.0005f, 0.45f);
+    m_liquidRdsBandFilter.init(static_cast<std::uint32_t>(rdsTapCount),
+                               rdsCutoffNorm, 60.0f, rdsCenterNorm);
+    const double w = 2.0 * static_cast<double>(kPi) *
+                     static_cast<double>(rdsCenterHz) /
+                     static_cast<double>(m_inputRate);
+    const int warm = rdsTapCount * 3;
+    double accum = 0.0;
+    int counted = 0;
+    for (int k = 0; k < warm; k++) {
+      const float s = static_cast<float>(std::cos(w * static_cast<double>(k)));
+      m_liquidRdsBandFilter.push(std::complex<float>(s, 0.0f));
+      const std::complex<float> o = m_liquidRdsBandFilter.execute();
+      if (k >= rdsTapCount * 2) {
+        accum += static_cast<double>(std::abs(o));
+        counted++;
+      }
+    }
+    m_rdsFilterGain = (counted > 0) ? static_cast<float>(accum / counted) : 0.5f;
+    if (m_rdsFilterGain < 1e-4f) {
+      m_rdsFilterGain = 0.5f;
+    }
+    m_liquidRdsBandFilter.reset();
+  }
+
+  // Noise-triangle hiss estimate for the demod-domain SNR/quality figure. A
+  // high-pass above the FM multiplex captures the signal-free region where FM
+  // demod noise PSD rises with frequency: a 65 kHz corner rejects the 19 kHz
+  // pilot and 38 kHz stereo subcarrier completely and the 57 kHz RDS subcarrier
+  // by ~13 dB, while passing ~70 kHz up to Nyquist. Order 6 Butterworth for a
+  // sharp skirt (a few biquads — far cheaper than another FIR). On channels
+  // narrower than ~150 kHz the upper band is rolled off by the channel filter,
+  // so the metric reads optimistically — but those are mono/weak cases anyway.
+  m_liquidHissBandFilter.initHighpass(
+      6, 65000.0f / static_cast<float>(m_inputRate), 60.0f);
   // No dedicated audio LPF at the input rate. The 19 kHz pilot / 38 kHz
   // L-R subcarrier / 57 kHz RDS subcarrier are all rejected by the
   // anti-aliasing filter in AFPostProcessor's resampler; the residual
@@ -201,7 +288,11 @@ void StereoDecoder::reset() {
   m_delayPos = 0;
   std::fill(m_delayLine.begin(), m_delayLine.end(),
             std::complex<float>(0.0f, 0.0f));
+  m_rdsBandMs = 0.0f;
+  m_hissNoiseMs = 0.0f;
   m_liquidPilotBandFilter.reset();
+  m_liquidRdsBandFilter.reset();
+  m_liquidHissBandFilter.reset();
   m_liquidPilotPll.reset();
   m_liquidPilotPll.setPLLBandwidth(kPilotPllBwAcquire);
 }
@@ -328,8 +419,23 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     const std::complex<float> pilot = m_liquidPilotBandFilter.execute();
     m_pilotBandMagnitude = (m_pilotBandMagnitude * kPilotEnvSmooth) +
                            (std::abs(pilot) * kPilotEnvInject);
+
+    // 57 kHz RDS subcarrier envelope, decaying peak hold (~0.1 s) for the RDS
+    // deviation meter. DSB-SC, so the envelope tracks the data; the peak is the
+    // reported deviation.
+    m_liquidRdsBandFilter.push(std::complex<float>(mpx, 0.0f));
+    const float rdsEnv = std::abs(m_liquidRdsBandFilter.execute());
+    m_rdsBandMs =
+        (m_rdsBandMs * kPilotEnvSmooth) + (rdsEnv * rdsEnv * kPilotEnvInject);
     m_mpxMagnitude =
         (m_mpxMagnitude * kPilotEnvSmooth) + (std::abs(mpx) * kPilotEnvInject);
+
+    // Noise-triangle hiss band (real IIR band-pass) for the demod SNR/quality
+    // estimate. EMA of the squared band output mirrors the RDS path.
+    const float hiss = m_liquidHissBandFilter.execute(mpx);
+    m_hissNoiseMs =
+        (m_hissNoiseMs * kPilotEnvSmooth) + (hiss * hiss * kPilotEnvInject);
+
     const float phaseNow = m_liquidPilotPll.phase();
     float vcoSin;
     float vcoCos;

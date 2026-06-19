@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 
 namespace fm_tuner::dsp {
 
@@ -39,10 +40,83 @@ public:
     m_isOpen = true;
   }
 
+  // Adaptive "fade mute": instead of an absolute threshold, track a slowly
+  // decaying reference of the channel power and mute when it drops `dropDb`
+  // below that reference. FM is constant-envelope, so a channel-power drop is a
+  // genuine RF fade (never quiet program audio) — this suppresses the demod
+  // noise burst on a dropout and fades back in on recovery, without permanently
+  // silencing weak stations (the reference decays so steady weak signals open).
+  // updatesPerSec is the rate updateGate() is called (one per processing block).
+  void configureFadeMute(float dropDb, float hysteresisDb,
+                         float attackReleaseSec, int sampleRate,
+                         float refDecayDbPerSec, float updatesPerSec) {
+    m_adaptive = true;
+    m_dropDb = std::max(3.0f, dropDb);
+    m_hysteresisDb = std::max(0.0f, hysteresisDb);
+    const float seconds = std::max(0.001f, attackReleaseSec);
+    const float fs = static_cast<float>(std::max(1, sampleRate));
+    m_rampAlpha = 1.0f - std::exp(-1.0f / (seconds * fs));
+    m_refDecayPerUpdate =
+        std::max(0.0f, refDecayDbPerSec) / std::max(1.0f, updatesPerSec);
+    m_refInit = false;
+    m_snrRefInit = false;
+    m_gain = 1.0f;
+    m_isOpen = true;
+  }
+
+  bool adaptiveEnabled() const { return m_adaptive; }
+
   // Update the gate decision from a per-block channel power estimate.
   // Stateless w.r.t. samples — call once per processing block (we already
   // compute channelPowerDbfs in DspPipeline::Result).
-  void updateGate(double channelPowerDbfs) {
+  //
+  // demodSnrDb (optional) is the demod-domain hiss SNR. When finite and the
+  // adaptive fade-mute is active, it acts as a second, symmetric fade trigger:
+  // the gate closes when EITHER the channel power or the SNR drops `dropDb`
+  // below its slowly-decaying reference, and reopens only when BOTH have
+  // recovered. This catches quality collapses (interference / multipath bursts)
+  // that leave channel power high. Pass NaN (the default) to disable it.
+  void updateGate(double channelPowerDbfs,
+                  float demodSnrDb = std::numeric_limits<float>::quiet_NaN()) {
+    if (m_adaptive) {
+      if (!std::isfinite(channelPowerDbfs)) {
+        return;
+      }
+      const float dbfs = static_cast<float>(channelPowerDbfs);
+      if (!m_refInit) {
+        m_refDbfs = dbfs;
+        m_refInit = true;
+      }
+      // Reference rises instantly to the current level and decays slowly, so a
+      // sudden drop is detected as a fade while a steady (even weak) signal
+      // keeps the gate open.
+      m_refDbfs = std::max(dbfs, m_refDbfs - m_refDecayPerUpdate);
+      const float openLevel = m_refDbfs - m_dropDb;
+      bool powerFaded = dbfs < openLevel;
+      bool powerRecovered = dbfs > openLevel + m_hysteresisDb;
+
+      bool snrFaded = false;
+      bool snrRecovered = true;
+      if (std::isfinite(demodSnrDb)) {
+        if (!m_snrRefInit) {
+          m_snrRef = demodSnrDb;
+          m_snrRefInit = true;
+        }
+        m_snrRef = std::max(demodSnrDb, m_snrRef - m_refDecayPerUpdate);
+        const float snrOpenLevel = m_snrRef - m_dropDb;
+        snrFaded = demodSnrDb < snrOpenLevel;
+        snrRecovered = demodSnrDb > snrOpenLevel + m_hysteresisDb;
+      }
+
+      if (m_isOpen) {
+        if (powerFaded || snrFaded) {
+          m_isOpen = false;
+        }
+      } else if (powerRecovered && snrRecovered) {
+        m_isOpen = true;
+      }
+      return;
+    }
     if (m_openDbfs <= -119.0f) {
       // Effectively disabled — always open.
       m_isOpen = true;
@@ -73,7 +147,7 @@ public:
     if (!left || !right || numSamples == 0) {
       return;
     }
-    if (m_openDbfs <= -119.0f) {
+    if (!m_adaptive && m_openDbfs <= -119.0f) {
       // Disabled — no work, no state change.
       return;
     }
@@ -95,6 +169,16 @@ private:
   float m_rampAlpha = 0.001f;
   float m_gain = 1.0f;
   bool m_isOpen = true;
+
+  // Adaptive fade-mute state.
+  bool m_adaptive = false;
+  bool m_refInit = false;
+  float m_refDbfs = -120.0f;
+  float m_dropDb = 10.0f;
+  float m_refDecayPerUpdate = 0.0f;
+  // Optional secondary fade trigger on the demod-domain SNR.
+  bool m_snrRefInit = false;
+  float m_snrRef = 0.0f;
 };
 
 } // namespace fm_tuner::dsp

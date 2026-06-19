@@ -320,6 +320,84 @@ TEST_CASE("AF deemphasis attenuates high frequencies more than low frequencies",
   REQUIRE(highRatio < lowRatio);
 }
 
+TEST_CASE("Adaptive fade-mute gates on relative signal drop, not absolute level",
+          "[dsp][squelch][fade_mute]") {
+  using fm_tuner::dsp::Squelch;
+  auto settle = [](Squelch &sq, double dbfs, int n) {
+    for (int i = 0; i < n; i++) sq.updateGate(dbfs);
+  };
+
+  SECTION("deep fade closes, recovery reopens") {
+    Squelch sq;
+    sq.configureFadeMute(12.0f, 3.0f, 0.001f, 48000, 5.0f, 30.0f);
+    settle(sq, -15.0, 50);
+    REQUIRE(sq.isOpen()); // strong steady signal stays open
+    sq.updateGate(-45.0); // deep fade (30 dB below reference)
+    REQUIRE_FALSE(sq.isOpen());
+    settle(sq, -15.0, 5); // signal returns
+    REQUIRE(sq.isOpen());
+  }
+
+  SECTION("steady weak signal is NOT muted") {
+    Squelch sq;
+    sq.configureFadeMute(12.0f, 3.0f, 0.001f, 48000, 5.0f, 30.0f);
+    settle(sq, -55.0, 100); // weak but steady — reference adapts down
+    REQUIRE(sq.isOpen());
+  }
+
+  SECTION("gain ramps to zero when closed and back when open") {
+    Squelch sq;
+    sq.configureFadeMute(12.0f, 3.0f, 0.020f, 48000, 5.0f, 30.0f);
+    settle(sq, -15.0, 50);
+    sq.updateGate(-50.0);
+    std::vector<float> l(48000, 1.0f), r(48000, 1.0f);
+    sq.process(l.data(), r.data(), l.size());
+    REQUIRE(l.back() < 0.05f); // faded out
+    settle(sq, -15.0, 5);
+    std::vector<float> l2(48000, 1.0f), r2(48000, 1.0f);
+    sq.process(l2.data(), r2.data(), l2.size());
+    REQUIRE(l2.back() > 0.95f); // faded back in
+  }
+}
+
+TEST_CASE("AF post resampler band-limits audio (no subcarrier/RDS aliasing)",
+          "[dsp][af_post][antialias]") {
+  // Regression for the audio "ringing"/lossy-codec artifact: the stereo
+  // decoder's mono path is the raw MPX, so the AF resampler must band-limit to
+  // the ~16 kHz audio edge. Otherwise the 38 kHz stereo subcarrier / 57 kHz RDS
+  // fold into the 0-24 kHz output (alias to ~9-10 kHz) at full level. An
+  // in-band tone must pass; an out-of-band MPX tone must be deeply rejected.
+  constexpr int kInputRate = 256000;
+  constexpr int kOutputRate = 48000;
+  constexpr size_t kInSamples = 65536;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  auto runTone = [&](float toneHz) -> float {
+    AFPostProcessor af(kInputRate, kOutputRate);
+    af.setDeemphasis(0); // isolate the resampler's anti-alias filter
+    std::vector<float> inL(kInSamples), inR(kInSamples);
+    for (size_t i = 0; i < kInSamples; i++) {
+      const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+      const float v = 0.4f * std::sin(kTwoPi * toneHz * t);
+      inL[i] = v;
+      inR[i] = v;
+    }
+    std::vector<float> outL(kInSamples, 0.0f), outR(kInSamples, 0.0f);
+    const size_t out = af.process(inL.data(), inR.data(), kInSamples,
+                                  outL.data(), outR.data(), kInSamples);
+    REQUIRE(out > 3000);
+    return rms(outL.data() + (out / 4), out - (out / 4));
+  };
+
+  const float inBand = runTone(5000.0f);    // audio — must pass
+  const float subcarrier = runTone(38000.0f); // stereo subcarrier — must be gone
+  const float rds = runTone(57000.0f);         // RDS — must be gone
+  REQUIRE(inBand > 1e-3f);
+  // Out-of-band MPX components rejected by >40 dB relative to in-band audio.
+  REQUIRE(subcarrier / inBand < 0.01f);
+  REQUIRE(rds / inBand < 0.01f);
+}
+
 TEST_CASE("AF post reset reproduces identical output for identical input",
           "[dsp][af_post]") {
   constexpr int kInputRate = 256000;
@@ -386,6 +464,59 @@ TEST_CASE("Stereo decoder force-stereo recovers channel separation on synthetic 
   const size_t settle = kSamples / 4;
   const float sep = meanAbsDiff(left.data() + settle, right.data() + settle, out - settle);
   REQUIRE(sep > 0.03f);
+}
+
+TEST_CASE("Stereo decoder demod SNR is higher for a clean MPX than a noisy one",
+          "[dsp][stereo]") {
+  constexpr int kInputRate = 256000;
+  constexpr size_t kSamples = 65536;
+  constexpr float kPilotHz = 19000.0f;
+  constexpr float kTwoPi = 6.2831853071795864769f;
+
+  auto makeMpx = [](float noiseAmplitude) {
+    std::vector<float> mpx(kSamples, 0.0f);
+    uint32_t state = 0x13579bdfu;
+    auto nextNoise = [&]() -> float {
+      state = state * 1664525u + 1013904223u;
+      const uint32_t bits = (state >> 8) & 0x00ffffffu;
+      return (static_cast<float>(bits) / 8388607.5f) - 1.0f;
+    };
+    for (size_t i = 0; i < kSamples; i++) {
+      const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
+      const float l = 0.45f * std::sin(kTwoPi * 1000.0f * t);
+      const float r = 0.45f * std::sin(kTwoPi * 2800.0f * t);
+      const float lr = l - r;
+      const float mono = l + r;
+      const float pilot = 0.08f * std::sin(kTwoPi * kPilotHz * t);
+      const float dsb = 0.25f * lr * std::sin(kTwoPi * (2.0f * kPilotHz) * t);
+      // Broadband noise lands in the 70-88 kHz hiss band (the demod SNR
+      // estimator's measurement window); clean program material does not.
+      const float noise = noiseAmplitude * nextNoise();
+      mpx[i] = mono + pilot + dsb + noise;
+    }
+    return mpx;
+  };
+
+  StereoDecoder clean(kInputRate, 48000);
+  StereoDecoder noisy(kInputRate, 48000);
+  clean.setForceStereo(true);
+  noisy.setForceStereo(true);
+
+  const std::vector<float> cleanMpx = makeMpx(0.0f);
+  const std::vector<float> noisyMpx = makeMpx(0.20f);
+
+  std::vector<float> l(kSamples, 0.0f);
+  std::vector<float> r(kSamples, 0.0f);
+  clean.processAudio(cleanMpx.data(), l.data(), r.data(), kSamples);
+  const float cleanSnr = clean.getDemodSnrDb();
+  noisy.processAudio(noisyMpx.data(), l.data(), r.data(), kSamples);
+  const float noisySnr = noisy.getDemodSnrDb();
+
+  // Always finite (the estimate is clamped to a sane range), and the clean
+  // input must report a markedly higher demod SNR than the noisy one.
+  REQUIRE(std::isfinite(cleanSnr));
+  REQUIRE(std::isfinite(noisySnr));
+  REQUIRE(cleanSnr > noisySnr + 6.0f);
 }
 
 TEST_CASE("Stereo decoder reduces blend when stereo difference path gets noisy",
@@ -778,6 +909,97 @@ TEST_CASE("DspPipeline decimation staging handles fragmented high-rate IQ withou
 
   REQUIRE(offset == totalIqSamples);
   REQUIRE(producedBlocks == 2);
+}
+
+TEST_CASE("ComplexDecimator CF32 input matches uint8 input bit-for-bit",
+          "[dsp][decimator][cf32]") {
+  using fm_tuner::dsp::liquid::ComplexDecimator;
+  constexpr uint32_t kFactor = 4;
+  constexpr size_t kInSamples = 4096;
+
+  std::vector<uint8_t> iq(kInSamples * 2);
+  std::vector<std::complex<float>> cf(kInSamples);
+  for (size_t i = 0; i < kInSamples; i++) {
+    const uint8_t iv = static_cast<uint8_t>((i * 7) & 0xFF);
+    const uint8_t qv = static_cast<uint8_t>((i * 13 + 5) & 0xFF);
+    iq[i * 2] = iv;
+    iq[i * 2 + 1] = qv;
+    // Same normalization the uint8 decimator applies internally.
+    cf[i] = std::complex<float>((static_cast<float>(iv) - 127.5f) / 127.5f,
+                                (static_cast<float>(qv) - 127.5f) / 127.5f);
+  }
+
+  ComplexDecimator decU8;
+  ComplexDecimator decCF;
+  decU8.init(kFactor, 12, 70.0f);
+  decCF.init(kFactor, 12, 70.0f);
+
+  const size_t outCap = kInSamples / kFactor;
+  std::vector<std::complex<float>> outU8(outCap);
+  std::vector<std::complex<float>> outCF(outCap);
+  const size_t nU8 = decU8.executeComplex(iq.data(), kInSamples, outU8.data(), outCap);
+  const size_t nCF =
+      decCF.executeComplexFromComplex(cf.data(), kInSamples, outCF.data(), outCap);
+
+  REQUIRE(nU8 == nCF);
+  REQUIRE(nU8 > 0);
+  for (size_t i = 0; i < nU8; i++) {
+    REQUIRE(std::abs(outU8[i].real() - outCF[i].real()) < 1e-4f);
+    REQUIRE(std::abs(outU8[i].imag() - outCF[i].imag()) < 1e-4f);
+  }
+}
+
+TEST_CASE("DspPipeline CF32 path matches uint8 path for equivalent IQ",
+          "[dsp][pipeline][cf32]") {
+  Config::ProcessingSection processing;
+  processing.stereo = true;
+  processing.w0_bandwidth_hz = 194000;
+
+  constexpr int kInputRate = 256000;
+  constexpr int kOutputRate = 48000;
+  constexpr size_t kBlockSamples = 8192;
+  constexpr size_t kDecim = 1; // SDRplay delivers at INPUT_RATE => 1:1
+
+  // A rotating phasor: constant instantaneous frequency -> well-defined FM
+  // demod output. Build uint8 IQ, then derive CF32 with the identical
+  // normalization so both pipelines see exactly the same complex samples.
+  const size_t n = kBlockSamples;
+  std::vector<uint8_t> iq(n * 2);
+  std::vector<std::complex<float>> cf(n);
+  const double f = 0.05; // cycles/sample
+  for (size_t i = 0; i < n; i++) {
+    const double ph = 2.0 * M_PI * f * static_cast<double>(i);
+    const uint8_t iv =
+        static_cast<uint8_t>(std::lround(std::cos(ph) * 110.0 + 127.5));
+    const uint8_t qv =
+        static_cast<uint8_t>(std::lround(std::sin(ph) * 110.0 + 127.5));
+    iq[i * 2] = iv;
+    iq[i * 2 + 1] = qv;
+    cf[i] = std::complex<float>((static_cast<float>(iv) - 127.5f) / 127.5f,
+                                (static_cast<float>(qv) - 127.5f) / 127.5f);
+  }
+
+  DspPipeline pa(kInputRate, kOutputRate, processing, false, kBlockSamples, kDecim);
+  DspPipeline pb(kInputRate, kOutputRate, processing, false, kBlockSamples, kDecim);
+
+  DspPipeline::Result ra;
+  DspPipeline::Result rb;
+  const bool haveA = pa.process(iq.data(), n, [](const float *, size_t) {}, ra);
+  const bool haveB = pb.process(cf.data(), n, [](const float *, size_t) {}, rb);
+
+  REQUIRE(haveA);
+  REQUIRE(haveB);
+  REQUIRE(ra.outSamples == rb.outSamples);
+  REQUIRE(ra.demodSamples == rb.demodSamples);
+  REQUIRE(ra.outSamples > 0);
+  // The uint8 demod path and the CF32 path use slightly different sample
+  // centering internally, so allow a small (~ -54 dB) tolerance — far below any
+  // audible/meaningful level. This guards against gross plumbing errors in the
+  // CF32 path while tolerating last-bit float divergence.
+  for (size_t i = 0; i < ra.outSamples; i++) {
+    REQUIRE(std::abs(ra.left[i] - rb.left[i]) < 2e-3f);
+    REQUIRE(std::abs(ra.right[i] - rb.right[i]) < 2e-3f);
+  }
 }
 
 TEST_CASE("DspPipeline::softLimitSample passes through below threshold",

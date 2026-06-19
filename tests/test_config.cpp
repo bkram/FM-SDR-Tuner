@@ -67,6 +67,79 @@ TEST_CASE("Config parses sdr section with gain strategy", "[config]") {
     std::remove("test_config.ini");
 }
 
+TEST_CASE("Config parses tuner source sdrplay", "[config]") {
+    Config config;
+    config.loadDefaults();
+
+    std::ofstream file("test_config.ini");
+    file << "[tuner]\n";
+    file << "source = sdrplay\n";
+    file.close();
+
+    REQUIRE(config.loadFromFile("test_config.ini"));
+    REQUIRE(config.tuner.source == "sdrplay");
+    std::remove("test_config.ini");
+}
+
+TEST_CASE("Config parses sdrplay section", "[config]") {
+    Config config;
+    config.loadDefaults();
+
+    REQUIRE(config.sdrplay.agc == true); // default on
+
+    std::ofstream file("test_config.ini");
+    file << "[sdrplay]\n";
+    file << "agc = false\n";
+    file << "lna_state = 3\n";
+    file << "antenna = 2\n";
+    file << "bias_tee = true\n";
+    file.close();
+
+    REQUIRE(config.loadFromFile("test_config.ini"));
+    REQUIRE(config.sdrplay.agc == false);
+    REQUIRE(config.sdrplay.lna_state == 3);
+    REQUIRE(config.sdrplay.antenna == 2);
+    REQUIRE(config.sdrplay.bias_tee == true);
+    std::remove("test_config.ini");
+}
+
+TEST_CASE("Config clamps sdrplay out-of-range values to defaults", "[config]") {
+    Config config;
+    config.loadDefaults();
+
+    std::ofstream file("test_config.ini");
+    file << "[sdrplay]\n";
+    file << "lna_state = 99\n";   // > 27, rejected
+    file << "antenna = 7\n";      // > 2, rejected
+    file.close();
+
+    REQUIRE(config.loadFromFile("test_config.ini"));
+    REQUIRE(config.sdrplay.lna_state == 8); // default preserved
+    REQUIRE(config.sdrplay.antenna == 0);   // default preserved
+    std::remove("test_config.ini");
+}
+
+TEST_CASE("Config parses rest section", "[config]") {
+    Config config;
+    config.loadDefaults();
+
+    REQUIRE(config.rest.enabled == false);
+    REQUIRE(config.rest.port == 0);
+
+    std::ofstream file("test_config.ini");
+    file << "[rest]\n";
+    file << "enabled = true\n";
+    file << "port = 8080\n";
+    file << "bind_address = 0.0.0.0\n";
+    file.close();
+
+    REQUIRE(config.loadFromFile("test_config.ini"));
+    REQUIRE(config.rest.enabled == true);
+    REQUIRE(config.rest.port == 8080);
+    REQUIRE(config.rest.bind_address == "0.0.0.0");
+    std::remove("test_config.ini");
+}
+
 TEST_CASE("Config handles invalid values gracefully", "[config]") {
     Config config;
     config.loadDefaults();

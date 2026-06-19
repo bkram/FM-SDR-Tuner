@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(fm-sdr-tuner VERSION 1.6.2 LANGUAGES CXX)
+project(fm-sdr-tuner VERSION 1.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -86,6 +86,22 @@ if(NOT LIQUID_INCLUDE_DIRS OR NOT LIQUID_LIBRARIES)
     message(FATAL_ERROR "liquid-dsp not found. Install liquid-dsp (libliquid). Required for DSP and RDS pipelines.")
 endif()
 
+# Optional SDRplay (RSP) support. The SDRplay API is a proprietary library the
+# user installs separately; we never link it (it is dlopen'd at runtime), only
+# the headers are needed at build time. Enable with -DFM_TUNER_ENABLE_SDRPLAY=ON.
+option(FM_TUNER_ENABLE_SDRPLAY "Enable SDRplay (RSP) source support" OFF)
+set(FM_TUNER_HAVE_SDRPLAY OFF)
+if(FM_TUNER_ENABLE_SDRPLAY)
+    find_path(SDRPLAY_INCLUDE_DIR NAMES sdrplay_api.h
+        PATHS /usr/local/include /Library/SDRplayAPI/*/include)
+    if(SDRPLAY_INCLUDE_DIR)
+        set(FM_TUNER_HAVE_SDRPLAY ON)
+        message(STATUS "SDRplay support enabled (headers: ${SDRPLAY_INCLUDE_DIR}); library loaded at runtime via dlopen")
+    else()
+        message(WARNING "FM_TUNER_ENABLE_SDRPLAY=ON but sdrplay_api.h not found; building SDRplay stub (source unavailable at runtime)")
+    endif()
+endif()
+
 set(SOURCES
     src/dsp/liquid_primitives.cpp
     src/dsp/runtime.cpp
@@ -93,6 +109,8 @@ set(SOURCES
     src/application.cpp
     src/tuner_controller.cpp
     src/tuner_session.cpp
+    src/sdrplay_device.cpp
+    src/rest_server.cpp
     src/runtime_loop.cpp
     src/processing_runner.cpp
     src/wav_writer.cpp
@@ -136,6 +154,11 @@ if(WIN32)
     target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_WINMM)
 endif()
 target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_RTLSDR)
+if(FM_TUNER_HAVE_SDRPLAY)
+    target_compile_definitions(fm-sdr-tuner PRIVATE FM_TUNER_HAS_SDRPLAY)
+    target_include_directories(fm-sdr-tuner PRIVATE ${SDRPLAY_INCLUDE_DIR})
+    target_link_libraries(fm-sdr-tuner PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 if(FM_TUNER_ENABLE_X86_AVX2)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)$")
