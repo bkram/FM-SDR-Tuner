@@ -188,6 +188,18 @@ RestServer::~RestServer() { stop(); }
 
 bool RestServer::start() {
   if (m_running.load()) return true;
+#if defined(_WIN32)
+  // Initialize Winsock so the REST server is self-sufficient and doesn't rely
+  // on the XDR server (or anyone else) having called WSAStartup first.
+  // Refcounted, so a redundant call alongside XDRServer's is harmless.
+  {
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+      std::cerr << "[REST] WSAStartup failed\n";
+      return false;
+    }
+  }
+#endif
   m_serverSocket = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
   if (m_serverSocket < 0) {
     std::cerr << "[REST] failed to create socket\n";
