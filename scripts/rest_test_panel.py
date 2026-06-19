@@ -11,14 +11,14 @@ Enable the API in fm-sdr-tuner.ini:
 
     [rest]
     enabled = true
-    port = 8080
+    port = 9090
     bind_address = 127.0.0.1
 
 Then run:
 
-    python3 scripts/rest_test_panel.py --api http://127.0.0.1:8080 --port 8090
+    python3 scripts/rest_test_panel.py --api http://127.0.0.1:9090 --port 9091
 
-and open http://127.0.0.1:8090 in a browser. The page also works as a pure
+and open http://127.0.0.1:9091 in a browser. The page also works as a pure
 client: every control issues GET/POST to <api>/api/control and polls
 <api>/api/status once a second.
 """
@@ -199,9 +199,9 @@ PAGE = """<!doctype html>
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--api", default="http://127.0.0.1:8080",
+    ap.add_argument("--api", default="http://127.0.0.1:9090",
                     help="Base URL of the fm-sdr-tuner REST API")
-    ap.add_argument("--port", type=int, default=8090,
+    ap.add_argument("--port", type=int, default=9091,
                     help="Port to serve this control panel on")
     args = ap.parse_args()
 

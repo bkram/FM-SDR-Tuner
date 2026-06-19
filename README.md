@@ -282,7 +282,7 @@ trusted network only.
 ```ini
 [rest]
 enabled = true
-port = 8080
+port = 9090
 bind_address = 127.0.0.1
 ```
 
@@ -325,20 +325,20 @@ Recognised keys: `freq_hz` / `freq_khz`, `gain_db`, `agc` (bool), `bandwidth_hz`
 Examples:
 
 ```bash
-curl "http://127.0.0.1:8080/api/control?freq_khz=94900&bandwidth_khz=200"
+curl "http://127.0.0.1:9090/api/control?freq_khz=94900&bandwidth_khz=200"
 curl -X POST -H 'Content-Type: application/json' \
-     -d '{"gain_db":28,"lna":2,"antenna":1}' http://127.0.0.1:8080/api/control
-curl http://127.0.0.1:8080/api/status
+     -d '{"gain_db":28,"lna":2,"antenna":1}' http://127.0.0.1:9090/api/control
+curl http://127.0.0.1:9090/api/status
 ```
 
 For interactive testing there is a tiny static control panel served by Python:
 
 ```bash
-scripts/run_rest_panel.sh                                  # defaults: API :8080, panel :8090
+scripts/run_rest_panel.sh                                  # defaults: API :9090, panel :9091
 # or directly / with overrides:
-python3 scripts/rest_test_panel.py --api http://127.0.0.1:8080 --port 8090
-API_URL=http://127.0.0.1:8080 PANEL_PORT=8090 scripts/run_rest_panel.sh
-# then open http://127.0.0.1:8090
+python3 scripts/rest_test_panel.py --api http://127.0.0.1:9090 --port 9091
+API_URL=http://127.0.0.1:9090 PANEL_PORT=9091 scripts/run_rest_panel.sh
+# then open http://127.0.0.1:9091
 ```
 
 ## Tests
@@ -541,7 +541,7 @@ cp fm-sdr-tuner-sdrplay.ini.example fm-sdr-tuner.ini
 ./build/fm-sdr-tuner -c fm-sdr-tuner.ini
 ```
 
-Both examples enable the REST control API (`[rest] enabled = true`, port 8080)
+Both examples enable the REST control API (`[rest] enabled = true`, port 9090)
 and the bundled test panel (`scripts/rest_test_panel.py`, shipped in the
 artifact). CLI flags override anything the config sets, which is useful for A/B
 testing:

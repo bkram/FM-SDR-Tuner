@@ -6,15 +6,15 @@ set -eu
 #
 #   [rest]
 #   enabled = true
-#   port = 8080
+#   port = 9090
 #   bind_address = 127.0.0.1
 #
 # Override the target API or the panel port via env vars:
-#   API_URL=http://127.0.0.1:8080 PANEL_PORT=8090 scripts/run_rest_panel.sh
+#   API_URL=http://127.0.0.1:9090 PANEL_PORT=9091 scripts/run_rest_panel.sh
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-API_URL="${API_URL:-http://127.0.0.1:8080}"
-PANEL_PORT="${PANEL_PORT:-8090}"
+API_URL="${API_URL:-http://127.0.0.1:9090}"
+PANEL_PORT="${PANEL_PORT:-9091}"
 
 echo "REST control panel"
 echo "  api:   $API_URL"
