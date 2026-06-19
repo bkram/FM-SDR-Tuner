@@ -2,6 +2,9 @@
 
 FM broadcast tuner and XDR server built around RTL-SDR IQ input.
 
+> New here? **[USER-MANUAL.md](USER-MANUAL.md)** is a focused guide to startup
+> and configuration. This README is the full feature/algorithm reference.
+
 ## Project Status / Experiment
 
 This repository is an active experiment in AI-assisted software development.

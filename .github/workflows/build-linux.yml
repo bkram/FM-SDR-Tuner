@@ -118,7 +118,7 @@ jobs:
         cpack -G DEB
         mkdir -p ../dist/linux
         cp ./*.deb ../dist/linux/
-        cp ../README.md ../dist/linux/
+        cp ../README.md ../USER-MANUAL.md ../dist/linux/
         cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
         # Ready-to-use config so auto-load (no -c) works on first run.
         cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
@@ -166,7 +166,7 @@ jobs:
         cpack -G DEB
         mkdir -p ../dist/linux
         cp ./*.deb ../dist/linux/
-        cp ../README.md ../dist/linux/
+        cp ../README.md ../USER-MANUAL.md ../dist/linux/
         cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
         # Ready-to-use config so auto-load (no -c) works on first run.
         cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
@@ -216,7 +216,7 @@ jobs:
         cpack -G RPM
         mkdir -p ../dist/linux
         cp ./*.rpm ../dist/linux/
-        cp ../README.md ../dist/linux/
+        cp ../README.md ../USER-MANUAL.md ../dist/linux/
         cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
         # Ready-to-use config so auto-load (no -c) works on first run.
         cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
@@ -266,7 +266,7 @@ jobs:
         cpack -G RPM
         mkdir -p ../dist/linux
         cp ./*.rpm ../dist/linux/
-        cp ../README.md ../dist/linux/
+        cp ../README.md ../USER-MANUAL.md ../dist/linux/
         cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
         # Ready-to-use config so auto-load (no -c) works on first run.
         cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
