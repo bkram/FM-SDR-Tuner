@@ -1,5 +1,7 @@
 #include "runtime_loop.h"
 
+#include "auto_gain_policy.h"
+
 #include <algorithm>
 #include <iomanip>
 #include <iostream>
@@ -113,41 +115,42 @@ void maybeAdjustAutoGain(
   if (useSdrppGainStrategy || cliGain >= 0 || imsAgcEnabled) {
     return;
   }
+  // Recovery keys off raw-dbfs headroom (see auto_gain_policy.h), not the
+  // smoothed display level whose slow fall used to delay climbing back.
+  (void)rfLevelFiltered;
 
   const auto now = std::chrono::steady_clock::now();
-  const bool overload = (clipRatio > 0.0200) || (signal.dbfs > -5.0);
-  const bool weak = (clipRatio < 0.0005) && (signal.compensatedDbfs < -47.0) &&
-                    (rfLevelFiltered < 35.0f);
+  const bool downTimerElapsed =
+      (now - lastGainDown) >= std::chrono::milliseconds(900);
+  const bool upTimerElapsed =
+      (now - lastGainUp) >= std::chrono::milliseconds(4000);
+  const int current = std::clamp(requestedAGCMode.load(), 0, 3);
+  const fm_tuner::AutoGainStep step = fm_tuner::decideAutoGainStep(
+      current, clipRatio, signal.dbfs, downTimerElapsed, upTimerElapsed);
 
-  if (overload && (now - lastGainDown) >= std::chrono::milliseconds(900)) {
-    const int current = std::clamp(requestedAGCMode.load(), 0, 3);
-    if (current < 3) {
-      requestedAGCMode = current + 1;
-      pendingAGC = true;
-      lastGainDown = now;
-      if (verboseLogging) {
-        std::cout << "[GAIN] clip-protect: A" << current << " -> A"
-                  << (current + 1) << " (" << agcModeToGainDb(current)
-                  << " dB -> " << agcModeToGainDb(current + 1)
-                  << " dB, dbfs=" << std::fixed
-                  << std::setprecision(2) << signal.dbfs
-                  << ", clip=" << std::setprecision(4) << clipRatio << ")\n";
-      }
+  if (step == fm_tuner::AutoGainStep::Down) {
+    requestedAGCMode = current + 1;
+    pendingAGC = true;
+    lastGainDown = now;
+    if (verboseLogging) {
+      std::cout << "[GAIN] clip-protect: A" << current << " -> A"
+                << (current + 1) << " (" << agcModeToGainDb(current)
+                << " dB -> " << agcModeToGainDb(current + 1)
+                << " dB, dbfs=" << std::fixed << std::setprecision(2)
+                << signal.dbfs << ", clip=" << std::setprecision(4) << clipRatio
+                << ")\n";
     }
-  } else if (weak && (now - lastGainUp) >= std::chrono::milliseconds(4000)) {
-    const int current = std::clamp(requestedAGCMode.load(), 0, 3);
-    if (current > 0) {
-      requestedAGCMode = current - 1;
-      pendingAGC = true;
-      lastGainUp = now;
-      if (verboseLogging) {
-        std::cout << "[GAIN] sensitivity-up: A" << current << " -> A"
-                  << (current - 1) << " (" << agcModeToGainDb(current)
-                  << " dB -> " << agcModeToGainDb(current - 1)
-                  << " dB, comp=" << std::fixed
-                  << std::setprecision(2) << signal.compensatedDbfs
-                  << ", clip=" << std::setprecision(4) << clipRatio << ")\n";
-      }
+  } else if (step == fm_tuner::AutoGainStep::Up) {
+    requestedAGCMode = current - 1;
+    pendingAGC = true;
+    lastGainUp = now;
+    if (verboseLogging) {
+      std::cout << "[GAIN] sensitivity-up: A" << current << " -> A"
+                << (current - 1) << " (" << agcModeToGainDb(current)
+                << " dB -> " << agcModeToGainDb(current - 1)
+                << " dB, dbfs=" << std::fixed << std::setprecision(2)
+                << signal.dbfs << ", clip=" << std::setprecision(4) << clipRatio
+                << ")\n";
     }
   }
 }
