@@ -90,8 +90,11 @@ Verify: `gh release view v$V --json isDraft,isPrerelease,assets`.
   service installed at runtime; Windows prebuilts are RTL-only. See
   [USER-MANUAL.md](USER-MANUAL.md) and [README.md](README.md).
 - Every archive/package bundles `README.md`, `USER-MANUAL.md`, the ready-to-use
-  `fm-sdr-tuner.ini` + `*.ini.example` templates, and `rest_test_panel.py`
-  (CI copies these in; see the workflow files and the CMake `install()` rules).
+  `fm-sdr-tuner.ini`, and `rest_test_panel.py` (CI copies these in; see the
+  workflow files and the CMake `install()` rules). macOS and Linux additionally
+  ship the `fm-sdr-tuner-sdrplay.ini.example` template and `run_rest_panel.sh`;
+  the Windows archive ships only `fm-sdr-tuner.ini.example` (SDRplay is
+  unsupported on Windows and `run_rest_panel.sh` is a POSIX shell launcher).
 - There is no automated release workflow yet; the publish step (4) is manual.
   A future improvement is a tag-triggered workflow that builds and attaches the
   assets automatically.

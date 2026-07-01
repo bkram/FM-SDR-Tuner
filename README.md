@@ -204,11 +204,18 @@ vcpkg install openssl librtlsdr liquid-dsp
 
 ## SDRplay (RSP) support
 
-SDRplay support is **optional and off by default**, and the prebuilt CI release
-binaries are deliberately built **without** it — the SDRplay API is proprietary
-(closed-source headers + a runtime service), so it cannot be redistributed in
-the public packages. To use an RSP you build from source yourself with the flag
-below. RTL-SDR users need none of this.
+The prebuilt **macOS and Linux** release binaries are **SDRplay-capable** — CI
+builds them with SDRplay support by fetching the vendor's public API *headers*
+at build time; the library itself is `dlopen`'d at runtime and never linked or
+bundled, so nothing proprietary is redistributed and the binary still runs on
+RTL-only systems. To use an RSP with a prebuilt binary, just install the
+**SDRplay API service** from <https://www.sdrplay.com/> and set
+`source = sdrplay`. The **Windows** build is RTL-only (no SDRplay loader).
+RTL-SDR users need none of this.
+
+Building it yourself is only needed for Windows SDRplay (unsupported) or custom
+builds; SDRplay support is off by default in a plain source build and enabled
+with the flag below.
 
 ### Building with SDRplay support
 
@@ -1262,9 +1269,9 @@ Artifacts currently uploaded by CI:
   - `fm-sdr-tuner-linux-rpm-fedora-43-x64`
   - `fm-sdr-tuner-linux-rpm-fedora-43-arm64`
 - macOS build job:
-  - `fm-sdr-tuner-macos` (binary + `README.md` + both `*.ini.example` configs + `rest_test_panel.py` + `run_rest_panel.sh`)
+  - `fm-sdr-tuner-macos` (binary + `README.md` + `USER-MANUAL.md` + ready-to-use `fm-sdr-tuner.ini` + both `*.ini.example` configs + `rest_test_panel.py` + `run_rest_panel.sh`)
 - Windows MinGW job:
-  - `fm-sdr-tuner-windows-mingw` (`.exe` + required DLLs + `dependencies.txt` + `fm-sdr-tuner.ini.example` + `rest_test_panel.py`)
+  - `fm-sdr-tuner-windows-mingw` (`.exe` + required DLLs + `dependencies.txt` + `README.md` + `USER-MANUAL.md` + ready-to-use `fm-sdr-tuner.ini` + `fm-sdr-tuner.ini.example` + `rest_test_panel.py`)
 
 The **macOS and Linux** release builds are **SDRplay-capable**: CI builds them
 with `-DFM_TUNER_ENABLE_SDRPLAY=ON` against the vendor's public API *headers*
