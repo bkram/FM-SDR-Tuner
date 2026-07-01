@@ -65,6 +65,69 @@ TEST_CASE("App options parser reads tcp host and port", "[app_options]") {
   REQUIRE(result.options.tcpPort == 4321);
 }
 
+TEST_CASE("App options parser overrides REST port and enables the API",
+          "[app_options]") {
+  std::vector<std::string> args = {"fm-sdr-tuner", "--rest-port", "9090", "-s"};
+  std::vector<char *> argv = makeArgv(args);
+  const AppParseResult result =
+      parseAppOptions(static_cast<int>(argv.size()), argv.data(), 256000);
+  REQUIRE(result.outcome == AppParseOutcome::Run);
+  REQUIRE(result.options.config.rest.port == 9090);
+  REQUIRE(result.options.config.rest.enabled);
+}
+
+TEST_CASE("App options parser disables REST API when port is zero",
+          "[app_options]") {
+  std::vector<std::string> args = {"fm-sdr-tuner", "--rest-port", "0", "-s"};
+  std::vector<char *> argv = makeArgv(args);
+  const AppParseResult result =
+      parseAppOptions(static_cast<int>(argv.size()), argv.data(), 256000);
+  REQUIRE(result.outcome == AppParseOutcome::Run);
+  REQUIRE(result.options.config.rest.port == 0);
+  REQUIRE_FALSE(result.options.config.rest.enabled);
+}
+
+TEST_CASE("App options parser sets REST bind address", "[app_options]") {
+  std::vector<std::string> args = {"fm-sdr-tuner", "--rest-bind", "0.0.0.0",
+                                   "--rest-port", "8080", "-s"};
+  std::vector<char *> argv = makeArgv(args);
+  const AppParseResult result =
+      parseAppOptions(static_cast<int>(argv.size()), argv.data(), 256000);
+  REQUIRE(result.outcome == AppParseOutcome::Run);
+  REQUIRE(result.options.config.rest.bind_address == "0.0.0.0");
+  REQUIRE(result.options.config.rest.port == 8080);
+}
+
+TEST_CASE("App options parser rejects out-of-range REST port",
+          "[app_options]") {
+  std::vector<std::string> args = {"fm-sdr-tuner", "--rest-port", "70000",
+                                   "-s"};
+  std::vector<char *> argv = makeArgv(args);
+  const AppParseResult result =
+      parseAppOptions(static_cast<int>(argv.size()), argv.data(), 256000);
+  REQUIRE(result.outcome == AppParseOutcome::ExitFailure);
+}
+
+TEST_CASE("App options parser --verbose forces verbose logging on",
+          "[app_options]") {
+  std::vector<std::string> args = {"fm-sdr-tuner", "--verbose", "-s"};
+  std::vector<char *> argv = makeArgv(args);
+  const AppParseResult result =
+      parseAppOptions(static_cast<int>(argv.size()), argv.data(), 256000);
+  REQUIRE(result.outcome == AppParseOutcome::Run);
+  REQUIRE(result.options.verboseLogging);
+}
+
+TEST_CASE("App options parser --quiet disables verbose logging",
+          "[app_options]") {
+  std::vector<std::string> args = {"fm-sdr-tuner", "--quiet", "-s"};
+  std::vector<char *> argv = makeArgv(args);
+  const AppParseResult result =
+      parseAppOptions(static_cast<int>(argv.size()), argv.data(), 256000);
+  REQUIRE(result.outcome == AppParseOutcome::Run);
+  REQUIRE_FALSE(result.options.verboseLogging);
+}
+
 TEST_CASE("App options parser enables audio by default when no output given",
           "[app_options]") {
   std::vector<std::string> args = {"fm-sdr-tuner", "--source", "rtl_sdr"};

@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Install dependencies
       run: |
@@ -39,7 +39,7 @@ jobs:
           --html-details build-coverage/coverage.html
 
     - name: Upload coverage artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: fm-sdr-tuner-coverage-ubuntu-24.04
         path: |
@@ -58,17 +58,30 @@ jobs:
             arch: arm64
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Install dependencies
       run: |
         if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
         $SUDO apt-get update
-        $SUDO apt-get install -y cmake g++ file dpkg-dev pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev catch2
+        $SUDO apt-get install -y cmake g++ file dpkg-dev pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev catch2 curl ca-certificates
 
-    - name: Build
+    # Fetch the SDRplay API *headers* so the shipped binary is SDRplay-capable.
+    # The library is dlopen'd at runtime (never linked/bundled), so this
+    # redistributes nothing proprietary, adds no package dependency, and the
+    # binary still runs on RTL-only systems. makeself --noexec extracts the
+    # payload (incl. inc/sdrplay_api.h, arch-independent) without running the
+    # installer. Pinned version — bump if it 404s.
+    - name: Build (SDRplay-enabled)
       run: |
-        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF
+        curl -sSL --retry 3 --max-time 120 -o sdrplay.run \
+          https://www.sdrplay.com/software/SDRplay_RSP_API-Linux-3.15.2.run
+        sh sdrplay.run --noexec --target sdrplay_pkg
+        test -f sdrplay_pkg/inc/sdrplay_api.h
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF \
+          -DFM_TUNER_ENABLE_SDRPLAY=ON -DSDRPLAY_INCLUDE_DIR="$PWD/sdrplay_pkg/inc" 2>&1 | tee cmake.log
+        # Fail loudly rather than silently ship an RTL-only binary.
+        grep -q "SDRplay support enabled" cmake.log
         cmake --build build -j$(nproc)
 
     - name: Run tests
@@ -81,11 +94,14 @@ jobs:
         cpack -G DEB
         mkdir -p ../dist/linux
         cp ./*.deb ../dist/linux/
-        cp ../README.md ../dist/linux/
-        cp ../fm-sdr-tuner.ini ../dist/linux/
+        cp ../README.md ../USER-MANUAL.md ../dist/linux/
+        cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        # Ready-to-use config so auto-load (no -c) works on first run.
+        cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
+        cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: fm-sdr-tuner-linux-deb-ubuntu-24.04-${{ matrix.arch }}
         path: dist/linux
@@ -103,17 +119,30 @@ jobs:
     container: debian:trixie
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Install dependencies
       run: |
         if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
         $SUDO apt-get update
-        $SUDO apt-get install -y cmake g++ file dpkg-dev pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev catch2
+        $SUDO apt-get install -y cmake g++ file dpkg-dev pkg-config librtlsdr-dev libusb-1.0-0-dev libssl-dev libasound2-dev libliquid-dev catch2 curl ca-certificates
 
-    - name: Build
+    # Fetch the SDRplay API *headers* so the shipped binary is SDRplay-capable.
+    # The library is dlopen'd at runtime (never linked/bundled), so this
+    # redistributes nothing proprietary, adds no package dependency, and the
+    # binary still runs on RTL-only systems. makeself --noexec extracts the
+    # payload (incl. inc/sdrplay_api.h, arch-independent) without running the
+    # installer. Pinned version — bump if it 404s.
+    - name: Build (SDRplay-enabled)
       run: |
-        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF
+        curl -sSL --retry 3 --max-time 120 -o sdrplay.run \
+          https://www.sdrplay.com/software/SDRplay_RSP_API-Linux-3.15.2.run
+        sh sdrplay.run --noexec --target sdrplay_pkg
+        test -f sdrplay_pkg/inc/sdrplay_api.h
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF \
+          -DFM_TUNER_ENABLE_SDRPLAY=ON -DSDRPLAY_INCLUDE_DIR="$PWD/sdrplay_pkg/inc" 2>&1 | tee cmake.log
+        # Fail loudly rather than silently ship an RTL-only binary.
+        grep -q "SDRplay support enabled" cmake.log
         cmake --build build -j$(nproc)
 
     - name: Run tests
@@ -126,11 +155,14 @@ jobs:
         cpack -G DEB
         mkdir -p ../dist/linux
         cp ./*.deb ../dist/linux/
-        cp ../README.md ../dist/linux/
-        cp ../fm-sdr-tuner.ini ../dist/linux/
+        cp ../README.md ../USER-MANUAL.md ../dist/linux/
+        cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        # Ready-to-use config so auto-load (no -c) works on first run.
+        cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
+        cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: fm-sdr-tuner-linux-deb-debian-trixie-${{ matrix.arch }}
         path: dist/linux
@@ -148,19 +180,32 @@ jobs:
     container: fedora:42
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Install dependencies
       run: |
-        dnf install -y cmake gcc-c++ make file pkgconfig
+        dnf install -y cmake gcc-c++ make file pkgconfig tar gzip
         dnf install -y openssl-devel alsa-lib-devel
         dnf install -y rtl-sdr-devel liquid-dsp-devel
         dnf install -y catch2-devel
         dnf install -y rpm-build || true
 
-    - name: Build
+    # Fetch the SDRplay API *headers* so the shipped binary is SDRplay-capable.
+    # The library is dlopen'd at runtime (never linked/bundled), so this
+    # redistributes nothing proprietary, adds no package dependency, and the
+    # binary still runs on RTL-only systems. makeself --noexec extracts the
+    # payload (incl. inc/sdrplay_api.h, arch-independent) without running the
+    # installer. Pinned version — bump if it 404s.
+    - name: Build (SDRplay-enabled)
       run: |
-        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF
+        curl -sSL --retry 3 --max-time 120 -o sdrplay.run \
+          https://www.sdrplay.com/software/SDRplay_RSP_API-Linux-3.15.2.run
+        sh sdrplay.run --noexec --target sdrplay_pkg
+        test -f sdrplay_pkg/inc/sdrplay_api.h
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF \
+          -DFM_TUNER_ENABLE_SDRPLAY=ON -DSDRPLAY_INCLUDE_DIR="$PWD/sdrplay_pkg/inc" 2>&1 | tee cmake.log
+        # Fail loudly rather than silently ship an RTL-only binary.
+        grep -q "SDRplay support enabled" cmake.log
         cmake --build build -j$(nproc)
 
     - name: Run tests
@@ -173,11 +218,14 @@ jobs:
         cpack -G RPM
         mkdir -p ../dist/linux
         cp ./*.rpm ../dist/linux/
-        cp ../README.md ../dist/linux/
-        cp ../fm-sdr-tuner.ini ../dist/linux/
+        cp ../README.md ../USER-MANUAL.md ../dist/linux/
+        cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        # Ready-to-use config so auto-load (no -c) works on first run.
+        cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
+        cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: fm-sdr-tuner-linux-rpm-fedora-42-${{ matrix.arch }}
         path: dist/linux
@@ -195,19 +243,32 @@ jobs:
     container: fedora:43
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Install dependencies
       run: |
-        dnf install -y cmake gcc-c++ make file pkgconfig
+        dnf install -y cmake gcc-c++ make file pkgconfig tar gzip
         dnf install -y openssl-devel alsa-lib-devel
         dnf install -y rtl-sdr-devel liquid-dsp-devel
         dnf install -y catch2-devel
         dnf install -y rpm-build || true
 
-    - name: Build
+    # Fetch the SDRplay API *headers* so the shipped binary is SDRplay-capable.
+    # The library is dlopen'd at runtime (never linked/bundled), so this
+    # redistributes nothing proprietary, adds no package dependency, and the
+    # binary still runs on RTL-only systems. makeself --noexec extracts the
+    # payload (incl. inc/sdrplay_api.h, arch-independent) without running the
+    # installer. Pinned version — bump if it 404s.
+    - name: Build (SDRplay-enabled)
       run: |
-        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF
+        curl -sSL --retry 3 --max-time 120 -o sdrplay.run \
+          https://www.sdrplay.com/software/SDRplay_RSP_API-Linux-3.15.2.run
+        sh sdrplay.run --noexec --target sdrplay_pkg
+        test -f sdrplay_pkg/inc/sdrplay_api.h
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFM_TUNER_ENABLE_X86_AVX2=OFF \
+          -DFM_TUNER_ENABLE_SDRPLAY=ON -DSDRPLAY_INCLUDE_DIR="$PWD/sdrplay_pkg/inc" 2>&1 | tee cmake.log
+        # Fail loudly rather than silently ship an RTL-only binary.
+        grep -q "SDRplay support enabled" cmake.log
         cmake --build build -j$(nproc)
 
     - name: Run tests
@@ -220,11 +281,14 @@ jobs:
         cpack -G RPM
         mkdir -p ../dist/linux
         cp ./*.rpm ../dist/linux/
-        cp ../README.md ../dist/linux/
-        cp ../fm-sdr-tuner.ini ../dist/linux/
+        cp ../README.md ../USER-MANUAL.md ../dist/linux/
+        cp ../fm-sdr-tuner.ini.example ../fm-sdr-tuner-sdrplay.ini.example ../dist/linux/
+        # Ready-to-use config so auto-load (no -c) works on first run.
+        cp ../fm-sdr-tuner.ini.example ../dist/linux/fm-sdr-tuner.ini
+        cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: fm-sdr-tuner-linux-rpm-fedora-43-${{ matrix.arch }}
         path: dist/linux
@@ -245,13 +309,13 @@ jobs:
 
     steps:
     - name: Download Ubuntu package artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         name: fm-sdr-tuner-linux-deb-ubuntu-24.04-${{ matrix.arch }}
         path: /tmp/artifacts/ubuntu
 
     - name: Download Debian package artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         name: fm-sdr-tuner-linux-deb-debian-trixie-${{ matrix.arch }}
         path: /tmp/artifacts/debian
@@ -297,13 +361,13 @@ jobs:
 
     steps:
     - name: Download Fedora 42 package artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         name: fm-sdr-tuner-linux-rpm-fedora-42-${{ matrix.arch }}
         path: /tmp/artifacts/fedora-42
 
     - name: Download Fedora 43 package artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         name: fm-sdr-tuner-linux-rpm-fedora-43-${{ matrix.arch }}
         path: /tmp/artifacts/fedora-43

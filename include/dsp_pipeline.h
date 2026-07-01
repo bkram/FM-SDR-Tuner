@@ -28,6 +28,15 @@ public:
     float stereoQuality = 0.0f;
     float audioClipRatio = 0.0f;
     double channelPowerDbfs = std::numeric_limits<double>::quiet_NaN();
+    float mpxMagnitude = 0.0f;
+    // Peak composite (MPX) deviation this block; demod scaled 1.0 == 75 kHz.
+    // Accumulated downstream into a decaying peak hold for MAX DEV.
+    float mpxPeak = 0.0f;
+    float pilotDeviationKHz = 0.0f; // calibrated 19 kHz pilot peak deviation
+    float rdsDeviationKHz = 0.0f;   // calibrated 57 kHz RDS peak deviation
+    // Demod-domain SNR/quality in dB (noise-triangle hiss band). Always finite;
+    // a reception-quality figure, not a calibrated absolute.
+    float demodSnrDb = 0.0f;
   };
 
   DspPipeline(int inputRate, int outputRate,
@@ -43,6 +52,13 @@ public:
   size_t sdrBlockSamples() const { return m_blockSamples * m_iqDecimation; }
 
   bool process(const uint8_t *iq, size_t samples,
+               const std::function<void(const float *, size_t)> &rdsSink,
+               Result &out);
+
+  // Normalized-complex<float> input path (SDRplay and other 16-bit sources).
+  // Same processing as the uint8 overload; only the front-end input conversion
+  // differs (the samples already arrive at ±1.0 full scale).
+  bool process(const std::complex<float> *iq, size_t samples,
                const std::function<void(const float *, size_t)> &rdsSink,
                Result &out);
 
@@ -68,6 +84,14 @@ private:
   size_t m_iqStagingReadPos = 0;
   size_t m_iqStagingWritePos = 0;
   size_t m_iqStagingSize = 0;
+  // Parallel complex<float> staging for the CF32 input path (allocated lazily
+  // on first use, so RTL/uint8 sessions don't pay for it). Units are samples,
+  // not bytes.
+  std::vector<std::complex<float>> m_iqStagingRingC;
+  std::vector<std::complex<float>> m_iqLinearizedBlockC;
+  size_t m_iqStagingReadPosC = 0;
+  size_t m_iqStagingWritePosC = 0;
+  size_t m_iqStagingSizeC = 0;
   // Deferred-reset gate. setBandwidthHz / setDeemphasisMode previously called
   // m_stereo.reset() + m_afPost.reset() inline, so two back-to-back retune
   // setters (common on fast XDR retunes) would zero the audio-chain IIR state
@@ -84,6 +108,20 @@ private:
   void clearIqStaging();
   void appendIqToStaging(const uint8_t *iq, size_t sampleCount);
   bool linearizeDecimatorBlock(size_t sampleCount);
+
+  void clearIqStagingC();
+  void appendIqToStagingC(const std::complex<float> *iq, size_t sampleCount);
+  bool linearizeDecimatorBlockC(size_t sampleCount);
+
+  // Shared back half of process(): demod -> stereo -> AF post -> squelch ->
+  // soft-limit -> fill Result. iqForDemodComplex is non-null for the CF32 path
+  // and for the decimated uint8 path; iqForDemod (uint8) is used only for the
+  // undecimated uint8 path.
+  bool runDemodChain(const uint8_t *iqForDemod,
+                     const std::complex<float> *iqForDemodComplex,
+                     size_t demodSamples,
+                     const std::function<void(const float *, size_t)> &rdsSink,
+                     Result &out);
 };
 
 #endif

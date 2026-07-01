@@ -277,11 +277,59 @@ target_link_libraries(test_adaptive_bandwidth PRIVATE
     ${FM_TUNER_CATCH2_TARGET}
 )
 
+# Header-only auto-gain policy: no extra source needed.
+add_executable(test_auto_gain test_auto_gain.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+)
+target_include_directories(test_auto_gain PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_auto_gain PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+)
+
+add_executable(test_sdrplay_stub test_sdrplay_stub.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/sdrplay_device.cpp
+    ${CMAKE_SOURCE_DIR}/src/tuner_controller.cpp
+    ${CMAKE_SOURCE_DIR}/src/rtl_sdr_device.cpp
+    ${CMAKE_SOURCE_DIR}/src/rtl_tcp_client.cpp
+)
+target_include_directories(test_sdrplay_stub PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_sdrplay_stub PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+    Threads::Threads
+)
+if(WIN32)
+    target_link_libraries(test_sdrplay_stub PRIVATE ws2_32)
+endif()
+
+add_executable(test_rest_server test_rest_server.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/rest_server.cpp
+)
+target_include_directories(test_rest_server PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_rest_server PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+    Threads::Threads
+)
+if(WIN32)
+    target_link_libraries(test_rest_server PRIVATE ws2_32)
+endif()
+
 add_test(NAME signal_level COMMAND test_signal_level)
 add_test(NAME config COMMAND test_config)
 add_test(NAME app_options COMMAND test_app_options)
 add_test(NAME dsp_chain COMMAND test_dsp_chain)
 add_test(NAME adaptive_bandwidth COMMAND test_adaptive_bandwidth)
+add_test(NAME auto_gain COMMAND test_auto_gain)
 add_test(NAME runtime COMMAND test_runtime)
 add_test(NAME audio_output COMMAND test_audio_output)
 add_test(NAME wav_writer COMMAND test_wav_writer)
@@ -292,3 +340,5 @@ add_test(NAME protocol COMMAND test_protocol)
 add_test(NAME xdr_unit COMMAND test_xdr_unit)
 add_test(NAME xdr_facade COMMAND test_xdr_facade)
 add_test(NAME scan_engine COMMAND $<TARGET_FILE:test_scan_engine>)
+add_test(NAME sdrplay_stub COMMAND test_sdrplay_stub)
+add_test(NAME rest_server COMMAND test_rest_server)

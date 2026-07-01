@@ -188,7 +188,11 @@ TEST_CASE("ScanEngine batches fallback retunes for contiguous uncovered channels
       },
       [&](uint8_t *, size_t maxSamples) -> size_t {
         readCount++;
-        if (readCount <= 4) {
+        // The first two tuned centers produce no data (forcing their channels
+        // into the fallback path); later centers and the fallback batch read
+        // normally. Gating on the retune index keeps this robust to the number
+        // of post-retune settle reads the engine performs.
+        if (retuneCount <= 2) {
           return 0;
         }
         return std::min(maxSamples, kSamples);
@@ -207,4 +211,50 @@ TEST_CASE("ScanEngine batches fallback retunes for contiguous uncovered channels
   REQUIRE(xdr.m_scanQueue.size() == 1);
   REQUIRE(xdr.m_scanQueue.back().second ==
           "U87500=0.0,87600=0.0,87700=0.0,87800=0.0,87900=0.0,88000=0.0,");
+}
+
+TEST_CASE("ScanEngine flushes the source buffer after every retune",
+          "[scan_engine][xdr]") {
+  XDRServer xdr;
+  xdr.setVerboseLogging(false);
+
+  xdr.m_scanStartKHz = 87500;
+  xdr.m_scanStopKHz = 88000;
+  xdr.m_scanStepKHz = 100;
+  xdr.m_scanBandwidthHz = 56000;
+  xdr.m_scanAntenna = 0;
+  xdr.m_scanContinuous = false;
+  xdr.m_scanStartPending = true;
+
+  ScanEngine scan;
+  std::atomic<int> requestedBandwidthHz{0};
+  std::atomic<bool> pendingBandwidth{false};
+  scan.handleControl(xdr, 90000000U, 56000, true, false, requestedBandwidthHz,
+                     pendingBandwidth, [](uint32_t, int) {});
+
+  constexpr uint32_t kSampleRateHz = 256000;
+  constexpr size_t kSamples = 16384;
+  std::vector<uint8_t> iqBuffer(kSamples * 2, 127);
+
+  int retuneCount = 0;
+  int flushCount = 0;
+  Config::SDRSection sdrConfig{};
+  const bool ran = scan.runIfActive(
+      xdr, true, []() { return true; },
+      [&](uint32_t) -> bool {
+        retuneCount++;
+        return true;
+      },
+      [&](uint8_t *, size_t maxSamples) -> size_t {
+        return std::min(maxSamples, kSamples);
+      },
+      [](const uint8_t *, size_t) {}, std::chrono::milliseconds(0),
+      iqBuffer.data(), kSamples, kSampleRateHz, 0, 0.0, sdrConfig,
+      [](uint32_t, int) {}, [&]() { flushCount++; });
+
+  REQUIRE(ran);
+  // Every retune must be followed by a flush so the FFT never reads the stale
+  // pre-retune backlog (which otherwise mis-bins a station by one sweep step).
+  REQUIRE(retuneCount > 0);
+  REQUIRE(flushCount == retuneCount);
 }

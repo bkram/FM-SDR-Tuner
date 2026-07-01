@@ -1,5 +1,7 @@
 #include "runtime_loop.h"
 
+#include "auto_gain_policy.h"
+
 #include <algorithm>
 #include <iomanip>
 #include <iostream>
@@ -29,7 +31,9 @@ bool handleControlAndScan(
     size_t sdrBufSamples, uint32_t iqSampleRate, int effectiveAppliedGainDb,
     double signalGainCompFactor, const Config::SDRSection &sdrConfig,
     const std::function<void(uint32_t, int)> &restoreAfterScan,
-    const std::function<bool()> &shouldRun) {
+    const std::function<bool()> &shouldRun,
+    const std::function<uint32_t(bool)> &setScanWideMode, bool &scanWideActive,
+    uint32_t &scanWideRate, const std::function<void()> &tunerFlush) {
   scanEngine.handleControl(xdrServer, requestedFrequencyHz.load(),
                            appliedBandwidthHz, rtlConnected, verboseLogging,
                            requestedBandwidthHz, pendingBandwidth,
@@ -38,6 +42,12 @@ bool handleControlAndScan(
   if (rtlConnected && pendingFrequency.exchange(false)) {
     const uint32_t targetFrequencyHz = requestedFrequencyHz.load();
     if (tunerSetFrequency(targetFrequencyHz)) {
+      // Reflect the applied frequency in the XDR server state regardless of who
+      // requested it (XDR command, REST API, scan restore, ...). The XDR/FM-DX
+      // command handlers set it themselves, but REST/internal retunes go only
+      // through the pending-frequency path, so without this an XDR client (e.g.
+      // FM-DX-Webserver) would report a stale frequency after a REST change.
+      xdrServer.setFrequencyState(targetFrequencyHz);
       audioOut.clearRealtimeQueue();
       dspRuntime.reset(fm_tuner::dsp::ResetReason::Retune);
       retuneMuteSamplesRemaining = kRetuneMuteSamples;
@@ -71,10 +81,28 @@ bool handleControlAndScan(
     }
   }
 
+  // SDRplay wide-bandwidth scan: when a sweep is active, drop the hardware
+  // decimation so each retune covers ~8x more spectrum (a full-band sweep is
+  // otherwise dominated by SDRplay's per-retune LO settling). Switch back to
+  // the 256 kHz audio rate the moment the scan ends. No-op for RTL (the lambda
+  // returns 0, so the normal rate is kept).
+  const bool scanActive = scanEngine.isActive();
+  if (scanActive && !scanWideActive) {
+    const uint32_t wide = setScanWideMode(true);
+    scanWideRate = (wide != 0) ? wide : iqSampleRate;
+    scanWideActive = true;
+  } else if (!scanActive && scanWideActive) {
+    setScanWideMode(false);
+    scanWideActive = false;
+    scanWideRate = iqSampleRate;
+  }
+  const uint32_t effectiveScanRate = scanWideActive ? scanWideRate : iqSampleRate;
+
   return scanEngine.runIfActive(
       xdrServer, rtlConnected, shouldRun, tunerSetFrequency, tunerReadIQ,
-      writeIqCapture, scanRetrySleep, iqBuffer, sdrBufSamples, iqSampleRate,
-      effectiveAppliedGainDb, signalGainCompFactor, sdrConfig, restoreAfterScan);
+      writeIqCapture, scanRetrySleep, iqBuffer, sdrBufSamples, effectiveScanRate,
+      effectiveAppliedGainDb, signalGainCompFactor, sdrConfig, restoreAfterScan,
+      tunerFlush);
 }
 
 void maybeAdjustAutoGain(
@@ -87,41 +115,42 @@ void maybeAdjustAutoGain(
   if (useSdrppGainStrategy || cliGain >= 0 || imsAgcEnabled) {
     return;
   }
+  // Recovery keys off raw-dbfs headroom (see auto_gain_policy.h), not the
+  // smoothed display level whose slow fall used to delay climbing back.
+  (void)rfLevelFiltered;
 
   const auto now = std::chrono::steady_clock::now();
-  const bool overload = (clipRatio > 0.0200) || (signal.dbfs > -5.0);
-  const bool weak = (clipRatio < 0.0005) && (signal.compensatedDbfs < -47.0) &&
-                    (rfLevelFiltered < 35.0f);
+  const bool downTimerElapsed =
+      (now - lastGainDown) >= std::chrono::milliseconds(900);
+  const bool upTimerElapsed =
+      (now - lastGainUp) >= std::chrono::milliseconds(4000);
+  const int current = std::clamp(requestedAGCMode.load(), 0, 3);
+  const fm_tuner::AutoGainStep step = fm_tuner::decideAutoGainStep(
+      current, clipRatio, signal.dbfs, downTimerElapsed, upTimerElapsed);
 
-  if (overload && (now - lastGainDown) >= std::chrono::milliseconds(900)) {
-    const int current = std::clamp(requestedAGCMode.load(), 0, 3);
-    if (current < 3) {
-      requestedAGCMode = current + 1;
-      pendingAGC = true;
-      lastGainDown = now;
-      if (verboseLogging) {
-        std::cout << "[GAIN] clip-protect: A" << current << " -> A"
-                  << (current + 1) << " (" << agcModeToGainDb(current)
-                  << " dB -> " << agcModeToGainDb(current + 1)
-                  << " dB, dbfs=" << std::fixed
-                  << std::setprecision(2) << signal.dbfs
-                  << ", clip=" << std::setprecision(4) << clipRatio << ")\n";
-      }
+  if (step == fm_tuner::AutoGainStep::Down) {
+    requestedAGCMode = current + 1;
+    pendingAGC = true;
+    lastGainDown = now;
+    if (verboseLogging) {
+      std::cout << "[GAIN] clip-protect: A" << current << " -> A"
+                << (current + 1) << " (" << agcModeToGainDb(current)
+                << " dB -> " << agcModeToGainDb(current + 1)
+                << " dB, dbfs=" << std::fixed << std::setprecision(2)
+                << signal.dbfs << ", clip=" << std::setprecision(4) << clipRatio
+                << ")\n";
     }
-  } else if (weak && (now - lastGainUp) >= std::chrono::milliseconds(4000)) {
-    const int current = std::clamp(requestedAGCMode.load(), 0, 3);
-    if (current > 0) {
-      requestedAGCMode = current - 1;
-      pendingAGC = true;
-      lastGainUp = now;
-      if (verboseLogging) {
-        std::cout << "[GAIN] sensitivity-up: A" << current << " -> A"
-                  << (current - 1) << " (" << agcModeToGainDb(current)
-                  << " dB -> " << agcModeToGainDb(current - 1)
-                  << " dB, comp=" << std::fixed
-                  << std::setprecision(2) << signal.compensatedDbfs
-                  << ", clip=" << std::setprecision(4) << clipRatio << ")\n";
-      }
+  } else if (step == fm_tuner::AutoGainStep::Up) {
+    requestedAGCMode = current - 1;
+    pendingAGC = true;
+    lastGainUp = now;
+    if (verboseLogging) {
+      std::cout << "[GAIN] sensitivity-up: A" << current << " -> A"
+                << (current - 1) << " (" << agcModeToGainDb(current)
+                << " dB -> " << agcModeToGainDb(current - 1)
+                << " dB, dbfs=" << std::fixed << std::setprecision(2)
+                << signal.dbfs << ", clip=" << std::setprecision(4) << clipRatio
+                << ")\n";
     }
   }
 }

@@ -129,6 +129,11 @@ public:
 
   void init(const std::vector<float> &b, const std::vector<float> &a);
   void initDCBlocker(float alpha);
+  // Butterworth high-pass via liquid's IIR prototype designer (second-order
+  // sections). cutoffNorm is a fraction of the sample rate (f/Fs). Used for the
+  // demod-domain hiss-noise estimator (energy above the FM multiplex).
+  void initHighpass(unsigned int order, float cutoffNorm,
+                    float stopBandAtten = 60.0f);
   void reset();
   float execute(float input) const;
   bool ready() const { return m_object != nullptr; }
@@ -139,6 +144,10 @@ private:
   std::vector<float> m_a{};
   bool m_useDcBlocker = false;
   float m_dcAlpha = 0.0f;
+  bool m_useHighpass = false;
+  unsigned int m_hpOrder = 4;
+  float m_hpCutoffNorm = 0.0f;
+  float m_hpStopAtten = 60.0f;
 };
 
 class Resampler {
@@ -185,6 +194,13 @@ public:
   std::size_t executeComplex(const uint8_t *iqIn, std::size_t inSamples,
                              std::complex<float> *iqOut,
                              std::size_t outCapacity) const;
+  // Decimate an already-normalized complex<float> input (e.g. SDRplay's
+  // 16-bit IQ scaled to ±1.0). Same response as executeComplex; only the input
+  // conversion differs (none — the samples arrive normalized).
+  std::size_t executeComplexFromComplex(const std::complex<float> *iqIn,
+                                        std::size_t inSamples,
+                                        std::complex<float> *iqOut,
+                                        std::size_t outCapacity) const;
   bool ready() const { return m_object != nullptr || m_factor == 1; }
   std::uint32_t factor() const { return m_factor; }
 

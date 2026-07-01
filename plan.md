@@ -1,6 +1,6 @@
 # FM-SDR-Tuner Code Review Plan
 
-Last reviewed against current source: 2026-05-20 (post v1.6.0)
+Last reviewed against current source: 2026-06-17 (post v1.6.2, on v1.6.3)
 
 ## Scope
 
@@ -19,113 +19,33 @@ This plan focuses on:
 
 ## Executive Summary
 
-### Recently closed
-
-**v1.6.1 (small features, patch):**
-- Live stereo blend control via XDR `Fb<n>` command (P15b). Closes the
-  half-shipped `-b` CLI flag — clients can now A/B blend modes at
-  runtime via the same XDR-GTK and FM-DX protocol paths.
-- Channel-power squelch with hysteresis + 30 ms ramp (P20). New
-  `[processing] squelch_dbfs` knob; default `-120.0` keeps the feature
-  effectively disabled, so existing deployments behave identically
-  until opted in. Useful for scan / DX / unattended workflows.
-- P18 (drop pilot bandpass FIR) was attempted as a stretch for this
-  patch but reverted — the lock-detection metrics need a holistic
-  redesign for the new (post-bandpass) signal scale, which is too
-  invasive for a patch release. Stays on the v1.7 stretch list.
-
-**v1.6.0 (CPU pass, perf-focused):**
-- Polynomial `fast_atan2f` for the pilot PLL phase detector, max error
-  ~0.0015 rad — replaces libm atan2f in the inner loop.
-- Gated Hi-Blend biquad redesign (every 64 samples instead of per-sample)
-  — eliminates `tanf` from the hot path.
-- Pilot bandpass FIR transition widened 3 kHz → 4 kHz, tap count drops
-  from ~325 to ~243 at 256 kHz (~25% fewer complex MACs/sec through
-  liquid's NEON dotprod).
-- 1024-entry sin/cos LUT for the two per-sample sincos pairs. Wash
-  against Apple's `__sincosf_stret` on M1; insurance for glibc / MSVC
-  builds where libm is less optimised, and a stepping stone for SIMD
-  batching.
-
-**v1.5.1 (DSP overhaul, feature work):**
-- CMA multipath equalizer with dispersion target + leak regularization
-  toward centered delta (`src/dsp/multipath_eq.cpp`).
-- Adaptive de-emphasis HiCut crossfade.
-- SNR-driven adaptive channel bandwidth with hysteresis.
-- LMS 19 kHz pilot canceller (default on).
-- 2nd-order Butterworth Hi-Blend biquad, gear-shifted pilot PLL.
-- Live MPX → audio device path (`src/mpx_audio_output.cpp`) — Core
-  Audio + ALSA, WinMM refused due to 48 kHz cap.
-- WAV writer learned input-side resampling; new `--mpx-rate` flag.
-- Meter calibration window widened to -65/-5 dBFS; `[METER]` log
-  with observed-min/max suggestions; `signal_level.snrDb` returns
-  NaN when no channel-FFT estimate available.
-- `forceMono` now suppresses the stereo indicator broadcast for
-  consistency with the audio actually being mono.
-- Unified RTL-SDR clip threshold via `include/dsp/iq_saturation.h`.
-- XDR FM-DX protocol gained `B` / `W` / `D` handlers (force-mono,
-  bandwidth, de-emphasis) — were silently erroring for clients
-  using the FM-DX protocol.
-- WinMM `waveOutPrepareHeader` return now checked; invalid
-  `WHDR_DONE` preset dropped.
-- MSVC: native `__cpuid` / `_xgetbv` CPU feature detection; AVX2
-  path enabled when `/arch:AVX2` is set.
-- Mono / MPX live: same-device collision guard; mono-then-stereo
-  Core Audio fallback (MPX duplicated to L=R) for strict DACs.
-
-**v1.5.0 (audio + scan hardening — for context):**
-- WAV header writes now check every `fseek`/`fwrite`, guard the 4 GiB
-  RIFF limit, propagate writer-thread fatal errors.
-- `XDRServer::start()` reports `errno` / `WSAGetLastError` on failures.
-- `FMDemod::setBandwidthHz` / `setDspAgcMode` reset downstream state on
-  reconfig (no audible click on XDR retune).
-- Output L/R through a tanh soft-limiter with metered `audioClipRatio`.
-- Stereo acquire/drop hysteresis is now a time-based EMA, block-size
-  independent.
-- Default `audio.enable_audio = true`, implicit guest-mode when no
-  password set, `tuner.default_freq = 87500`, blend = aggressive.
-- `-b soft|normal|aggressive` CLI flag.
-- `FMDemod::m_filteredChannelPowerDbfs` clamped ≤ 0 dBFS (display-side
-  band-aid for ADC-rail ringing).
-- Scan engine `usableHalfSpanHz` is a true half-span; consecutive
-  captures overlap by ≥ 25%; scan output is raw per-channel level.
-- `XDRServer` callback setters consolidated onto one template helper.
-- De-emphasis default is 50 µs; bilinear-pre-warped coefficients
-  matching GNU Radio `fm_emph.py`.
-
 ### Remaining problem areas
 
-1. **Tuner backend selection is still binary** (`rtl_sdr` / `rtl_tcp`)
-   — not a capability-based abstraction. `SoapySDR` cannot be added
-   cleanly on top of the current `TunerController` / `TunerSession`
-   split. This is the headline of milestone 1.7.
+1. **Tuner backend selection is still binary** (`rtl_sdr` / `rtl_tcp` /
+   `sdrplay`) — dispatched by a `SourceKind` enum, not a capability-based
+   abstraction. `SoapySDR` cannot be added cleanly on top of the current
+   `TunerController` / `TunerSession` split. This is the headline of
+   milestone 1.7.
 2. **Application::run() still owns too much orchestration.** Session
    lifecycle, XDR facade wiring, scan restore, mute windows,
-   reconnect, processing loop — all in one ~700-line function.
+   reconnect, processing loop — all in one large function.
    Structural debt for any new runtime feature.
 3. **ADC-rail saturation behaviour.** The channel Kaiser FIR rings
    past unit envelope under chronic clipping; the dBFS clamp hides
-   the symptom but the FIR isn't L1-renormalized and the gain
-   policy still accepts requests that would overload.
-4. **Runtime `stereo_blend` control is not wired to XDR** — `-b`
-   covers startup, but clients cannot A/B blend modes live.
+   the symptom, and the gain policy still accepts requests that would
+   overload.
 
 ## Verified Remaining Findings
 
 | ID | Priority | Location | Finding | Recommended action | Validation |
 |---|---|---|---|---|---|
-| P5 | Medium | `src/application.cpp` (~700 LoC) | `Application::run()` still owns session bootstrap, tuner lifecycle, XDR lifecycle, scan restore, mute windows, reconnection flow, and the main processing loop. Makes backend work and future runtime fixes harder than they need to be. | Split into smaller responsibilities: session bootstrap, command/control state application, scan coordinator, main DSP/audio loop. Keep `Application` as the assembly layer. | Behavior-preserving tests around start/stop, reconnect, scan restore, and retune mute. |
-| P6 | High | `src/tuner_controller.cpp`, `src/tuner_session.cpp` | Tuner backend selection is binary `rtl_sdr` / `rtl_tcp`. Not a sufficient abstraction for `SoapySDR`. Control surface is scattered between `TunerController`, `TunerSession`, and gain policy. | Backend interface that owns connect/disconnect, tuning, gain/AGC capabilities, sample-rate constraints, and capability queries. Policy in one layer, transport/device specifics in another. | Backend contract tests using a fake backend before adding `SoapySDR`. |
-| P17 | Medium | `src/fm_demod.cpp` (IQ filter init, power calc), `src/runtime_loop.cpp` | Under ADC-rail overload the IQ Kaiser FIR rings with L1 norm > 1, so `\|y\|² > 1`. The `≤ 0 dBFS` display clamp hides the symptom; underlying causes (non-L1-bounded FIR, gain policy not refusing overload-causing requests) remain. | (a) Renormalize IQ FIR taps so L1 norm ≤ 1 (guarantees `\|y\| ≤ max\|x\|`), keep the DC-passband gain as a documented constant. (b) Gain policy refuses to enable IF AGC (`G01`/`G11`) when recent `clip` ratio exceeds threshold; log `[GAIN] refusing G01: clip=...`. | `test_dsp_chain` synthetic 99% rail-clipped IQ block asserts `out.channelPowerDbfs <= 0` AND `\|y\|` stays bounded by `max\|x\|` after L1 normalization. Gain-policy unit test for the IF-AGC refusal path. |
+| P5 | Medium | `src/application.cpp` | `Application::run()` still owns session bootstrap, tuner lifecycle, XDR lifecycle, scan restore, mute windows, reconnection flow, and the main processing loop. Makes backend work and future runtime fixes harder than they need to be. | Split into smaller responsibilities: session bootstrap, command/control state application, scan coordinator, main DSP/audio loop. Keep `Application` as the assembly layer. | Behavior-preserving tests around start/stop, reconnect, scan restore, and retune mute. |
+| P6 | High | `src/tuner_controller.cpp`, `src/tuner_session.cpp` | Tuner backend selection is a `SourceKind` switch over `rtl_sdr` / `rtl_tcp` / `sdrplay`. Not a sufficient abstraction for `SoapySDR`. Control surface is scattered between `TunerController`, `TunerSession`, and gain policy. | Backend interface that owns connect/disconnect, tuning, gain/AGC capabilities, sample-rate constraints, and capability queries. Policy in one layer, transport/device specifics in another. | Backend contract tests using a fake backend before adding `SoapySDR`. |
+| P17b | Medium | `src/runtime_loop.cpp` (gain policy) | The IQ FIR L1 normalization landed in v1.6.2 (`processing.iq_fir_l1_normalize`, default off), so post-filter envelope can be hard-bounded. Still open: the gain policy accepts `G01` / `G11` requests that would push the front end into chronic ADC saturation. | Gain policy refuses to enable IF AGC (`G01`/`G11`) when recent `clip` ratio exceeds threshold; log `[GAIN] refusing G01: clip=...` and report the chronic-clip ratio back through the XDR meter rather than silently mis-representing the level. | Gain-policy unit test for the IF-AGC refusal path under a synthetic chronic-clip ratio. |
 | P18 | High | `src/stereo_decoder.cpp` (`m_liquidPilotBandFilter`, `m_delayLine`) | The 243-tap complex bandpass FIR for pilot recovery dominates the post-v1.6.0 profile (`dotprod_crcf_execute_neon4`, ~525 samples = ~10% of one core). `research/sdr-j-fm/src/fm/pilot-recover.cpp` removes the bandpass entirely and relies on the PLL loop bandwidth itself for filtering: `PhaseError = pilot * sin(oscillatorPhase); oscillatorPhase += PhaseError * gain + omega`. The L-R recovery delay line also shortens because there's no FIR group delay to compensate. | Replace `m_liquidPilotBandFilter.push/execute` with a product-detector PLL on the raw MPX float. Reuse `m_liquidPilotPll` for the NCO. Adjust `m_delaySamples` to whatever residual phase compensation the new path needs (likely zero). Keep the lock-detection (`m_pilotConfidence`) path. | Verify lock acquisition time on a clean strong station is within 2× of current. Verify lock holds on the captured `mpx_88600_60s.wav` fixture. Re-baseline real-RF CPU on the same M1 hardware A/B protocol — expect 5-10 pp savings on one core. Listening test for adjacent-channel splatter scenarios (where the bandpass was earning its keep). |
 | P19 | Medium | `src/stereo_decoder.cpp` (L-R recovery block) | Today's L-R recovery `2·Re(MPX·conj(PLL_38k)²)` is sensitive to pilot phase error: a 5° error in the pilot reference rotates the L-R subcarrier by ~10° before demodulation, producing ~3% measurable crosstalk. `research/sdr-j-fm/src/fm/stereo-separation.cpp` (Thomas Neder, 2023) implements `PerfectStereoSeparation`: a Costas-style adaptive separator that drives the cos/sin cross-coupling on the L-R complex baseband to zero. | Add an adaptive phase-shift integrator that sits between the pilot PLL output and the L-R demix multiply: `sinCosPath = sincos(pilotPhase + accPhaseShift) * mux; LPF(sinCosPath); error = real * imag; accPhaseShift += alpha * error`. Lock detector reuses `mean_error < threshold` over a stability window. Bypassed when `m_forceMono` or `m_stereoBlend < threshold`. | Synthetic test feeds MPX with a deliberately-rotated pilot reference and asserts post-convergence crosstalk is ≤ 1/10 of the pre-convergence value. Listening regression against the captured WAV fixture confirms no degradation on clean signals. |
 
 ## DSP Chain Alignment Review
-
-(Carried forward from v1.5.0 plan — all checks still valid as of
-v1.6.0. The CMA multipath equalizer and pilot canceller added in
-v1.5.1 don't change the load-bearing parts of the FM → pilot → stereo
-chain.)
 
 The FM demod → pilot PLL → stereo → de-emph → resample chain was
 cross-checked against the open-source WFM consensus (SDR++, GNU
@@ -148,9 +68,9 @@ implementation matches the consensus in all load-bearing respects:
 - Soft stereo blend driven by pilot coherence / PLL residual / PLL
   frequency error. Both SDR++ and GNU Radio omit any soft blend;
   retaining this is a deliberate strength.
-- **New in v1.5.1**: LMS pilot canceller two-tap subtracts the 19 kHz
-  residual from mono output; dispersion-form CMA equalizer with leak
-  regularization sits between the channel FIR and discriminator.
+- LMS pilot canceller two-tap subtracts the 19 kHz residual from mono
+  output; dispersion-form CMA equalizer with leak regularization sits
+  between the channel FIR and discriminator.
 
 ## Missing Test Coverage
 
@@ -159,15 +79,16 @@ These would catch regressions that current CI can't:
 1. ALSA enumeration failure path (`AudioOutput::listAlsaDevices`).
 2. Off-thread WAV writer shutdown-flush.
 3. High-IQ-rate decimation-path test (`--iq-rate 1024000` / `2048000`).
-4. Scan performance regression (FFT plan / buffer reuse, fallback
-   retune count bound).
+4. Scan FFT plan / buffer reuse across retunes (the fallback retune-count
+   bound and the post-retune buffer flush are already covered in
+   `test_scan_engine`).
 5. Handshake/auth truncation directly exercising `recvLine()` overflow.
 6. `WavWriter` / `AudioOutput::writeWAVData` 4 GiB boundary +
    fatal-error propagation.
 7. Analog-de-emphasis response-reference regression test (post the
    bilinear switch in v1.5.0).
-8. IF-AGC refusal path under chronic clip (depends on P17 landing).
-9. **New gaps from v1.5.1 / v1.6.0:**
+8. IF-AGC refusal path under chronic clip (depends on P17b landing).
+9. DSP / feature gaps:
    - Multipath equalizer behaviour on a multi-ray channel that's
      also moving (Doppler-like). Currently only the static
      2-ray test exists in `test_dsp_chain`.
@@ -186,9 +107,9 @@ split. The next clean step is the backend capability interface (P6),
 then a `SoapySDR` implementation behind it. This is the headline
 work for the 1.7 milestone.
 
-- Current source selection is binary and transport-oriented.
-- Capability differences between direct RTL, `rtl_tcp`, and Soapy
-  backends grow quickly.
+- Current source selection is a transport-oriented `SourceKind` switch.
+- Capability differences between direct RTL, `rtl_tcp`, SDRplay, and
+  Soapy backends grow quickly.
 - A fake backend in tests would also unblock more comprehensive
   test coverage for retune / reconnect flows.
 
@@ -207,10 +128,8 @@ single-digit-pp gains.
 
 ### Patch (1.6.x)
 
-1. ~~Runtime XDR `stereo_blend` control (P15b)~~ — **shipped in 1.6.1**.
-2. ~~Channel-power squelch (P20)~~ — **shipped in 1.6.1**.
-3. IQ FIR L1 normalization + ADC-rail-aware gain policy (P17) —
-   correctness fix, mostly invisible until needed.
+1. ADC-rail-aware gain policy refusal (P17b) — correctness fix, mostly
+   invisible until needed.
 
 ### Milestone (1.7) — Broad SDR Backend Support
 
@@ -233,14 +152,12 @@ single-digit-pp gains.
 
 1. Decompose `Application::run()` (P5) into smaller responsibilities
    now that the backend layer is abstracted.
-2. Squelch (P20) — small, can land alongside P5 or any earlier patch
-   if a user asks.
-3. Pick off the missing-test-coverage items above as the affected
+2. Pick off the missing-test-coverage items above as the affected
    subsystems are touched.
 
 ## References
 
-Algorithmic ideas in P18, P19, and P20 are drawn from
+Algorithmic ideas in P18 and P19 are drawn from
 [`sdr-j-fm`](https://github.com/JvanKatwijk/sdr-j-fm) by Jan van Katwijk
 (GPL-3.0), with the adaptive stereo separator (P19) specifically
 contributed by Thomas Neder in 2023. A reference clone lives at

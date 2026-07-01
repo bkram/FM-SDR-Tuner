@@ -37,7 +37,9 @@ bool handleControlAndScan(
     size_t sdrBufSamples, uint32_t iqSampleRate, int effectiveAppliedGainDb,
     double signalGainCompFactor, const Config::SDRSection &sdrConfig,
     const std::function<void(uint32_t, int)> &restoreAfterScan,
-    const std::function<bool()> &shouldRun);
+    const std::function<bool()> &shouldRun,
+    const std::function<uint32_t(bool)> &setScanWideMode, bool &scanWideActive,
+    uint32_t &scanWideRate, const std::function<void()> &tunerFlush = {});
 
 void maybeAdjustAutoGain(
     bool useSdrppGainStrategy, int cliGain, bool imsAgcEnabled,

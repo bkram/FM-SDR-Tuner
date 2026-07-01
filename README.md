@@ -2,6 +2,9 @@
 
 FM broadcast tuner and XDR server built around RTL-SDR IQ input.
 
+> New here? **[USER-MANUAL.md](USER-MANUAL.md)** is a focused guide to startup
+> and configuration. This README is the full feature/algorithm reference.
+
 ## Project Status / Experiment
 
 This repository is an active experiment in AI-assisted software development.
@@ -17,7 +20,7 @@ Implications:
 - Treat this as experimental software, not a finished product.
 
 Current architecture:
-- Input: `rtl_sdr` (default) or `rtl_tcp`
+- Input: `rtl_sdr` (default), `rtl_tcp`, or `sdrplay` (RSP series)
 - Demod/stereo/audio pipeline in-process
 - DSP pipeline uses `liquid-dsp` primitives (FM chain + RDS-related paths)
 - XDR-compatible server on port `7373`
@@ -27,6 +30,8 @@ Current architecture:
 
 - Direct USB RTL-SDR support (`--source rtl_sdr`) as default mode
 - `rtl_tcp` network source support (`--source rtl_tcp`)
+- SDRplay RSP support (`--source sdrplay`): 16-bit IQ fed at full dynamic range into the demod; the SDRplay API is `dlopen`'d at runtime (built with `-DFM_TUNER_ENABLE_SDRPLAY=ON`, no link/bundle), so the binary still runs and falls back to RTL where the RSP library is absent
+- Anonymous REST control API on a dedicated port (`[rest]`): carries the SDR-specific settings XDR has no vocabulary for (manual dB gain, SDRplay LNA state, antenna input, bias-tee) plus the common ones (frequency, bandwidth, AGC, de-emphasis, force-mono, volume, start/stop); works for both RTL and SDRplay backends. Intended for an fm-dx-webserver client plugin
 - FM stereo demod with gear-shifted PLL on the 19 kHz pilot (wide acquire, narrow hold)
 - 2nd-order Butterworth adaptive Hi-Blend on the L−R path — narrows stereo image as reception worsens, with 12 dB/oct rejection of stereo-decoded HF noise instead of 6 dB/oct
 - LMS pilot canceller: subtracts a phase-locked 19 kHz copy from the mono path (~20 dB extra suppression beyond the audio LPF; on by default)
@@ -114,7 +119,7 @@ If `fm-sdr-tuner` reports `[SDR] no rtl_sdr device found at index 0` even after 
 
 The tuner writes PCM to a single OS audio output device (Core Audio / ALSA / WinMM). It does not stream audio over the XDR control connection. If you want another application — FM-DX-Webserver, a streaming encoder, a recorder — to consume the tuner's audio, you need a virtual loopback that exposes the tuner's output as a recordable input on the host. Without a loopback the tuner can only play to a local speaker.
 
-List the devices the tuner can see with `./build/fm-sdr-tuner -l`, then point it at the loopback either per-run with `-d "<name>"` or persistently via `[audio] device = ...` in the INI. The bundled `fm-sdr-tuner.ini` already defaults to `BlackHole 2ch`.
+List the devices the tuner can see with `./build/fm-sdr-tuner -l`, then point it at the loopback either per-run with `-d "<name>"` or persistently via `[audio] device = ...` in the INI (e.g. `device = BlackHole 2ch`). The shipped example configs leave `device` empty (system default).
 
 ### macOS — BlackHole
 
@@ -195,6 +200,148 @@ Example dependency install (triplet/package names may vary by your vcpkg setup):
 
 ```bash
 vcpkg install openssl librtlsdr liquid-dsp
+```
+
+## SDRplay (RSP) support
+
+SDRplay support is **optional and off by default**, and the prebuilt CI release
+binaries are deliberately built **without** it — the SDRplay API is proprietary
+(closed-source headers + a runtime service), so it cannot be redistributed in
+the public packages. To use an RSP you build from source yourself with the flag
+below. RTL-SDR users need none of this.
+
+### Building with SDRplay support
+
+1. **Install the SDRplay API** from <https://www.sdrplay.com/api/>. This
+   provides the SDK headers (`sdrplay_api.h`) the build needs and the runtime
+   service (`sdrplay_apiService`) + shared library (`libsdrplay_api`) the binary
+   `dlopen`s at run time. The tuner never links the library — only the headers
+   are needed at compile time.
+2. **Configure with the flag.** SDRplay code only compiles when
+   `-DFM_TUNER_ENABLE_SDRPLAY=ON` is set *and* CMake can find `sdrplay_api.h`:
+
+   ```bash
+   cmake -S . -B build -DFM_TUNER_ENABLE_SDRPLAY=ON   # + your platform arch flag
+   cmake --build build -j
+   ```
+
+   CMake searches `/usr/local/include` and `/Library/SDRplayAPI/*/include` for
+   the header. If the SDK is installed elsewhere, point it there explicitly:
+
+   ```bash
+   cmake -S . -B build -DFM_TUNER_ENABLE_SDRPLAY=ON \
+         -DSDRPLAY_INCLUDE_DIR=/path/to/sdrplay/include
+   ```
+
+   Watch the configure output: `SDRplay support enabled (headers: ...)` means it
+   worked. If you instead see `building SDRplay stub (source unavailable at
+   runtime)`, the header wasn't found — the build still succeeds but
+   `--source sdrplay` will be a no-op until you point CMake at the SDK and
+   rebuild.
+
+Then run it (the SDRplay API service must be installed and running so
+`libsdrplay_api` and `sdrplay_apiService` are present):
+
+```bash
+./build/fm-sdr-tuner --source sdrplay --auto-start -s
+```
+
+The RSP front end is configured to deliver 2.048 MHz / 8 = 256 kHz IQ, matching
+the tuner's internal input rate (1:1 decimation). The 16-bit samples feed the
+demod at full dynamic range; an 8-bit shadow drives the signal meter / scan
+engine so the existing calibration windows stay valid. SDRplay-specific knobs
+live in an `[sdrplay]` INI section:
+
+```ini
+[tuner]
+source = sdrplay
+
+[sdrplay]
+lna_state = 4      ; front-end LNA gain-reduction step (0 = most gain)
+antenna   = 0      ; RSPdx/RSPdxR2 antenna input: 0=A, 1=B, 2=C (ignored on other models)
+bias_tee  = false
+```
+
+If no RSP (or no SDRplay API service) is present, `--source sdrplay` reports the
+failure; use `--source rtl_sdr` to fall back to an RTL dongle.
+
+**Spectral scan:** an SDRplay full-band sweep is dominated by per-retune LO
+settling, so the tuner automatically switches the RSP to a wide-bandwidth scan
+mode for the duration of a scan — it drops the hardware decimation (256 kHz →
+2.048 MHz) and widens the IF filter, so each retune covers ~8× more spectrum
+(~17 retunes instead of ~140 for the full band). A full 87.5–108 MHz sweep
+drops from ~13 s to under 2 s, then the 256 kHz audio rate is restored
+automatically. This is transparent (no config) and a no-op on RTL.
+
+## REST control API (fm-dx-webserver plugin)
+
+An optional anonymous HTTP API exposes the SDR settings on a dedicated port,
+including the SDR-specific ones the XDR protocol cannot carry. It drives the
+**same** `TunerController` and request-state as the XDR path, so it works
+identically for the RTL-SDR and SDRplay backends (SDRplay-only knobs no-op on
+RTL). There is **no authentication** by design — bind it to localhost or a
+trusted network only.
+
+```ini
+[rest]
+enabled = true
+port = 9090
+bind_address = 127.0.0.1
+```
+
+The port and bind address can also be overridden on the command line (handy for
+transient runs): `--rest-port <port>` (0 disables the API; any non-zero port
+enables it, overriding `[rest] enabled`/`port`) and `--rest-bind <addr>`.
+
+```bash
+./build/fm-sdr-tuner -c fm-sdr-tuner.ini -s --rest-port 9090 --rest-bind 0.0.0.0
+```
+
+Endpoints:
+
+- `GET /api/status` → JSON of the current source/model/frequency/bandwidth/gain/etc.,
+  plus live telemetry:
+  - `signal` (0–120 meter level), `dbfs` (tuned-channel power), `clip` (0–1 IQ
+    clip ratio), `overload` (bool — front-end/ADC overloading; reduce gain or
+    LNA when true).
+  - `stereo` (bool, decoder locked), `stereo_quality` (0–1), `pilot_khz` (19 kHz
+    pilot deviation), `blend` (applied stereo blend).
+  - `snr` (dB) — demod-domain SNR from the noise-triangle band above the
+    multiplex. Unlike `signal` (a relative, install-calibrated meter — see
+    [Getting reasonable signal-strength readings](#getting-reasonable-signal-strength-readings)),
+    this is a self-referencing reception-quality figure: high and steady on a
+    clean signal, dropping on a fade or interference. Always finite.
+  - `rds_dev_khz` (57 kHz RDS subcarrier deviation), `rds_ber` (block error
+    rate), `rds_groups` (groups decoded this session).
+  - `mpx` (relative composite magnitude) and `mpx_peak_khz` (MAX DEV — decaying
+    peak composite deviation).
+
+  All numeric telemetry is rounded to one decimal.
+- `GET  /api/control?key=value&...` or `POST /api/control` (JSON or form body) →
+  applies settings and returns `{"ok":..,"applied":N,"rejected":[..],"status":{..}}`.
+
+Recognised keys: `freq_hz` / `freq_khz`, `gain_db`, `agc` (bool), `bandwidth_hz`
+/ `bandwidth_khz`, `lna`, `antenna`, `bias_tee` (bool), `ppm`, `rtl_agc` (bool),
+`deemphasis` (0=50µs,1=75µs,2=off), `force_mono` (bool), `volume` (0–100),
+`action` (`start`/`stop`).
+
+Examples:
+
+```bash
+curl "http://127.0.0.1:9090/api/control?freq_khz=94900&bandwidth_khz=200"
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"gain_db":28,"lna":2,"antenna":1}' http://127.0.0.1:9090/api/control
+curl http://127.0.0.1:9090/api/status
+```
+
+For interactive testing there is a tiny static control panel served by Python:
+
+```bash
+scripts/run_rest_panel.sh                                  # defaults: API :9090, panel :9091
+# or directly / with overrides:
+python3 scripts/rest_test_panel.py --api http://127.0.0.1:9090 --port 9091
+API_URL=http://127.0.0.1:9090 PANEL_PORT=9091 scripts/run_rest_panel.sh
+# then open http://127.0.0.1:9091
 ```
 
 ## Tests
@@ -370,7 +517,14 @@ A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; no
 - Default source is direct RTL-SDR (`rtl_sdr`).
 - Default startup frequency is `87500 kHz` (EU bottom of band — unlikely to hit a strong local on first run).
 - Audio output sample rate is fixed at `48000 Hz`.
-- Device/buffer latency is backend-specific (Core Audio / ALSA / WinMM).
+- Device/buffer latency is backend-specific (Core Audio / ALSA / WinMM). The
+  Windows WinMM output is event-driven (`CALLBACK_EVENT`, ~170 ms of device
+  buffering). If you ever see `[AUDIO] WinMM output can't keep up with 48 kHz`,
+  the selected device/driver can't sustain the stream — switch to the system
+  default device (`-d` / `[audio] device`).
+- Diagnostic logging (`[SIG]`, `[ST]`, `[AUDIO]`, …) follows `[debug] log_level`
+  in the INI (default on). Override per-run with `-v`/`--verbose` or
+  `-q`/`--quiet`.
 - XDR server listens on port `7373`. If `xdr.password` is empty and no `-P` is passed, the server automatically enters guest mode (no auth).
 - The tuner does not auto-start by default; an XDR client start command activates it. Use `--auto-start` to begin playback without a client.
 - De-emphasis default is 50 µs (EU/ITU). For US/Korea set `[tuner].deemphasis = 1` in the config (75 µs).
@@ -378,13 +532,36 @@ A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; no
 
 ## Config-Driven Usage (optional)
 
-Once you know your site profile (gain, meter calibration, bandwidth), move the settings into a config file:
+**Auto-load:** when you run the binary **without** `-c`/`--config`, it looks for
+`fm-sdr-tuner.ini` in the current working directory and loads it automatically
+(you'll see `[Config] auto-loading fm-sdr-tuner.ini …` at startup). So you can
+just edit the config next to the executable and run it — no `-c` needed. The
+release artifacts ship a ready-to-use `fm-sdr-tuner.ini` (a copy of the RTL
+example) for exactly this, so it works on first run:
 
 ```bash
-./build/fm-sdr-tuner -c fm-sdr-tuner.ini
+./build/fm-sdr-tuner            # auto-loads ./fm-sdr-tuner.ini if present
 ```
 
-The bundled `fm-sdr-tuner.ini` is documented and safe to copy. CLI flags override anything the config sets, which is useful for A/B testing:
+An explicit `-c <file>` always wins over the auto-loaded file, and if no
+`fm-sdr-tuner.ini` is present the binary just uses its built-in defaults.
+
+The repo and release artifacts also ship two documented example configs — copy
+the one for your hardware over `fm-sdr-tuner.ini` and tune it for your site
+(your personal `fm-sdr-tuner.ini` is git-ignored, so it is never committed):
+
+```bash
+cp fm-sdr-tuner.ini.example fm-sdr-tuner.ini          # RTL-SDR (sane defaults)
+# or, for an SDRplay RSP (macOS/Linux, SDRplay build only):
+cp fm-sdr-tuner-sdrplay.ini.example fm-sdr-tuner.ini
+
+./build/fm-sdr-tuner            # or: -c fm-sdr-tuner.ini to be explicit
+```
+
+Both examples enable the REST control API (`[rest] enabled = true`, port 9090)
+and the bundled test panel (`scripts/rest_test_panel.py`, shipped in the
+artifact). CLI flags override anything the config sets, which is useful for A/B
+testing:
 
 ```bash
 # temporary frequency override on top of a baseline config
@@ -396,7 +573,10 @@ The bundled `fm-sdr-tuner.ini` is documented and safe to copy. CLI flags overrid
 
 ## Configuration (`fm-sdr-tuner.ini`)
 
-`fm-sdr-tuner.ini` is the primary control surface.
+`fm-sdr-tuner.ini` is the primary control surface. It is **git-ignored** — start
+from a shipped example (`fm-sdr-tuner.ini.example` for RTL-SDR,
+`fm-sdr-tuner-sdrplay.ini.example` for SDRplay) and copy it to
+`fm-sdr-tuner.ini`.
 
 Important sections:
 - `[tuner]`: source, device index, startup frequency, deemphasis
@@ -409,6 +589,41 @@ Signal meter related keys (`[sdr]`):
 - `signal_floor_dbfs` (default `-65.0`)
 - `signal_ceil_dbfs` (default `-5.0`)
 - `signal_bias_db` (default `0.0`)
+
+### Getting reasonable signal-strength readings
+
+The displayed signal level (the `0..120` value XDR/FM-DX clients show as dBf) is
+not an absolute measurement — it is a **linear mapping of the tuned-channel
+power (compensated dBFS) onto a `0..120` scale**:
+
+- `signal_floor_dbfs` is the power that reads as **0** (your noise floor / empty
+  channel).
+- `signal_ceil_dbfs` is the power that reads as **120** (your strongest local).
+- `signal_bias_db` shifts the whole scale up/down to line up with a reference
+  receiver, if you have one (otherwise leave it at `0`).
+
+So a "reasonable" reading depends entirely on the floor/ceil window matching the
+signal range your antenna actually delivers. The shipped default
+(`-65` / `-5`, a wide 60 dB window) is deliberately conservative so nothing
+saturates out of the box, but on most sites it compresses everything into the
+middle of the scale. To get readings that track real signal differences:
+
+1. **Fix RF gain first.** A meter calibrated over a clipping or starved front
+   end is meaningless. Get `[SIG] clip` near zero on strong locals (see
+   [Tune RF Gain](#4-tune-rf-gain-before-anything-else)) before touching these
+   keys.
+2. **Let the tuner measure your site.** Either run the one-shot sweep
+   `./fm-sdr-tuner --calibrate` (prints copy-paste `signal_floor_dbfs` /
+   `signal_ceil_dbfs` / `signal_bias_db` for your antenna), or just watch the
+   `[METER] session observed` log line, which continuously suggests a floor/ceil
+   from the running min/max it sees.
+3. **Apply the suggested window** to `[sdr]` and restart. Strong locals should
+   then settle near `100–110` (leaving headroom for exceptional signals) and
+   fringe stations should register meaningfully around `20–40`.
+
+The full step-by-step procedure, the `[METER]` output format, and the symptoms
+of a mis-set window are in
+[Calibrate The Signal Meter For Your Location](#8-calibrate-the-signal-meter-for-your-location).
 
 Weak-signal tuning keys (all default to off / static):
 - `processing.w0_bandwidth_hz` — static channel bandwidth
@@ -1047,9 +1262,19 @@ Artifacts currently uploaded by CI:
   - `fm-sdr-tuner-linux-rpm-fedora-43-x64`
   - `fm-sdr-tuner-linux-rpm-fedora-43-arm64`
 - macOS build job:
-  - `fm-sdr-tuner-macos` (binary + `README.md` + `fm-sdr-tuner.ini`)
+  - `fm-sdr-tuner-macos` (binary + `README.md` + both `*.ini.example` configs + `rest_test_panel.py` + `run_rest_panel.sh`)
 - Windows MinGW job:
-  - `fm-sdr-tuner-windows-mingw` (`.exe` + required DLLs + `dependencies.txt`)
+  - `fm-sdr-tuner-windows-mingw` (`.exe` + required DLLs + `dependencies.txt` + `fm-sdr-tuner.ini.example` + `rest_test_panel.py`)
+
+The **macOS and Linux** release builds are **SDRplay-capable**: CI builds them
+with `-DFM_TUNER_ENABLE_SDRPLAY=ON` against the vendor's public API *headers*
+(fetched at build time). The SDRplay library is `dlopen`'d at runtime, never
+linked or bundled — so nothing proprietary is redistributed, no package
+dependency is added, and the binary still runs on RTL-only systems. To use an
+RSP with a prebuilt binary, just install the **SDRplay API service** from
+<https://www.sdrplay.com/>. The **Windows** build is RTL-only (no SDRplay
+loader). Building SDRplay from source needs `-DFM_TUNER_ENABLE_SDRPLAY=ON`
+(macOS/Linux only).
 
 Notes:
 - Linux smoke-test jobs validate package installability in fresh containers, but

@@ -11,8 +11,24 @@ AFPostProcessor::AFPostProcessor(int inputRate, int outputRate)
       m_currentHicutWeight(0.0f) {
   const float ratio =
       static_cast<float>(m_outputRate) / static_cast<float>(m_inputRate);
-  m_liquidLeftResampler.init(ratio);
-  m_liquidRightResampler.init(ratio);
+  // The resampler is also the audio anti-alias / band-limiting filter: the
+  // stereo decoder's mono path is the raw MPX (pilot 19 kHz, stereo subcarrier
+  // 23-53 kHz, RDS 57 kHz all present), so without a band-limit those fold into
+  // the 0-24 kHz output and alias to ~9-10 kHz — audible "ringing"/lossy-codec
+  // artifacts. liquid's default cutoff (0.47) does NOT band-limit a 5.33x
+  // downsample at all (it passes everything). Set the cutoff to the ~16 kHz FM
+  // audio edge (normalized to the input rate) with enough taps for a steep
+  // transition: passband flat to ~14 kHz, subcarrier/RDS rejected by 85+ dB.
+  constexpr float kAudioCutoffHz = 16000.0f;
+  constexpr std::uint32_t kResampHalfLen = 48;
+  constexpr float kResampStopBandDb = 80.0f;
+  constexpr std::uint32_t kResampPolyphase = 64;
+  const float cutoffNorm =
+      std::min(0.45f, kAudioCutoffHz / static_cast<float>(m_inputRate));
+  m_liquidLeftResampler.init(ratio, kResampHalfLen, cutoffNorm,
+                             kResampStopBandDb, kResampPolyphase);
+  m_liquidRightResampler.init(ratio, kResampHalfLen, cutoffNorm,
+                              kResampStopBandDb, kResampPolyphase);
   m_liquidLeftDcBlock.initDCBlocker(kDcBlockAlpha);
   m_liquidRightDcBlock.initDCBlocker(kDcBlockAlpha);
   reset();

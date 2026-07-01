@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -23,6 +24,10 @@ bool parseSourceOption(std::string value, std::string &outSource) {
     outSource = "rtl_sdr";
     return true;
   }
+  if (value == "sdrplay" || value == "rsp") {
+    outSource = "sdrplay";
+    return true;
+  }
   return false;
 }
 
@@ -37,8 +42,8 @@ void printUsage(const char *prog) {
          "localhost:1234)\n"
       << "      --iq-rate <rate>   IQ sample rate: 256000, 1024000, or 2048000 "
          "(default: 256000)\n"
-      << "      --source <name>    Tuner source: rtl_tcp or rtl_sdr (default: "
-         "rtl_sdr)\n"
+      << "      --source <name>    Tuner source: rtl_tcp, rtl_sdr, or sdrplay "
+         "(default: rtl_sdr)\n"
       << "      --rtl-device <id>  RTL-SDR device index for --source rtl_sdr "
          "(default: 0)\n"
       << "  -f, --freq <khz>      Frequency in kHz (default: 87500)\n"
@@ -55,6 +60,10 @@ void printUsage(const char *prog) {
       << "      --mpx-audio-device <id>\n"
       << "                        Audio device for live MPX output (name "
          "substring or default-device if empty)\n"
+      << "      --mpx-gain-db <db>\n"
+      << "                        Gain on the MPX WAV/audio outputs (default: "
+         "-6; full scale = 150 kHz deviation). 0 restores the legacy 1.0 = "
+         "75 kHz scale, which clips on real broadcast peaks\n"
       << "  -i, --iq <file>       Capture raw IQ bytes to file\n"
       << "      --low-latency-iq  Keep newest IQ samples (drop backlog on "
          "overload)\n"
@@ -70,6 +79,14 @@ void printUsage(const char *prog) {
       << "  -d, --device <id>     Audio output device (index or name)\n"
       << "  -P, --password <pwd>   XDR server password\n"
       << "  -G, --guest            Enable guest mode (no password required)\n"
+      << "      --rest-port <port> REST control API port (0 disables; "
+         "overrides [rest] port)\n"
+      << "      --rest-bind <addr> REST control API bind address (default: "
+         "127.0.0.1)\n"
+      << "  -v, --verbose          Enable verbose diagnostic logging "
+         "(overrides [debug] log_level)\n"
+      << "  -q, --quiet            Disable diagnostic logging "
+         "([SIG]/[ST]/[AUDIO] lines)\n"
       << "  -h, --help             Show this help\n";
 }
 
@@ -91,6 +108,18 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
     if (arg == "--config" && i + 1 < argc) {
       opts.configPath = argv[++i];
       continue;
+    }
+  }
+
+  // If no explicit --config was given, auto-load fm-sdr-tuner.ini from the
+  // working directory when present. Users edit the bundled config next to the
+  // executable and expect it to take effect without remembering -c.
+  if (opts.configPath.empty()) {
+    std::ifstream probe("fm-sdr-tuner.ini");
+    if (probe.good()) {
+      opts.configPath = "fm-sdr-tuner.ini";
+      std::cout << "[Config] auto-loading fm-sdr-tuner.ini from the working "
+                   "directory (no --config given)\n";
     }
   }
 
@@ -223,6 +252,15 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
     }
     if (arg == "--auto-start") {
       opts.autoStart = true;
+      continue;
+    }
+    if (arg == "-v" || arg == "--verbose") {
+      // Override the INI-derived [debug] log_level default.
+      opts.verboseLogging = true;
+      continue;
+    }
+    if (arg == "-q" || arg == "--quiet") {
+      opts.verboseLogging = false;
       continue;
     }
     if (arg == "--no-low-latency-iq") {
@@ -376,6 +414,29 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
       }
       continue;
     }
+    if (arg == "--mpx-gain-db" || arg.rfind("--mpx-gain-db=", 0) == 0) {
+      const std::string value = readValue(i, arg, "mpx-gain-db");
+      if (value.empty()) {
+        std::cerr << "[CLI] missing value for --mpx-gain-db\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      try {
+        const float parsed = std::stof(value);
+        if (parsed < -24.0f || parsed > 24.0f) {
+          std::cerr << "[CLI] --mpx-gain-db out of range [-24, 24]: " << value
+                    << "\n";
+          result.outcome = AppParseOutcome::ExitFailure;
+          return result;
+        }
+        opts.mpxGainDb = parsed;
+      } catch (const std::exception &) {
+        std::cerr << "[CLI] invalid --mpx-gain-db value: " << value << "\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      continue;
+    }
     if (arg == "-i" || arg == "--iq" || arg.rfind("--iq=", 0) == 0) {
       const std::string value = readValue(i, arg, "iq");
       if (value.empty()) {
@@ -404,6 +465,41 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
         return result;
       }
       opts.xdrPassword = value;
+      continue;
+    }
+    if (arg == "--rest-port" || arg.rfind("--rest-port=", 0) == 0) {
+      const std::string value = readValue(i, arg, "rest-port");
+      if (value.empty()) {
+        std::cerr << "[CLI] missing value for --rest-port\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      try {
+        const int parsed = std::stoi(value);
+        if (parsed < 0 || parsed > 65535) {
+          std::cerr << "[CLI] --rest-port out of range [0, 65535]: " << value
+                    << "\n";
+          result.outcome = AppParseOutcome::ExitFailure;
+          return result;
+        }
+        // Port 0 disables the REST API; any non-zero port enables it.
+        opts.config.rest.port = static_cast<uint16_t>(parsed);
+        opts.config.rest.enabled = (parsed != 0);
+      } catch (const std::exception &) {
+        std::cerr << "[CLI] invalid --rest-port value: " << value << "\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      continue;
+    }
+    if (arg == "--rest-bind" || arg.rfind("--rest-bind=", 0) == 0) {
+      const std::string value = readValue(i, arg, "rest-bind");
+      if (value.empty()) {
+        std::cerr << "[CLI] missing value for --rest-bind\n";
+        result.outcome = AppParseOutcome::ExitFailure;
+        return result;
+      }
+      opts.config.rest.bind_address = value;
       continue;
     }
     if (arg == "-b" || arg == "--blend" || arg.rfind("--blend=", 0) == 0) {

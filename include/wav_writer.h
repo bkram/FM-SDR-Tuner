@@ -32,6 +32,12 @@ public:
   void shutdown();
   bool isOpen() const { return m_handle != nullptr; }
 
+  // Linear gain applied to float samples before the int16 clamp. Used by the
+  // MPX path for headroom: the demod calibrates 75 kHz deviation to 1.0 full
+  // scale, so real broadcasts (which deviate to and beyond 75 kHz) would
+  // otherwise hard-clip in the int16 conversion.
+  void setGain(float gain) { m_gain = gain; }
+
   bool enqueueInterleavedFloat(const float *samples, size_t frameCount);
   bool enqueueMonoFloat(const float *samples, size_t sampleCount);
 
@@ -47,6 +53,11 @@ private:
   uint32_t m_sampleRate;
   uint16_t m_channels;
   bool m_verboseLogging;
+  // False when the output is a pipe/FIFO/char device (not seekable): the
+  // header is written once, streaming, and never patched on close.
+  bool m_seekable = true;
+  // Linear pre-clamp gain; see setGain().
+  float m_gain = 1.0f;
   std::string m_label;
 
   std::mutex m_mutex;

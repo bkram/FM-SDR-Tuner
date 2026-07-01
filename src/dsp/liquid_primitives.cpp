@@ -281,6 +281,29 @@ void IIRFilterReal::init(const std::vector<float>& b, const std::vector<float>& 
     }
 }
 
+void IIRFilterReal::initHighpass(unsigned int order, float cutoffNorm,
+                                 float stopBandAtten) {
+    if (m_object != nullptr) {
+        iirfilt_rrrf_destroy(m_object);
+    }
+    m_useDcBlocker = false;
+    m_useHighpass = true;
+    m_hpOrder = std::max(1u, order);
+    m_hpCutoffNorm = cutoffNorm;
+    m_hpStopAtten = stopBandAtten;
+    m_b.clear();
+    m_a.clear();
+    // Butterworth high-pass, second-order-section form. Ap (passband ripple) is
+    // unused by Butterworth; As is the stopband attenuation target. f0 is unused
+    // for low/high-pass prototypes.
+    m_object = iirfilt_rrrf_create_prototype(
+        LIQUID_IIRDES_BUTTER, LIQUID_IIRDES_HIGHPASS, LIQUID_IIRDES_SOS,
+        m_hpOrder, m_hpCutoffNorm, 0.0f, 1.0f, m_hpStopAtten);
+    if (m_object == nullptr) {
+        throw std::runtime_error("failed to create liquid iirfilt_rrrf highpass");
+    }
+}
+
 void IIRFilterReal::initDCBlocker(float alpha) {
     if (m_object != nullptr) {
         iirfilt_rrrf_destroy(m_object);
@@ -305,6 +328,8 @@ void IIRFilterReal::reset() {
             return;
         }
         initDCBlocker(m_dcAlpha);
+    } else if (m_useHighpass) {
+        initHighpass(m_hpOrder, m_hpCutoffNorm, m_hpStopAtten);
     } else {
         if (m_b.empty() || m_a.empty()) {
             return;
@@ -529,6 +554,37 @@ std::size_t ComplexDecimator::executeComplex(const uint8_t* iqIn,
             m_block[k] = std::complex<float>(i, q);
         }
 
+        std::complex<float> y(0.0f, 0.0f);
+        firdecim_crcf_execute(m_object, m_block.data(), &y);
+        iqOut[b] = y;
+    }
+    return blocks;
+}
+
+std::size_t ComplexDecimator::executeComplexFromComplex(
+    const std::complex<float>* iqIn, std::size_t inSamples,
+    std::complex<float>* iqOut, std::size_t outCapacity) const {
+    if (!iqIn || !iqOut || inSamples == 0 || outCapacity == 0) {
+        return 0;
+    }
+
+    if (m_factor == 1) {
+        const std::size_t copySamples = std::min(inSamples, outCapacity);
+        for (std::size_t i = 0; i < copySamples; i++) {
+            iqOut[i] = iqIn[i];
+        }
+        return copySamples;
+    }
+    if (m_object == nullptr || m_block.size() != m_factor) {
+        return 0;
+    }
+
+    const std::size_t blocks = std::min(inSamples / m_factor, outCapacity);
+    for (std::size_t b = 0; b < blocks; b++) {
+        const std::size_t inBase = b * m_factor;
+        for (std::size_t k = 0; k < m_factor; k++) {
+            m_block[k] = iqIn[inBase + k];
+        }
         std::complex<float> y(0.0f, 0.0f);
         firdecim_crcf_execute(m_object, m_block.data(), &y);
         iqOut[b] = y;

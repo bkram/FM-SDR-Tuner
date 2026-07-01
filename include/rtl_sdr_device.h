@@ -25,6 +25,11 @@ public:
   bool setAGC(bool enable);
   void setLowLatencyMode(bool enable);
   size_t readIQ(uint8_t *buffer, size_t maxSamples);
+  // Drop all currently buffered IQ so the next readIQ returns only samples
+  // captured after this call. Used after a scan retune to discard the stale
+  // pre-retune ring contents (which otherwise mis-bin the FFT by one sweep
+  // step). Cheap: just advances the read cursor to the write cursor.
+  void flushBuffers();
 
 private:
   static void asyncCallback(unsigned char *buf, uint32_t len, void *ctx);

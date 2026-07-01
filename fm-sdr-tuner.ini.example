@@ -1,0 +1,240 @@
+# FM-SDR-Tuner configuration file
+# Run with: ./build/fm-sdr-tuner -c fm-sdr-tuner.ini
+# CLI flags override values here.
+
+# =========================
+# SDR Input / RF Tuning
+# =========================
+
+[tuner]
+# Source: rtl_sdr (direct USB), rtl_tcp (network server), or sdrplay (RSP series).
+# NOTE: the macOS and Linux prebuilt binaries are SDRplay-capable — just install
+# the SDRplay API service (sdrplay.com) and set source=sdrplay. The SDRplay
+# library is dlopen'd at runtime, so the binary also runs fine on RTL-only
+# systems. Windows is RTL-only (no SDRplay loader). Building SDRplay from source
+# needs -DFM_TUNER_ENABLE_SDRPLAY=ON (macOS/Linux). If no RSP is present, use
+# rtl_sdr (or --source rtl_sdr).
+source = rtl_sdr
+
+# RTL-SDR device index when source=rtl_sdr
+rtl_device = 0
+
+# Startup frequency in kHz (88600 = 88.6 MHz)
+default_freq = 88600
+
+# De-emphasis: 0=50us, 1=75us, 2=off
+deemphasis = 0
+
+[sdrplay]
+# SDRplay RSP front-end settings (used only when source=sdrplay; ignored on RTL).
+# Enable the RSP hardware IF AGC (recommended). When on it overrides the [sdr]
+# manual-gain/TEF path for SDRplay and trims IF gain to avoid overload.
+agc = true
+# Front-end LNA gain-reduction step (0 = most gain). 8 keeps strong broadcast
+# FM out of front-end overload while the AGC trims the IF gain.
+lna_state = 8
+# Antenna input: RSPdx/RSPdxR2 -> 0=A, 1=B, 2=C; ignored on single-input models.
+antenna = 0
+# Enable the RSP bias-tee (model-specific).
+bias_tee = false
+
+[rtl_tcp]
+# Used only when source=rtl_tcp
+host = localhost
+port = 1234
+
+# RTL input sample rate.
+# Supported: 256000, 1024000, 2048000.
+# Higher rates are front-end decimated to 256000 for the DSP stereo chain.
+sample_rate = 256000
+
+[sdr]
+# Gain strategy:
+#   tef   = TEF-like A/G behavior (supports auto clip-protect loop)
+#   sdrpp = SDR++-style gain behavior
+gain_strategy = tef
+
+# Manual tuner gain in dB.
+#   -1 = strategy-managed gain (auto / TEF table; default and best for indoor
+#        telescopic antennas where the AGC needs to climb on weak signals)
+#   >=0 = force fixed manual gain (overrides strategy + disables IF AGC)
+#
+# Default -1 (auto) suits the common indoor-telescopic case. When using a
+# high-gain outdoor antenna, auto-mode can overload the R820T LNA on strong
+# locals (multiple stations at -3 dBFS produce IMD splatter into adjacent
+# channels — symptoms: AGC pumping, blend instability, momentary pilot-quality
+# drops); in that case force a fixed value (e.g. 6 dB) that keeps strong locals
+# clean while still receiving fringe stations. --calibrate's clip indicator
+# helps spot the right setting.
+rtl_gain_db = -1
+
+# RTL frequency correction in ppm (set from known dongle offset)
+freq_correction_ppm = 0
+
+# Packed custom gain flags (tef strategy): tens=RF, ones=IF
+# Example: 11 => RF=1, IF=1
+default_custom_gain_flags = 1
+
+# SDR++ strategy options (used when gain_strategy=sdrpp)
+sdrpp_rtl_agc = false
+sdrpp_rtl_agc_gain_db = 18
+
+# Quick presets:
+#
+# Preset A: TEF (stable, auto clip-protect)
+#   gain_strategy = tef
+#   rtl_gain_db = -1
+#   default_custom_gain_flags = 1
+#   agc_mode = 2
+#
+# Preset B: SDR++ (predictable/manual-like)
+#   gain_strategy = sdrpp
+#   rtl_gain_db = -1
+#   sdrpp_rtl_agc = false
+#   sdrpp_rtl_agc_gain_db = 18
+#   agc_mode = 2   ; ignored by sdrpp strategy
+
+# Signal meter mapping window. Maps (compensated dBFS) → 0..120 linearly.
+# The window must cover the full dynamic range of stations at this site:
+#   - too narrow → strong locals peg at 120 AND weak stations clamp to 0
+#   - too wide  → mid-strength stations look smaller than they are
+# Easiest workflow: run `./fm-sdr-tuner --calibrate` once with your antenna
+# connected — it sweeps the band and prints copy-paste-ready values for the
+# three keys below. Alternative: leave the wide defaults (-65 / -5) and let
+# the [METER] session log line guide you over a few minutes of listening.
+# These wide defaults are safe everywhere; narrow them for your site to use the
+# full 0..120 meter range.
+signal_floor_dbfs = -65.0
+signal_ceil_dbfs = -5.0
+signal_bias_db = 0.0
+
+# Drop stale IQ backlog when overloaded
+low_latency_iq = false
+
+# =========================
+# Audio / Decode
+# =========================
+
+[audio]
+# Enable speaker output by default (same as -s)
+enable_audio = true
+
+# Startup audio volume in percent (0..100)
+startup_volume = 80
+
+# Output device index/name (empty = system default)
+device =
+
+[processing]
+# TEF AGC profile (0..3). Used by gain_strategy=tef.
+agc_mode = 2
+
+# Allow client-issued gain commands (XDR)
+client_gain_allowed = true
+
+# DSP block size (IQ samples per processing cycle)
+dsp_block_samples = 8192
+
+# FM channel bandwidth hint in Hz (194000 recommended for WFM stereo)
+w0_bandwidth_hz = 194000
+
+# Optional DSP AGC before FM discriminator: off, fast, slow
+dsp_agc = off
+
+# Stereo blend profile: soft, normal, aggressive
+stereo_blend = normal
+
+# Enable stereo decoder
+stereo = true
+
+# 19 kHz pilot canceller. Two-tap LMS subtracts the residual pilot tone from
+# the mono audio path; ~20+ dB additional suppression beyond the audio LPF.
+# Default on — only audible improvement, no behavioral surprise.
+pilot_canceller = true
+
+# Adaptive de-emphasis ("HiCut") — narrows the top-end de-emphasis when
+# the stereo decoder reports low signal quality. Crossfades into a steeper
+# curve to suppress hiss on fringe stations without touching clean ones.
+#   off    = no adaptive HiCut (default)
+#   gentle = narrow tau = 2x configured (mild HF rolloff on weak signal)
+#   strong = narrow tau = 5x configured (aggressive hiss suppression)
+hicut = off
+
+# Adaptive channel bandwidth — automatically narrows the channel FIR when
+# SNR is low (adjacent splatter or weak signal), widens when SNR recovers.
+# Hysteresis: changes at most every 2 s. Off keeps the static w0_bandwidth_hz.
+#   off          = use the static w0_bandwidth_hz only (default)
+#   conservative = 3-band (95/142/194 kHz)
+#   aggressive   = 5-band (36/56/95/130/200 kHz)
+adaptive_bandwidth = off
+
+# Multipath equalizer — CMA-based complex equalizer in the I/Q path before the
+# discriminator. On clean signals stays near transparent (dispersion target +
+# leak toward centered-delta). On real multipath ghosting it converges to
+# flatten the channel envelope. Adaptation is gated by stereo lock so it
+# never trains on noise.
+#   off        = bypassed (default)
+#   light      = small step size, strong leak (safest)
+#   aggressive = larger step size, weaker leak (chases stronger multipath)
+multipath_eq = off
+multipath_eq_taps = 17
+
+# Adaptive fade-mute: smoothly mutes the demod noise burst when the RF signal
+# drops out (deep fade / dropout) and fades back in on recovery. Tracks the
+# station's own level (FM is constant-envelope, so a channel-power drop is a
+# real fade, never quiet program audio), so it won't silence steady weak
+# stations. off | gentle (only deep fades) | strong (mutes more readily).
+fade_mute = gentle
+
+# IQ channel FIR L1 normalization. When true, the I/Q Kaiser lowpass that
+# runs before the discriminator is designed with sum(|tap|)·scale ≤ 1, so
+# the output envelope can never exceed the input envelope (|y[n]| ≤ max|x|).
+# Without this a non-monotonic Kaiser response can ring past unit envelope
+# under ADC-rail saturation, producing post-filter samples whose computed
+# power exceeds the input dBFS — confusing the meter and any downstream
+# consumer that assumes |IQ| ≤ 1 (e.g. WAV writers / MPX rebroadcast).
+# Defaults to false to keep existing meter calibration; turn on if you see
+# meter saturation behavior that doesn't match the actual ADC level, or if
+# you're piping the IQ stream into a tool that requires strict bounds.
+iq_fir_l1_normalize = false
+
+# Channel-power squelch on the 48 kHz audio output (in compensated dBFS).
+# Below this threshold the audio is faded to silence with a 30 ms ramp;
+# 3 dB of hysteresis prevents flutter at the boundary. Useful for scan /
+# DX / unattended workflows where silence on empty channels is preferable
+# to hiss. -120 = effectively disabled (default); broadcast-relevant
+# values are -90 .. -30.
+squelch_dbfs = -120.0
+
+# =========================
+# Network / Service
+# =========================
+
+[xdr]
+# XDR server TCP port
+port = 7373
+
+# Optional password (empty = no auth)
+password = test123
+
+# Allow guest mode without password
+guest_mode = false
+
+[rest]
+# Anonymous HTTP control API for an fm-dx-webserver client plugin. Carries the
+# SDR-specific settings XDR can't (manual dB gain, SDRplay LNA/antenna/bias-tee)
+# plus the common ones; works for both RTL and SDRplay. NO authentication by
+# design — keep bind_address on localhost or a trusted network only.
+# Endpoints: GET /api/status, GET|POST /api/control (query-string or JSON body).
+# Test UI: scripts/run_rest_panel.sh
+enabled = true
+port = 9090
+bind_address = 127.0.0.1
+
+[reconnection]
+# Auto reconnect after repeated IQ read failures
+auto_reconnect = true
+
+[debug]
+# 0=quiet, 1=info, 2+=verbose
+log_level = 1

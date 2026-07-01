@@ -20,7 +20,9 @@ void TunerSession::connect() {
   if (m_rtlConnected) {
     return;
   }
-  if (m_params.useDirectRtlSdr) {
+  if (m_tuner.isSdrPlay()) {
+    std::cout << "[SDR] connecting to sdrplay device...\n";
+  } else if (m_params.useDirectRtlSdr) {
     std::cout << "[SDR] connecting to rtl_sdr device " << m_params.rtlDeviceIndex
               << "...\n";
   } else {
@@ -76,6 +78,15 @@ void TunerSession::resetReadFailures() { m_consecutiveReadFailures = 0; }
 
 void TunerSession::noteReadFailureAndMaybeReconnect() {
   m_consecutiveReadFailures++;
+  // SDRplay surfaces device loss explicitly; reconnect promptly on it rather
+  // than waiting out the generic no-data heuristic.
+  if (m_params.autoReconnect && m_rtlConnected && m_tuner.deviceFailed()) {
+    std::cerr << "[SDR] device failure reported, reconnecting...\n";
+    disconnect();
+    connect();
+    m_consecutiveReadFailures = 0;
+    return;
+  }
   if (m_params.autoReconnect && m_rtlConnected && m_consecutiveReadFailures >= 20) {
     std::cerr << "[SDR] no IQ data, reconnecting...\n";
     disconnect();

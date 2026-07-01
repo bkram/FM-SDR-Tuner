@@ -37,11 +37,33 @@ struct Config {
   } sdr;
 
   struct TunerSection {
-    std::string source = "rtl_sdr"; // rtl_sdr|rtl_tcp
+    std::string source = "rtl_sdr"; // rtl_sdr|rtl_tcp|sdrplay
     uint32_t rtl_device = 0;
     uint32_t default_freq = 87500;
     int deemphasis = 0;
   } tuner;
+
+  struct SDRplaySection {
+    // Enable the RSP hardware IF AGC (recommended; trims IF gain to avoid
+    // overload). When true it overrides the [sdr] manual-gain/TEF path for the
+    // SDRplay source. LNA state below still sets the front-end gain reduction.
+    bool agc = true;
+    // Front-end LNA gain-reduction step (0 = most gain). 8 keeps strong
+    // broadcast FM out of front-end overload while AGC trims the IF gain.
+    int lna_state = 8;
+    // Antenna input index (RSPdx/RSPdxR2: 0=A,1=B,2=C; other models: ignored).
+    int antenna = 0;
+    bool bias_tee = false;
+  } sdrplay;
+
+  struct RestSection {
+    // Anonymous HTTP control API (for an fm-dx-webserver plugin). Disabled
+    // unless a non-zero port is set. No authentication by design — bind to
+    // localhost or a trusted network only.
+    bool enabled = false;
+    uint16_t port = 0;
+    std::string bind_address = "127.0.0.1";
+  } rest;
 
   struct XDRSection {
     uint16_t port = 7373;
@@ -62,6 +84,10 @@ struct Config {
     std::string adaptive_bandwidth = "off"; // off|conservative|aggressive
     std::string multipath_eq = "off"; // off|light|aggressive
     int multipath_eq_taps = 17;
+    // Adaptive fade-mute: smoothly mutes the demod noise burst when the RF
+    // signal drops out (deep fade / dropout) and fades back in on recovery.
+    // off (default) | gentle (only deep fades) | strong (mutes more readily).
+    std::string fade_mute = "off";
     // When true, the IQ channel FIR is L1-normalized at design time so that
     // |y[n]| ≤ max|x[n]| for every output sample. Defaults to false to
     // preserve existing meter calibration; enable when ADC-rail clipping is

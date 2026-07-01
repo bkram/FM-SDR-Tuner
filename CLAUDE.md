@@ -94,6 +94,7 @@ There is no clang-tidy or clang-format enforcement wired into CMake — they are
 ./build/fm-sdr-tuner -c fm-sdr-tuner.ini           # config-first
 ./scripts/run_rtl_xdr_test.sh                      # RTL-SDR + XDR on 127.0.0.1:7373, pw test123
 ./scripts/run_rtl_local_audio.sh                   # --auto-start local speaker listening
+./scripts/run_rest_panel.sh                        # browser control panel for the [rest] API (test stand-in for the fm-dx-webserver plugin)
 ```
 
 At least one output (`-s` audio, `-w` WAV, or `-i` IQ capture) must be enabled or the app refuses to start. By default the tuner does not auto-start; an XDR client start command activates the pipeline.
@@ -121,11 +122,19 @@ Optional DSP features (all gated by config; default off except `pilot_canceller`
 
 ### Control plane
 
-`XDRServer` (port 7373) is the control surface. `XdrFacade` brokers between the server and `TunerController` + `ScanEngine`. `ScanEngine` uses `SignalLevel` (the dBFS / floor / clip estimator — see `[SIG]` log lines) to drive scan decisions. `XDRServer` speaks the XDR-GTK / FM-DX protocol and authenticates with OpenSSL.
+`XDRServer` (port 7373) is the control surface. `XdrFacade` brokers between the server and `TunerController` + `ScanEngine`. `ScanEngine` uses `SignalLevel` (the dBFS / floor / clip estimator — see `[SIG]` log lines) to drive scan decisions. `XDRServer` speaks the XDR-GTK / FM-DX protocol and authenticates with OpenSSL (constant-time hash compare; fails closed if the secure RNG is unavailable).
+
+`RestServer` (`src/rest_server.cpp`, optional `[rest]` port, default off) is a second, **anonymous** control surface — a minimal HTTP/1.1 API for an fm-dx-webserver client plugin. It exists because the XDR protocol has no vocabulary for SDR-specific settings (manual dB gain, SDRplay LNA state, antenna input, bias-tee); the REST API carries those plus the common knobs. It drives the **same** `TunerController` + `XdrCommandState` request path as the XDR server (frequency/bandwidth go through the pending-flag retune path; SDRplay-only knobs call `TunerController` directly and no-op on RTL), so both backends behave identically. No auth by design — bind to localhost/trusted networks. `GET /api/status`, `GET|POST /api/control` (query-string or flat-JSON body). Test it with `scripts/rest_test_panel.py`.
+
+### SDR sources
+
+`TunerController` dispatches over three backends via a `SourceKind` enum: `RtlSdrDevice` (USB), `RtlTcpClient` (network), and `SDRplayDevice` (RSP). RTL sources deliver uint8 IQ (`IqFormat::U8`); SDRplay delivers normalized `complex<float>` (`IqFormat::CF32`) at full 16-bit range. The application read loop branches on `nativeFormat()`: CF32 feeds the demod via `DspPipeline::process(const std::complex<float>*)` while a quantized 8-bit shadow (same full-scale reference) feeds `computeSignalLevel`/scan/calibration unchanged. `SDRplayDevice` `dlopen`s the proprietary `libsdrplay_api` at runtime (built only when `-DFM_TUNER_ENABLE_SDRPLAY=ON` finds the SDK headers; compiles to a no-op stub otherwise), configures 2.048 MHz / 8 = 256 kHz to match the pipeline's `INPUT_RATE` (1:1 decimation).
+
+Two SDRplay-specific scan details: (1) `SDRplayDevice::readIQ` blocks until a full block accumulates (bounded ceiling) rather than returning a tiny partial — each scan retune raises the API `reset` flag and flushes the ring, and a short partial read would starve the scan's FFT. (2) `runtime_loop::handleControlAndScan` drives a **wide-bandwidth scan mode** (`TunerController::setScanWideMode` → `Update_Ctrl_Decimation`): for the duration of a sweep the RSP runs undecimated at 2.048 MHz with a wider IF filter, so each retune covers ~8× more spectrum (full-band sweep ~13 s → <2 s), then 256 kHz is restored when the scan ends. No-op on RTL (whose ring is always full, so its scan is already fast).
 
 ### Configuration surface
 
-`fm-sdr-tuner.ini` is the primary control surface (CLI is meant for transient overrides). `Config` (`src/config.cpp`) parses the `[tuner]`, `[audio]`, `[sdr]`, `[processing]`, `[xdr]` sections. Signal-meter calibration keys (`signal_floor_dbfs`, `signal_ceil_dbfs`, `signal_bias_db`; default window is `-65`/`-5`/`0` = 60 dB range) and DSP keys (`w0_bandwidth_hz`, `dsp_agc`, `stereo_blend`, `agc_mode`, `pilot_canceller`, `hicut`, `adaptive_bandwidth`, `multipath_eq`, `multipath_eq_taps`) all flow through here and down into `DspPipeline` / `SignalLevel`. The README's "Setup And Tuning Guide" is the canonical reference for what each knob does in practice — consult it before changing defaults.
+`fm-sdr-tuner.ini` is the primary control surface (CLI is meant for transient overrides). `Config` (`src/config.cpp`) parses the `[tuner]`, `[audio]`, `[sdr]`, `[sdrplay]`, `[rest]`, `[processing]`, `[xdr]` sections. `[sdrplay]` keys: `lna_state`, `antenna`, `bias_tee`. `[rest]` keys: `enabled`, `port`, `bind_address`. Signal-meter calibration keys (`signal_floor_dbfs`, `signal_ceil_dbfs`, `signal_bias_db`; default window is `-65`/`-5`/`0` = 60 dB range) and DSP keys (`w0_bandwidth_hz`, `dsp_agc`, `stereo_blend`, `agc_mode`, `pilot_canceller`, `hicut`, `adaptive_bandwidth`, `multipath_eq`, `multipath_eq_taps`) all flow through here and down into `DspPipeline` / `SignalLevel`. The README's "Setup And Tuning Guide" is the canonical reference for what each knob does in practice — consult it before changing defaults.
 
 Diagnostic log prefixes (grep-friendly):
 - `[SIG]` — per-block signal stats (dbfs, compensated, floor, snr, level, clip).
@@ -154,8 +163,10 @@ src/
   processing_runner.cpp    - Per-block hot path; signal-level + [METER] logging
   rtl_sdr_device.cpp       - Direct USB RTL-SDR source
   rtl_tcp_client.cpp       - rtl_tcp network client
-  tuner_session.cpp        - Tuner abstraction over the two sources above
-  tuner_controller.cpp     - Frequency/gain/AGC state machine
+  tuner_session.cpp        - Tuner abstraction over the sources below
+  tuner_controller.cpp     - Frequency/gain/AGC state machine; 3-way source dispatch
+  sdrplay_device.cpp       - SDRplay RSP source (dlopen'd API; CF32 16-bit IQ)
+  rest_server.cpp          - Anonymous HTTP control API (optional [rest] port)
   fm_demod.cpp             - FM discriminator + channel FIR + multipath EQ insertion
   stereo_decoder.cpp       - Gear-shift PLL, pilot canceller, biquad Hi-Blend, L-R
   af_post_processor.cpp    - Resampling, de-emphasis (+ optional HiCut crossfade)

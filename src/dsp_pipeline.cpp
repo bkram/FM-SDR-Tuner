@@ -101,8 +101,28 @@ DspPipeline::DspPipeline(int inputRate, int outputRate,
   // Squelch — operates on the 48 kHz audio output, gated by the per-block
   // channelPowerDbfs estimate from FMDemod. Default config.squelch_dbfs
   // == -120 leaves the gate effectively disabled.
-  m_squelch.configure(static_cast<float>(processing.squelch_dbfs), 3.0f,
-                      0.030f, m_outputRate);
+  std::string fadeMute = processing.fade_mute;
+  std::transform(
+      fadeMute.begin(), fadeMute.end(), fadeMute.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (fadeMute == "gentle" || fadeMute == "strong") {
+    // Adaptive fade-mute bridges the demod noise burst when the RF signal
+    // drops out and fades back in on recovery. updatesPerSec = one updateGate()
+    // per processing block.
+    const float updatesPerSec =
+        static_cast<float>(m_inputRate) /
+        static_cast<float>(std::max<size_t>(1, sdrBlockSamples()));
+    const bool strong = (fadeMute == "strong");
+    m_squelch.configureFadeMute(/*dropDb=*/strong ? 9.0f : 14.0f,
+                                /*hysteresisDb=*/strong ? 3.0f : 4.0f,
+                                /*attackReleaseSec=*/strong ? 0.015f : 0.022f,
+                                m_outputRate,
+                                /*refDecayDbPerSec=*/strong ? 8.0f : 5.0f,
+                                updatesPerSec);
+  } else {
+    m_squelch.configure(static_cast<float>(processing.squelch_dbfs), 3.0f,
+                        0.030f, m_outputRate);
+  }
 
   const uint32_t decimFactor = static_cast<uint32_t>(m_iqDecimation);
   const uint32_t decimTapsPerPhase =
@@ -121,6 +141,7 @@ void DspPipeline::reset() {
   m_afPost.reset();
   m_iqDecimator.reset();
   clearIqStaging();
+  clearIqStagingC();
   m_pendingAudioReset = false;
 }
 
@@ -208,6 +229,66 @@ bool DspPipeline::linearizeDecimatorBlock(size_t sampleCount) {
   return true;
 }
 
+void DspPipeline::clearIqStagingC() {
+  m_iqStagingReadPosC = 0;
+  m_iqStagingWritePosC = 0;
+  m_iqStagingSizeC = 0;
+}
+
+void DspPipeline::appendIqToStagingC(const std::complex<float> *iq,
+                                     size_t sampleCount) {
+  if (!iq || sampleCount == 0 || m_iqStagingRingC.empty()) {
+    return;
+  }
+  const size_t capacity = m_iqStagingRingC.size();
+
+  size_t srcOffset = 0;
+  if (sampleCount >= capacity) {
+    srcOffset = sampleCount - capacity;
+    clearIqStagingC();
+  } else if (m_iqStagingSizeC + sampleCount > capacity) {
+    const size_t drop = (m_iqStagingSizeC + sampleCount) - capacity;
+    m_iqStagingReadPosC = (m_iqStagingReadPosC + drop) % capacity;
+    m_iqStagingSizeC -= drop;
+  }
+
+  const size_t kept = sampleCount - srcOffset;
+  const std::complex<float> *src = iq + srcOffset;
+  size_t remaining = kept;
+  while (remaining > 0) {
+    const size_t chunk = std::min(remaining, capacity - m_iqStagingWritePosC);
+    std::memcpy(m_iqStagingRingC.data() + m_iqStagingWritePosC, src,
+                chunk * sizeof(std::complex<float>));
+    m_iqStagingWritePosC = (m_iqStagingWritePosC + chunk) % capacity;
+    src += chunk;
+    remaining -= chunk;
+  }
+  m_iqStagingSizeC += kept;
+}
+
+bool DspPipeline::linearizeDecimatorBlockC(size_t sampleCount) {
+  if (m_iqStagingRingC.empty() || m_iqLinearizedBlockC.size() < sampleCount ||
+      m_iqStagingSizeC < sampleCount) {
+    return false;
+  }
+  const size_t capacity = m_iqStagingRingC.size();
+  size_t dstOffset = 0;
+  size_t remaining = sampleCount;
+  size_t readPos = m_iqStagingReadPosC;
+  while (remaining > 0) {
+    const size_t chunk = std::min(remaining, capacity - readPos);
+    std::memcpy(m_iqLinearizedBlockC.data() + dstOffset,
+                m_iqStagingRingC.data() + readPos,
+                chunk * sizeof(std::complex<float>));
+    readPos = (readPos + chunk) % capacity;
+    dstOffset += chunk;
+    remaining -= chunk;
+  }
+  m_iqStagingReadPosC = readPos;
+  m_iqStagingSizeC -= sampleCount;
+  return true;
+}
+
 bool DspPipeline::process(
     const uint8_t *iq, size_t samples,
     const std::function<void(const float *, size_t)> &rdsSink, Result &out) {
@@ -253,6 +334,59 @@ bool DspPipeline::process(
     iqForDemod = iq;
   }
 
+  return runDemodChain(iqForDemod, iqForDemodComplex, demodSamples, rdsSink,
+                       out);
+}
+
+bool DspPipeline::process(
+    const std::complex<float> *iq, size_t samples,
+    const std::function<void(const float *, size_t)> &rdsSink, Result &out) {
+  out = Result{};
+  if (!iq || samples == 0) {
+    return false;
+  }
+
+  if (m_pendingAudioReset) {
+    m_stereo.reset();
+    m_afPost.reset();
+    m_pendingAudioReset = false;
+  }
+
+  m_demod.setMultipathAdaptEnabled(m_stereo.isStereo());
+
+  const std::complex<float> *iqForDemodComplex = iq;
+  size_t demodSamples = samples;
+
+  if (m_iqDecimation > 1) {
+    if (m_iqStagingRingC.empty()) {
+      m_iqStagingRingC.assign(sdrBlockSamples() * kIqStagingBlocks,
+                              std::complex<float>(0.0f, 0.0f));
+      m_iqLinearizedBlockC.assign(sdrBlockSamples(),
+                                  std::complex<float>(0.0f, 0.0f));
+    }
+    appendIqToStagingC(iq, samples);
+    if (m_iqStagingSizeC < sdrBlockSamples()) {
+      return false;
+    }
+    if (!linearizeDecimatorBlockC(sdrBlockSamples())) {
+      return false;
+    }
+    demodSamples = m_iqDecimator.executeComplexFromComplex(
+        m_iqLinearizedBlockC.data(), sdrBlockSamples(),
+        m_iqDecimatedComplex.data(), m_blockSamples);
+    iqForDemodComplex = m_iqDecimatedComplex.data();
+    if (demodSamples == 0) {
+      return false;
+    }
+  }
+
+  return runDemodChain(nullptr, iqForDemodComplex, demodSamples, rdsSink, out);
+}
+
+bool DspPipeline::runDemodChain(
+    const uint8_t *iqForDemod, const std::complex<float> *iqForDemodComplex,
+    size_t demodSamples,
+    const std::function<void(const float *, size_t)> &rdsSink, Result &out) {
   size_t outSamples = 0;
   bool stereoDetected = false;
   int pilotTenthsKHz = 0;
@@ -298,7 +432,8 @@ bool DspPipeline::process(
   // channel-power estimate), but the per-sample gain ramp inside
   // m_squelch.process() avoids audible clicks at the open/close edge.
   // No-op when squelch_dbfs is at the disable sentinel.
-  m_squelch.updateGate(m_demod.getFilteredChannelPowerDbfs());
+  m_squelch.updateGate(m_demod.getFilteredChannelPowerDbfs(),
+                       m_stereo.getDemodSnrDb());
   m_squelch.process(m_audioLeft.data(), m_audioRight.data(), outSamples);
 
   uint32_t softClipCount = 0;
@@ -315,6 +450,25 @@ bool DspPipeline::process(
   out.pilotTenthsKHz = pilotTenthsKHz;
   out.stereoBlend = m_stereo.getStereoBlend();
   out.stereoQuality = m_stereo.getStereoQuality();
+  out.mpxMagnitude = m_stereo.getMpxMagnitude();
+  out.pilotDeviationKHz = m_stereo.getPilotDeviationKHz();
+  out.rdsDeviationKHz = m_stereo.getRdsDeviationKHz();
+  out.demodSnrDb = m_stereo.getDemodSnrDb();
+
+  // Composite (MPX) deviation stats for the ITU-R BS.412 power meter. The demod
+  // output is scaled so 1.0 == 75 kHz deviation, so mean-square and peak here
+  // are in those units; the 60 s averaging + dBr/kHz conversion happen
+  // downstream where the per-block stats are accumulated.
+  {
+    float peak = 0.0f;
+    for (size_t i = 0; i < demodSamples; i++) {
+      const float a = std::fabs(m_demodBuffer[i]);
+      if (a > peak) {
+        peak = a;
+      }
+    }
+    out.mpxPeak = peak;
+  }
   out.audioClipRatio =
       (outSamples > 0)
           ? static_cast<float>(softClipCount) /

@@ -11,7 +11,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Setup MSYS2 (MinGW-w64)
       uses: msys2/setup-msys2@v2
@@ -103,8 +103,11 @@ jobs:
       run: |
         mkdir -p dist/windows-mingw
         cp build/fm-sdr-tuner.exe dist/windows-mingw/
-        cp README.md dist/windows-mingw/
-        cp fm-sdr-tuner.ini dist/windows-mingw/
+        cp README.md USER-MANUAL.md dist/windows-mingw/
+        cp fm-sdr-tuner.ini.example dist/windows-mingw/
+        # Ready-to-use config so auto-load (no -c) works on first run.
+        cp fm-sdr-tuner.ini.example dist/windows-mingw/fm-sdr-tuner.ini
+        cp scripts/rest_test_panel.py dist/windows-mingw/
 
         mapfile -t deps < <(
           ldd build/fm-sdr-tuner.exe \
@@ -146,7 +149,7 @@ jobs:
         fi
 
     - name: Upload artifact (MinGW-w64)
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: fm-sdr-tuner-windows-mingw
         path: dist/windows-mingw

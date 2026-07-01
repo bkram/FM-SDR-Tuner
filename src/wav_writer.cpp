@@ -4,6 +4,8 @@
 #include <chrono>
 #include <iostream>
 
+#include <sys/stat.h>
+
 namespace {
 
 constexpr size_t kDefaultQueueSeconds = 2;
@@ -31,12 +33,20 @@ bool WavWriter::init(const std::string &filename, uint32_t sampleRate,
     return false;
   }
 
+  // A pipe/FIFO/char device (e.g. --mpx-wav <fifo> or /dev/stdout) is not
+  // seekable: write the WAV header once, streaming, and never patch sizes on
+  // close. Only a regular file can have its header rewritten.
+  struct stat st {};
+  m_seekable =
+      (fstat(fileno(m_handle), &st) == 0) && S_ISREG(st.st_mode);
+
   m_sampleRate = sampleRate;
   m_channels = channels;
   m_verboseLogging = verboseLogging;
   m_label = (label != nullptr) ? label : "WAV";
   m_dataSize = 0;
   m_fatalError.store(false);
+  m_gain = 1.0f;
   m_readPos = 0;
   m_writePos = 0;
   m_size = 0;
@@ -85,7 +95,10 @@ void WavWriter::shutdown() {
   if (m_thread.joinable()) {
     m_thread.join();
   }
-  if (!writeHeader() && !m_fatalError.load() && m_verboseLogging) {
+  // Patch the header sizes only on a seekable (regular) file. On a stream the
+  // header was already written once at the front; rewriting now would inject
+  // 44 bytes into the middle of the audio data.
+  if (m_seekable && !writeHeader() && !m_fatalError.load() && m_verboseLogging) {
     std::cerr << "[AUDIO] " << m_label << " final header write failed\n";
   }
   std::fclose(m_handle);
@@ -99,13 +112,17 @@ bool WavWriter::writeHeader() {
 
   const uint32_t byteRate = m_sampleRate * m_channels * BITS_PER_SAMPLE / 8;
   const uint16_t blockAlign = m_channels * BITS_PER_SAMPLE / 8;
-  const uint32_t dataSize = m_dataSize;
-  const uint32_t fileSize = 36u + dataSize;
+  // Streaming (non-seekable) output cannot have its sizes patched on close, so
+  // advertise the maximum -- downstream consumers read to EOF.
+  const uint32_t dataSize = m_seekable ? m_dataSize : 0xFFFFFFFFu;
+  const uint32_t fileSize = m_seekable ? (36u + m_dataSize) : 0xFFFFFFFFu;
   const uint32_t fmtSize = 16;
   const uint16_t audioFormat = 1;
   const uint16_t bitsPerSample = BITS_PER_SAMPLE;
 
-  if (std::fseek(m_handle, 0, SEEK_SET) != 0) {
+  // Only seek a regular file; on a pipe/FIFO the header is written in place
+  // at the start of the stream and never rewritten.
+  if (m_seekable && std::fseek(m_handle, 0, SEEK_SET) != 0) {
     if (m_verboseLogging) {
       std::cerr << "[AUDIO] " << m_label << " failed to seek WAV header\n";
     }
@@ -152,7 +169,7 @@ bool WavWriter::writeData(const int16_t *samples, size_t sampleCount) {
   }
   const size_t written =
       std::fwrite(samples, sizeof(int16_t), sampleCount, m_handle);
-  m_dataSize += static_cast<uint32_t>(written * sizeof(int16_t));
+  m_dataSize += static_cast<uint32_t>(written) * 2u;
   if (written != sampleCount) {
     if (m_verboseLogging) {
       std::cerr << "[AUDIO] " << m_label << " short WAV write (" << written
@@ -176,7 +193,7 @@ bool WavWriter::enqueueInterleavedFloat(const float *samples,
     m_encodeScratch.resize(sampleCount);
   }
   for (size_t i = 0; i < sampleCount; i++) {
-    const float clamped = std::clamp(samples[i], -1.0f, 1.0f);
+    const float clamped = std::clamp(samples[i] * m_gain, -1.0f, 1.0f);
     m_encodeScratch[i] = static_cast<int16_t>(clamped * kInt16Max);
   }
 

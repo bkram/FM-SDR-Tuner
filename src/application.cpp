@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <iomanip>
 #include <iostream>
+#include <memory>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -17,6 +20,7 @@
 #include "mpx_audio_output.h"
 #include "processing_runner.h"
 #include "rds_worker.h"
+#include "rest_server.h"
 #include "runtime_loop.h"
 #include "scan_engine.h"
 #include "signal_level.h"
@@ -129,6 +133,8 @@ bool Application::initMpxCapture(WavWriter &mpxWavOut,
     tunerSession.disconnect();
     return false;
   }
+  const float mpxGainLin = std::pow(10.0f, m_options.mpxGainDb / 20.0f);
+  mpxWavOut.setGain(mpxGainLin);
   if (m_options.verboseLogging) {
     std::cout << "[MPX] capture enabled: " << m_options.mpxWavFile << " ("
               << targetRate << " Hz mono";
@@ -136,6 +142,11 @@ bool Application::initMpxCapture(WavWriter &mpxWavOut,
       std::cout << ", resampled from " << sampleRate << " Hz";
     }
     std::cout << ")\n";
+    // Calibration line for downstream analyzers: the demod is 1.0 = 75 kHz
+    // deviation, so after output gain, digital full scale = 75/gain kHz.
+    std::cout << "[MPX] output gain " << m_options.mpxGainDb
+              << " dB (full scale = " << (75.0f / mpxGainLin)
+              << " kHz deviation)\n";
   }
   return true;
 }
@@ -197,6 +208,13 @@ bool Application::initMpxAudio(MpxAudioOutput &mpxAudioOut,
     std::cerr << "[MPX-AUDIO] failed to initialize live MPX audio output\n";
     tunerSession.disconnect();
     return false;
+  }
+  const float mpxGainLin = std::pow(10.0f, m_options.mpxGainDb / 20.0f);
+  mpxAudioOut.setGain(mpxGainLin);
+  if (m_options.verboseLogging) {
+    std::cout << "[MPX-AUDIO] output gain " << m_options.mpxGainDb
+              << " dB (full scale = " << (75.0f / mpxGainLin)
+              << " kHz deviation)\n";
   }
   return true;
 }
@@ -272,6 +290,13 @@ int Application::run() {
   const bool autoStartTuner = m_options.autoStart;
   bool lowLatencyIq = m_options.lowLatencyIq;
 
+  if (tunerSource == "sdrplay") {
+    // The RSP front end is configured to deliver INPUT_RATE directly
+    // (2.048 MHz / 8), so the pipeline runs at 1:1 IQ decimation regardless of
+    // any iq_sample_rate the user set (which only applies to RTL sources).
+    iqSampleRate = static_cast<uint32_t>(INPUT_RATE);
+  }
+
   const size_t iqDecimation = static_cast<size_t>(iqSampleRate / INPUT_RATE);
 
   signal(SIGINT, signalHandler);
@@ -279,7 +304,13 @@ int Application::run() {
 
   TunerController tuner(tunerSource, tcpHost, tcpPort, rtlDeviceIndex);
   tuner.setLowLatencyMode(lowLatencyIq);
+  if (tuner.isSdrPlay()) {
+    tuner.configureSdrplay(config.sdrplay.lna_state, config.sdrplay.antenna,
+                           config.sdrplay.bias_tee);
+  }
   const bool useDirectRtlSdr = tuner.isDirectRtlSdr();
+  const bool sourceIsComplex =
+      tuner.nativeFormat() == TunerController::IqFormat::CF32;
   bool rtlConnected = false;
   XdrCommandState xdrState(freqKHz * 1000U, defaultCustomGainFlags,
                            std::clamp(config.processing.agc_mode, 0, 3), 0,
@@ -375,6 +406,18 @@ int Application::run() {
 
   auto applyRtlGainAndAgc = [&](const char *reason) {
     if (!rtlConnected) {
+      return;
+    }
+    // SDRplay with hardware AGC enabled: use the RSP's own IF AGC and ignore the
+    // RTL-centric manual/TEF gain path. The LNA state is set via configureSdrplay
+    // at connect.
+    if (tuner.isSdrPlay() && config.sdrplay.agc) {
+      tuner.setGainMode(false); // auto-gain mode
+      tuner.setAGC(true);       // RSP hardware IF AGC
+      if (verboseLogging) {
+        std::cout << "[SDR] " << reason << " sdrplay AGC on, LNA "
+                  << config.sdrplay.lna_state << "\n";
+      }
       return;
     }
     if (useSdrppGainStrategy) {
@@ -500,6 +543,11 @@ int Application::run() {
   bool appliedEffectiveForceMono = appliedForceMono;
   constexpr size_t kRetuneMuteSamples =
       static_cast<size_t>(OUTPUT_RATE / 25);
+  // Cold-start settle takes longer than a retune (RF AGC converging from
+  // scratch; glitches observed out to ~70 ms) and there is nothing to hear
+  // yet, so the start mute can afford a longer window: 120 ms.
+  constexpr size_t kStartMuteSamples =
+      static_cast<size_t>((OUTPUT_RATE * 3) / 25);
   SignalLevelSmoother rfLevelSmoother;
   dspPipeline.setDeemphasisMode(appliedDeemphasis);
   dspPipeline.setForceMono(appliedEffectiveForceMono);
@@ -560,6 +608,214 @@ int Application::run() {
     std::cerr << "[XDR] failed to start XDR server\n";
   }
 
+  // Anonymous REST control API (optional; for an fm-dx-webserver plugin). It
+  // carries the SDR-specific settings XDR has no vocabulary for (manual dB
+  // gain, SDRplay LNA/antenna/bias-tee) plus the common ones, and drives the
+  // same TunerController + request-state used by the XDR path so both backends
+  // behave identically.
+  // Live signal telemetry for /api/status, updated each block on the processing
+  // thread and read on the REST thread (hence atomic). overload mirrors the
+  // auto-gain overload condition so a client can warn on front-end / ADC clip.
+  std::atomic<float> liveSignalLevel{0.0f};
+  std::atomic<double> liveSignalDbfs{-120.0};
+  std::atomic<double> liveClipRatio{0.0};
+  std::atomic<bool> liveOverload{false};
+  // Pilot / stereo / MPX telemetry (updated on the processing thread).
+  std::atomic<float> livePilotKHz{0.0f};
+  std::atomic<float> liveRdsDevKHz{0.0f};
+  std::atomic<bool> liveStereo{false};
+  std::atomic<float> liveStereoQuality{0.0f};
+  std::atomic<float> liveDemodSnrDb{0.0f};
+  std::atomic<float> liveMpxMagnitude{0.0f};
+  // Peak composite deviation (kHz) — MAX DEV.
+  std::atomic<double> liveMpxPeakKhz{0.0};
+  // Set by the REST "reset_stats" action; consumed on the processing thread to
+  // restart the MPX 60 s window and peak hold.
+  std::atomic<bool> statsResetRequest{false};
+  // RDS statistics (updated on the RDS worker thread). BER is an EMA of the
+  // per-group block-error fraction (same definition as MPXPrime's blockErrorRate
+  // = failed/received, but windowed so it tracks current link quality and
+  // self-resets on a station change).
+  std::atomic<int> liveRdsPi{0};
+  std::atomic<double> liveRdsBer{0.0};
+  std::atomic<unsigned long long> liveRdsGroups{0};
+
+  // The SDR-specific settables (gain dB / auto-gain / LNA / antenna / bias-T /
+  // ppm / RTL-AGC) have no shared atomic the way frequency/volume/etc. do, so
+  // we mirror them here for /api/status. All REST handlers run serialized on the
+  // RestServer accept thread, so plain members are safe (no atomics). Declared
+  // in the outer scope so it outlives restServer (whose lambdas reference it).
+  struct RestPanelState {
+    double gainDb;
+    bool autoGain;
+    int lna;
+    int antenna;
+    bool biasTee;
+    int ppm;
+    bool rtlAgc;
+  };
+  RestPanelState restPanel{config.sdr.rtl_gain_db >= 0
+                               ? static_cast<double>(config.sdr.rtl_gain_db)
+                               : 20.0,
+                           (config.sdr.rtl_gain_db < 0) ||
+                               (tuner.isSdrPlay() && config.sdrplay.agc),
+                           config.sdrplay.lna_state,
+                           config.sdrplay.antenna,
+                           config.sdrplay.bias_tee,
+                           freqCorrectionPpm,
+                           config.sdr.sdrpp_rtl_agc};
+
+  // Blend mode reported by /api/status when no live override is set yet
+  // (requestedBlendMode == -1): map the INI stereo_blend string to 0/1/2.
+  int defaultBlendMode = 1; // normal
+  {
+    std::string b = config.processing.stereo_blend;
+    std::transform(b.begin(), b.end(), b.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    if (b == "soft") {
+      defaultBlendMode = 0;
+    } else if (b == "aggressive") {
+      defaultBlendMode = 2;
+    }
+  }
+
+  std::unique_ptr<RestServer> restServer;
+  if (config.rest.enabled && config.rest.port != 0) {
+    RestServer::Controls controls;
+    controls.setFrequencyHz = [&](uint32_t hz) {
+      requestedFrequencyHz.store(hz, std::memory_order_relaxed);
+      pendingFrequency.store(true, std::memory_order_release);
+      return true;
+    };
+    controls.setGainDb = [&](double db) {
+      restPanel.gainDb = std::clamp(db, 0.0, 50.0);
+      restPanel.autoGain = false;
+      tuner.setGainMode(true);
+      return tuner.setGain(
+          static_cast<uint32_t>(std::lround(restPanel.gainDb * 10.0)));
+    };
+    controls.setAutoGain = [&](bool on) {
+      restPanel.autoGain = on;
+      tuner.setGainMode(!on);
+      return tuner.setAGC(on);
+    };
+    controls.setBandwidthHz = [&](int hz) {
+      requestedBandwidthHz = hz;
+      pendingBandwidth = true;
+      return true;
+    };
+    controls.setLnaState = [&](int s) {
+      restPanel.lna = s;
+      return tuner.setLnaState(s);
+    };
+    controls.setAntenna = [&](int i) {
+      restPanel.antenna = i;
+      return tuner.setAntenna(i);
+    };
+    controls.setBiasTee = [&](bool e) {
+      restPanel.biasTee = e;
+      return tuner.setBiasTee(e);
+    };
+    controls.setPpm = [&](int ppm) {
+      restPanel.ppm = ppm;
+      return tuner.setFrequencyCorrection(ppm);
+    };
+    controls.setRtlAgc = [&](bool e) {
+      restPanel.rtlAgc = e;
+      return tuner.setAGC(e);
+    };
+    controls.setDeemphasis = [&](int m) {
+      if (m < 0 || m > 2) return false;
+      requestedDeemphasis.store(m, std::memory_order_relaxed);
+      return true;
+    };
+    controls.setBlendMode = [&](int m) {
+      if (m < 0 || m > 2) return false;
+      requestedBlendMode.store(m, std::memory_order_relaxed);
+      pendingBlendMode.store(true, std::memory_order_release);
+      return true;
+    };
+    controls.setForceMono = [&](bool b) {
+      requestedForceMono.store(b, std::memory_order_relaxed);
+      return true;
+    };
+    controls.setVolume = [&](int v) {
+      const int clamped = std::clamp(v, 0, 100);
+      requestedVolume.store(clamped, std::memory_order_relaxed);
+      audioOut.setVolumePercent(clamped);
+      return true;
+    };
+    controls.start = [&]() {
+      pendingStartRequest.store(true, std::memory_order_release);
+      return true;
+    };
+    controls.stop = [&]() {
+      pendingStopRequest.store(true, std::memory_order_release);
+      return true;
+    };
+    controls.resetStats = [&]() {
+      statsResetRequest.store(true, std::memory_order_release);
+      liveRdsBer.store(0.0, std::memory_order_relaxed);
+      liveRdsGroups.store(0, std::memory_order_relaxed);
+      liveRdsPi.store(0, std::memory_order_relaxed);
+      return true;
+    };
+    controls.statusJson = [&]() -> std::string {
+      std::ostringstream oss;
+      // All metrics reported to one decimal (N.N); the small ratios clip/rds_ber
+      // keep more precision so they don't collapse to 0.0.
+      oss << std::fixed << std::setprecision(1);
+      oss << "{\"source\":\"" << tuner.name() << "\",\"model\":\""
+          << tuner.modelName() << "\",\"antenna_count\":" << tuner.antennaCount()
+          << ",\"running\":" << (tunerActive.load() ? "true" : "false")
+          << ",\"frequency_hz\":" << requestedFrequencyHz.load()
+          << ",\"bandwidth_hz\":" << appliedBandwidthHz
+          << ",\"gain_db\":" << restPanel.gainDb
+          << ",\"auto_gain\":" << (restPanel.autoGain ? "true" : "false")
+          << ",\"lna\":" << restPanel.lna << ",\"antenna\":" << restPanel.antenna
+          << ",\"bias_tee\":" << (restPanel.biasTee ? "true" : "false")
+          << ",\"ppm\":" << restPanel.ppm
+          << ",\"rtl_agc\":" << (restPanel.rtlAgc ? "true" : "false")
+          << ",\"deemphasis\":" << requestedDeemphasis.load()
+          << ",\"blend\":"
+          << (requestedBlendMode.load() >= 0 ? requestedBlendMode.load()
+                                             : defaultBlendMode)
+          << ",\"force_mono\":" << (requestedForceMono.load() ? "true" : "false")
+          << ",\"volume\":" << requestedVolume.load()
+          << ",\"signal\":" << liveSignalLevel.load(std::memory_order_relaxed)
+          << ",\"dbfs\":" << liveSignalDbfs.load(std::memory_order_relaxed)
+          << ",\"clip\":" << std::setprecision(4)
+          << liveClipRatio.load(std::memory_order_relaxed) << std::setprecision(1)
+          << ",\"overload\":"
+          << (liveOverload.load(std::memory_order_relaxed) ? "true" : "false")
+          << ",\"stereo\":"
+          << (liveStereo.load(std::memory_order_relaxed) ? "true" : "false")
+          << ",\"pilot_khz\":"
+          << livePilotKHz.load(std::memory_order_relaxed)
+          << ",\"rds_dev_khz\":"
+          << liveRdsDevKHz.load(std::memory_order_relaxed)
+          << ",\"stereo_quality\":"
+          << liveStereoQuality.load(std::memory_order_relaxed)
+          << ",\"snr\":" << liveDemodSnrDb.load(std::memory_order_relaxed)
+          << ",\"mpx\":" << liveMpxMagnitude.load(std::memory_order_relaxed)
+          << ",\"mpx_peak_khz\":"
+          << liveMpxPeakKhz.load(std::memory_order_relaxed)
+          << ",\"rds_ber\":" << std::setprecision(4)
+          << liveRdsBer.load(std::memory_order_relaxed) << std::setprecision(1)
+          << ",\"rds_groups\":" << liveRdsGroups.load(std::memory_order_relaxed)
+          << "}";
+      return oss.str();
+    };
+    restServer = std::make_unique<RestServer>(config.rest.bind_address,
+                                              config.rest.port, controls);
+    restServer->setVerboseLogging(verboseLogging);
+    if (!restServer->start()) {
+      std::cerr << "[REST] failed to start REST control API\n";
+      restServer.reset();
+    }
+  }
+
   if (autoStartTuner) {
     if (verboseLogging) {
       std::cout << "[AUTO] auto-starting tuner for local mode\n";
@@ -575,6 +831,19 @@ int Application::run() {
   RdsWorker rdsWorker(INPUT_RATE, [&](const RDSGroup &group) {
     xdrServer.updateRDS(group.blockA, group.blockB, group.blockC, group.blockD,
                         group.errors);
+    // RDS telemetry for /api/status. errors packs 2 bits per block
+    // (0=ok, 1=errored, 3=missing); a block is "valid" only when its field is 0.
+    const uint8_t e = group.errors;
+    auto fld = [&](int shift) { return (e >> shift) & 0x3; };
+    const int erroredBlocks = (fld(6) != 0) + (fld(4) != 0) + (fld(2) != 0) +
+                              (fld(0) != 0);
+    const double frac = static_cast<double>(erroredBlocks) / 4.0;
+    const double prev = liveRdsBer.load(std::memory_order_relaxed);
+    liveRdsBer.store(prev * 0.95 + frac * 0.05, std::memory_order_relaxed);
+    liveRdsGroups.fetch_add(1, std::memory_order_relaxed);
+    if (group.blockA != 0) {
+      liveRdsPi.store(group.blockA, std::memory_order_relaxed); // PI = block A
+    }
   });
   rdsWorker.start();
 
@@ -591,9 +860,31 @@ int Application::run() {
                                               : std::chrono::milliseconds(5);
   std::vector<uint8_t> iqBufferStorage(SDR_BUF_SAMPLES * 2, 0);
   uint8_t *iqBuffer = iqBufferStorage.data();
+  // CF32 sources (SDRplay) deliver full-precision complex<float> for the demod;
+  // we also quantize them into iqBuffer as an 8-bit shadow so the signal meter,
+  // scan engine, and IQ capture (all RTL-format consumers) work unchanged.
+  std::vector<std::complex<float>> iqComplexStorage;
+  if (sourceIsComplex) {
+    iqComplexStorage.assign(SDR_BUF_SAMPLES, std::complex<float>(0.0f, 0.0f));
+  }
 
-  size_t retuneMuteSamplesRemaining = 0;
-  size_t retuneMuteTotalSamples = 0;
+  // Pre-armed so the very first processed samples after startup (including
+  // the --auto-start path, which connects before this loop) get the same
+  // settle mute as a retune. The counter only decrements while samples flow.
+  size_t retuneMuteSamplesRemaining = kStartMuteSamples;
+  size_t retuneMuteTotalSamples = kStartMuteSamples;
+
+  // SDRplay wide-bandwidth scan mode edge state (see runtime_loop scan logic).
+  bool scanWideActive = false;
+  uint32_t scanWideRate = iqSampleRate;
+
+  // MAX DEV state: ~1 s decaying peak hold of the composite deviation.
+  // Block time ≈ dspBlockSize / INPUT_RATE.
+  const double kMpxBlockSec =
+      static_cast<double>(dspBlockSize) / static_cast<double>(INPUT_RATE);
+  const float kMpxPeakDecay = static_cast<float>(std::exp(-kMpxBlockSec / 1.0));
+  constexpr double kMpxDevFullScaleKHz = 75.0; // demod 1.0 == 75 kHz
+  float mpxPeakHold = 0.0f;
 
   ScanEngine scanEngine;
   auto lastGainDown =
@@ -636,9 +927,23 @@ int Application::run() {
     }
 
     if (pendingStartRequest.exchange(false, std::memory_order_acq_rel)) {
-      tunerSession.connect();
-      dspRuntime.reset(fm_tuner::dsp::ResetReason::Start);
-      tunerActive.store(rtlConnected, std::memory_order_release);
+      // Idempotent start: if the tuner is already playing (e.g. --auto-start,
+      // or another client already started it), ignore the redundant start so a
+      // newly-connecting client doesn't restart the DSP/audio (which reads as a
+      // glitch / "second player"). Only (re)connect when not already active —
+      // this still lets a client retry after a failed auto-start, or restart
+      // after an explicit stop.
+      if (!tunerActive.load(std::memory_order_acquire)) {
+        tunerSession.connect();
+        dspRuntime.reset(fm_tuner::dsp::ResetReason::Start);
+        // Arm the settle mute on start as well as on retune: the demod's
+        // PLL/AGC settling emits a glitch burst (spikes to ~2x deviation full
+        // scale) for the first tens of ms, which otherwise reaches the audio
+        // AND the MPX outputs (WAV / live MPX / RDS) unmuted.
+        retuneMuteSamplesRemaining = kStartMuteSamples;
+        retuneMuteTotalSamples = kStartMuteSamples;
+        tunerActive.store(rtlConnected, std::memory_order_release);
+      }
     }
 
     if (!tunerActive) {
@@ -656,7 +961,9 @@ int Application::run() {
             tunerSetFrequency, tunerReadIQ, writeIqCapture, scanRetrySleep,
             iqBuffer, SDR_BUF_SAMPLES, iqSampleRate, effectiveAppliedGainDb(),
             kSignalGainCompFactor, config.sdr, restoreAfterScan,
-            [&]() { return g_running.load(); })) {
+            [&]() { return g_running.load(); },
+            [&](bool wide) { return tuner.setScanWideMode(wide); },
+            scanWideActive, scanWideRate, [&]() { tuner.flushBuffers(); })) {
       continue;
     }
 
@@ -689,8 +996,26 @@ int Application::run() {
     }
 
     size_t samples = 0;
-    if (!readIqSamples(tunerReadIQ, writeIqCapture, iqBuffer, SDR_BUF_SAMPLES,
-                       noDataSleep, tunerSession, verboseLogging, samples)) {
+    const std::complex<float> *iqComplexPtr = nullptr;
+    if (sourceIsComplex) {
+      samples = tuner.readIQ(iqComplexStorage.data(), SDR_BUF_SAMPLES);
+      if (samples == 0) {
+        tunerSession.noteReadFailureAndMaybeReconnect();
+        std::this_thread::sleep_for(noDataSleep);
+        continue;
+      }
+      for (size_t i = 0; i < samples; i++) {
+        const float si = std::lround(iqComplexStorage[i].real() * 127.5f + 127.5f);
+        const float sq = std::lround(iqComplexStorage[i].imag() * 127.5f + 127.5f);
+        iqBuffer[2 * i] = static_cast<uint8_t>(std::clamp(si, 0.0f, 255.0f));
+        iqBuffer[2 * i + 1] = static_cast<uint8_t>(std::clamp(sq, 0.0f, 255.0f));
+      }
+      writeIqCapture(iqBuffer, samples);
+      tunerSession.resetReadFailures();
+      iqComplexPtr = iqComplexStorage.data();
+    } else if (!readIqSamples(tunerReadIQ, writeIqCapture, iqBuffer,
+                              SDR_BUF_SAMPLES, noDataSleep, tunerSession,
+                              verboseLogging, samples)) {
       continue;
     }
 
@@ -700,6 +1025,14 @@ int Application::run() {
         kSignalGainCompFactor, config, verboseLogging, rfLevelSmoother,
         [&](const SignalLevelResult &signal, double clipRatio,
             float rfLevelFiltered) {
+          // Publish live telemetry for the REST API. Overload uses the same
+          // condition the auto-gain loop acts on (heavy IQ clipping or channel
+          // power into the top few dB of full scale).
+          liveSignalLevel.store(rfLevelFiltered, std::memory_order_relaxed);
+          liveSignalDbfs.store(signal.dbfs, std::memory_order_relaxed);
+          liveClipRatio.store(clipRatio, std::memory_order_relaxed);
+          liveOverload.store((clipRatio > 0.0200) || (signal.dbfs > -5.0),
+                             std::memory_order_relaxed);
           runtime_loop::maybeAdjustAutoGain(
               useSdrppGainStrategy, gain, isImsAgcEnabled(), requestedAGCMode,
               pendingAGC, lastGainDown, lastGainUp, signal, clipRatio,
@@ -710,11 +1043,32 @@ int Application::run() {
         },
         targetForceMono, appliedEffectiveForceMono, dspPipeline, rdsWorker,
         xdrServer, retuneMuteSamplesRemaining, retuneMuteTotalSamples, audioOut,
-        &mpxWavOut, m_options.mpxAudioEnabled ? &mpxAudioOut : nullptr);
+        &mpxWavOut, m_options.mpxAudioEnabled ? &mpxAudioOut : nullptr,
+        iqComplexPtr,
+        [&](float pilotKHz, bool stereo, float quality, float mpxMag,
+            float mpxPeak, float rdsDevKHz, float demodSnrDb) {
+          livePilotKHz.store(pilotKHz, std::memory_order_relaxed);
+          liveRdsDevKHz.store(rdsDevKHz, std::memory_order_relaxed);
+          liveStereo.store(stereo, std::memory_order_relaxed);
+          liveStereoQuality.store(quality, std::memory_order_relaxed);
+          liveDemodSnrDb.store(demodSnrDb, std::memory_order_relaxed);
+          liveMpxMagnitude.store(mpxMag, std::memory_order_relaxed);
+          // MAX DEV: ~1 s decaying peak hold of the composite deviation.
+          if (statsResetRequest.exchange(false, std::memory_order_acquire)) {
+            mpxPeakHold = 0.0f;
+          }
+          mpxPeakHold = std::max(mpxPeak, mpxPeakHold * kMpxPeakDecay);
+          liveMpxPeakKhz.store(
+              static_cast<double>(mpxPeakHold) * kMpxDevFullScaleKHz,
+              std::memory_order_relaxed);
+        });
   }
 
   rdsWorker.stop();
 
+  if (restServer) {
+    restServer->stop();
+  }
   mpxAudioOut.shutdown();
   shutdownResources(audioOut, iqHandle, mpxWavOut, xdrServer, tunerSession);
 

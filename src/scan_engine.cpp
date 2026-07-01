@@ -64,7 +64,8 @@ bool ScanEngine::runIfActive(
     size_t sdrBufSamples, uint32_t iqSampleRate, int effectiveAppliedGainDb,
     double signalGainCompFactor,
     const Config::SDRSection &sdrConfig,
-    const std::function<void(uint32_t, int)> &restoreAfterScan) {
+    const std::function<void(uint32_t, int)> &restoreAfterScan,
+    const std::function<void()> &tunerFlush) {
   if (!m_active || !rtlConnected) {
     return false;
   }
@@ -72,7 +73,13 @@ bool ScanEngine::runIfActive(
   constexpr int kScanRetries = 1;
   constexpr int kFftAverages = 1;
   constexpr size_t kScanReadSamplesCap = 32768;
-  constexpr size_t kRetuneDiscardSamples = 512;
+  // After a scan retune the source's buffered IQ is still from the previous
+  // center. flushBuffers() drops that backlog; we then discard a settle window
+  // to skip the PLL-lock + USB-in-flight samples captured before the new
+  // center took effect, so the FFT only sees post-retune spectrum. Without
+  // this the strong-station energy lands one sweep-step too high.
+  const size_t kRetuneSettleSamples =
+      std::max<size_t>(8192, iqSampleRate / 10); // ~100 ms
   constexpr float kUsableSpectrumFraction = 0.85f;
   constexpr float kCenterStepFraction = 0.60f;
   constexpr float kDcRejectHz = 2000.0f;
@@ -297,6 +304,28 @@ bool ScanEngine::runIfActive(
     return true;
   };
 
+  // Flush the stale pre-retune backlog, then read (and discard) a settle
+  // window of fresh samples so the next measured read is clean.
+  auto settleAfterRetune = [&]() {
+    if (tunerFlush) {
+      tunerFlush();
+    }
+    size_t discarded = 0;
+    int emptyReads = 0;
+    while (discarded < kRetuneSettleSamples && emptyReads < 4) {
+      const size_t want =
+          std::min(sdrBufSamples, kRetuneSettleSamples - discarded);
+      const size_t got = tunerReadIQ(iqBuffer, want);
+      if (got == 0) {
+        emptyReads++;
+        std::this_thread::sleep_for(scanRetrySleep);
+        continue;
+      }
+      emptyReads = 0;
+      discarded += got;
+    }
+  };
+
   for (; centerHz <= endCenterHz; centerHz += centerStepHz) {
     if (!shouldRun() || xdrServer.consumeScanCancel()) {
       m_active = false;
@@ -309,8 +338,8 @@ bool ScanEngine::runIfActive(
       m_active = false;
       break;
     }
-    // Discard one short read after retune to let tuner/NCO settle.
-    (void)tunerReadIQ(iqBuffer, std::min(sdrBufSamples, kRetuneDiscardSamples));
+    // Drop the stale pre-retune backlog and let the tuner/NCO settle.
+    settleAfterRetune();
 
     for (int avg = 0; avg < kFftAverages; avg++) {
       size_t samples = 0;
@@ -369,7 +398,7 @@ bool ScanEngine::runIfActive(
       ch = batchEnd + 1;
       continue;
     }
-    (void)tunerReadIQ(iqBuffer, std::min(sdrBufSamples, kRetuneDiscardSamples));
+    settleAfterRetune();
 
     size_t samples = 0;
     for (int retries = 0; retries < kScanRetries && samples == 0; retries++) {
@@ -398,6 +427,7 @@ bool ScanEngine::runIfActive(
           levelByChannel[static_cast<size_t>(missing)] = 0.0f;
           continue;
         }
+        settleAfterRetune();
         size_t singleSamples = 0;
         for (int retries = 0; retries < kScanRetries && singleSamples == 0;
              retries++) {

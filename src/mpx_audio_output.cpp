@@ -196,7 +196,7 @@ bool MpxAudioOutput::enqueueMpx(const float *samples, size_t sampleCount) {
     }
   }
   for (size_t i = start; i < sampleCount; i++) {
-    m_ring[m_writePos] = samples[i];
+    m_ring[m_writePos] = samples[i] * m_gain;
     m_writePos = (m_writePos + 1) % capacity;
   }
   m_size += kept;

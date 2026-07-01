@@ -21,6 +21,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <random>
@@ -328,14 +329,13 @@ std::string XDRServer::generateSalt() {
   unsigned char random_data[SALT_LENGTH];
 
   if (!RAND_bytes(random_data, sizeof(random_data))) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<size_t> dis(0, len - 1);
-    std::string salt;
-    for (int i = 0; i < SALT_LENGTH; i++) {
-      salt += chars[dis(gen)];
+    // Fail closed: a predictable salt would undermine the challenge/response,
+    // so refuse to authenticate this session rather than fall back to a
+    // non-cryptographic PRNG.
+    if (m_verboseLogging) {
+      std::cerr << "[XDR] RAND_bytes failed; refusing to issue a salt\n";
     }
-    return salt;
+    return {};
   }
 
   std::string salt;
@@ -387,8 +387,21 @@ std::string XDRServer::computeSHA1(const std::string &salt,
 bool XDRServer::authenticate(const std::string &salt,
                              const std::string &passwordHash) {
   std::string expected = computeSHA1(salt, m_password);
-  return (expected.length() == passwordHash.length() &&
-          equalsIgnoreCase(expected, passwordHash));
+  if (expected.empty() || expected.length() != passwordHash.length()) {
+    return false;
+  }
+  // Constant-time comparison so response timing can't be used to recover the
+  // expected hash byte-by-byte. Normalize hex case first (clients may send
+  // upper- or lower-case), then CRYPTO_memcmp over the equal-length buffers.
+  auto toLowerHex = [](std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    return s;
+  };
+  const std::string a = toLowerHex(expected);
+  const std::string b = toLowerHex(passwordHash);
+  return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
 }
 
 std::string XDRServer::buildXdrStateSnapshot() const {
@@ -779,6 +792,11 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
   bool guestSession = false;
 
   std::string salt = generateSalt();
+  if (salt.empty()) {
+    // Secure RNG unavailable; we already logged the cause. Without a salt we
+    // cannot run the challenge/response, so close the connection.
+    return;
+  }
 
   if (m_verboseLogging.load()) {
     std::cout << "[XDR] sending salt: '" << salt << "'" << "\n";
