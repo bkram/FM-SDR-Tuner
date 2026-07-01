@@ -79,6 +79,9 @@ cpack -G DEB --config build/CPackConfig.cmake
 ./scripts/test-linux-arm-builds.sh   # ubuntu:24.04, debian:trixie, fedora:42, fedora:43 container smoke tests
 ```
 
+Cutting a versioned release (branch → PR/CI → merge → GitHub release with the
+CI-built binaries attached) is documented in `RELEASING.md`.
+
 ### Static analysis / formatting
 
 ```bash
