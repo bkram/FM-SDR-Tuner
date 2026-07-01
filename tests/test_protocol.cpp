@@ -124,9 +124,6 @@ uint16_t reserveLoopbackPort() {
 }
 
 int connectLoopback(uint16_t port) {
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
-  REQUIRE(sock >= 0);
-
   sockaddr_in addr{};
 #if defined(__APPLE__)
   addr.sin_len = sizeof(addr);
@@ -135,9 +132,26 @@ int connectLoopback(uint16_t port) {
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = htons(port);
 
-  const int rc = connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
-  REQUIRE(rc == 0);
-  return sock;
+  // Retry the connect for a bounded window instead of failing on the first
+  // attempt: the server thread may not have reached listen() yet, and that
+  // race intermittently reddened CI (notably the macOS runner) with
+  // "Failed to connect to 127.0.0.1". Poll until it accepts or ~2 s elapse.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  for (;;) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(sock >= 0);
+    if (connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0) {
+      return sock;
+    }
+    closeSock(sock);
+    if (std::chrono::steady_clock::now() >= deadline) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  REQUIRE(false); // server never became connectable within the timeout
+  return -1;
 }
 
 bool waitForPrefixLine(int sock, const std::string &prefix,
