@@ -214,10 +214,14 @@ squelch_dbfs = -120.0
 # XDR server TCP port
 port = 7373
 
-# Optional password (empty = no auth)
-password = test123
+# XDR/FM-DX client password. Empty (default) = no auth: the server runs in
+# guest mode so clients like FM-DX-Webserver / XDR-GTK connect without a
+# password (fine for localhost / a trusted LAN). Set a value here to require
+# it, and configure the same password in your client.
+password =
 
-# Allow guest mode without password
+# Allow guest mode without a password. Ignored while password is empty (guest
+# mode is then enabled automatically).
 guest_mode = false
 
 [rest]
