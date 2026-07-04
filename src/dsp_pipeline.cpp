@@ -140,6 +140,7 @@ void DspPipeline::reset() {
   m_stereo.reset();
   m_afPost.reset();
   m_iqDecimator.reset();
+  m_squelch.reset();
   clearIqStaging();
   clearIqStagingC();
   m_pendingAudioReset = false;
