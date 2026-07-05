@@ -600,14 +600,27 @@ Signal meter related keys (`[sdr]`):
 ### Getting reasonable signal-strength readings
 
 The displayed signal level (the `0..120` value XDR/FM-DX clients show as dBf) is
-not an absolute measurement — it is a **linear mapping of the tuned-channel
-power (compensated dBFS) onto a `0..120` scale**:
+not an absolute measurement — it is the **lower of two terms**: a linear mapping
+of the tuned-channel power (compensated dBFS) onto a `0..120` scale, capped by a
+noise-referenced SNR term so an empty channel can never peg the meter:
 
 - `signal_floor_dbfs` is the power that reads as **0** (your noise floor / empty
   channel).
 - `signal_ceil_dbfs` is the power that reads as **120** (your strongest local).
 - `signal_bias_db` shifts the whole scale up/down to line up with a reference
   receiver, if you have one (otherwise leave it at `0`).
+
+**The SNR cap.** RTL front ends saturate: with auto-gain the tuner climbs to
+high gain on a weak/empty channel and the amplified noise pushes the raw channel
+power near full scale — so the *absolute* term alone would read ~maximum on
+empty spectrum just as it does on a strong station. To prevent that, the
+displayed level is also capped by the demod-domain SNR (the gain-invariant
+noise-triangle metric shown as `snr` in the REST API): below ~3 dB SNR the cap
+is 0, and it rises to full scale near ~30 dB. In practice this means an empty
+frequency reads near **0**, a fringe station reads low-to-mid, and only a clean,
+genuinely strong signal approaches the top — regardless of where auto-gain has
+parked the front-end gain. (This is why tuning a dead frequency no longer shows
+a pegged meter.)
 
 So a "reasonable" reading depends entirely on the floor/ceil window matching the
 signal range your antenna actually delivers. The shipped default

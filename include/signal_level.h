@@ -31,6 +31,13 @@ float computeDisplaySignalLevel120(double channelDbfs, double noiseFloorDbfs,
                                    double signalBiasDb, double floorDbfs,
                                    double ceilDbfs, bool channelAware);
 
+// Maps a channel SNR (dB) onto the 0-120 meter scale using the same gate/ceil
+// window the channel-aware absolute mapping uses. A non-finite snrDb means "no
+// SNR estimate" and returns 120 (no cap). Exposed so the display path can cap
+// its absolute level by the FFT-derived SNR even when it sources the absolute
+// term from the demodulator's channel-power estimate.
+float snrLevel120FromSnrDb(double snrDb);
+
 float smoothSignalLevel(float input, SignalLevelSmoother &state);
 
 #endif

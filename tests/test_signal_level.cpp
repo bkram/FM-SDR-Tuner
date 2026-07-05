@@ -5,6 +5,7 @@
 #include <cmath>
 #include <complex>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -248,6 +249,25 @@ TEST_CASE("computeDisplaySignalLevel120 absolute receiver path is not gated by u
 
     REQUIRE(receiverLevel > 40.0f);
     REQUIRE(gatedLevel == 0.0f);
+}
+
+TEST_CASE("snrLevel120FromSnrDb suppresses noise, climbs with SNR, uncaps on NaN",
+          "[signal_level]") {
+    // The display path caps its (saturation-prone) absolute level by this
+    // SNR-derived level so empty spectrum reads low and only genuine signal
+    // climbs the meter. Below/at the gate -> 0; NaN -> no cap (120).
+    REQUIRE(snrLevel120FromSnrDb(0.0) == 0.0f);
+    REQUIRE(snrLevel120FromSnrDb(3.0) == 0.0f);
+    const float mid = snrLevel120FromSnrDb(16.0);
+    REQUIRE(mid > 40.0f);
+    REQUIRE(mid < 90.0f);
+    REQUIRE(snrLevel120FromSnrDb(30.0) == 120.0f);
+    REQUIRE(snrLevel120FromSnrDb(60.0) == 120.0f);
+    REQUIRE(snrLevel120FromSnrDb(
+                std::numeric_limits<double>::quiet_NaN()) == 120.0f);
+
+    // An empty channel must never read higher than a strong one.
+    REQUIRE(snrLevel120FromSnrDb(2.5) < snrLevel120FromSnrDb(22.0));
 }
 
 TEST_CASE("computeSignalLevel rejects center DC contamination", "[signal_level]") {
