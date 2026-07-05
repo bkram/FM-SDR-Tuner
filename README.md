@@ -622,11 +622,12 @@ genuinely strong signal approaches the top — regardless of where auto-gain has
 parked the front-end gain. (This is why tuning a dead frequency no longer shows
 a pegged meter.)
 
-So a "reasonable" reading depends entirely on the floor/ceil window matching the
-signal range your antenna actually delivers. The shipped default
-(`-65` / `-5`, a wide 60 dB window) is deliberately conservative so nothing
-saturates out of the box, but on most sites it compresses everything into the
-middle of the scale. To get readings that track real signal differences:
+So a "reasonable" reading depends on the floor/ceil window matching the signal
+range your antenna delivers **and**, wherever it binds, on the SNR cap. The
+shipped default (`-65` / `-5`, a wide 60 dB window) is deliberately conservative
+so nothing saturates out of the box, but on most sites it compresses everything
+into the middle of the scale. To get the *absolute term* to track real signal
+differences:
 
 1. **Fix RF gain first.** A meter calibrated over a clipping or starved front
    end is meaningless. Get `[SIG] clip` near zero on strong locals (see
@@ -636,10 +637,15 @@ middle of the scale. To get readings that track real signal differences:
    `./fm-sdr-tuner --calibrate` (prints copy-paste `signal_floor_dbfs` /
    `signal_ceil_dbfs` / `signal_bias_db` for your antenna), or just watch the
    `[METER] session observed` log line, which continuously suggests a floor/ceil
-   from the running min/max it sees.
+   from the running min/max it sees. Both calibrate the **absolute term only** —
+   they don't model the SNR cap.
 3. **Apply the suggested window** to `[sdr]` and restart. Strong locals should
-   then settle near `100–110` (leaving headroom for exceptional signals) and
-   fringe stations should register meaningfully around `20–40`.
+   then settle near the top. Note that **fringe-station readings are bounded by
+   the SNR cap, not the window**: a station at ~10 dB demod SNR is capped near
+   `30` no matter how you set floor/ceil, so widening the window can't raise it.
+   The window mainly positions strong/mid stations; the live meter can read lower
+   than the absolute mapping wherever the SNR cap binds (expected, not a
+   mis-calibration).
 
 The full step-by-step procedure, the `[METER]` output format, and the symptoms
 of a mis-set window are in
@@ -805,10 +811,13 @@ Field meaning:
   - What to do next: use this to compare empty vs strong channels when calibrating the meter
 - `compensated`: gain-adjusted internal power
   - What to do next: use this only as a secondary reference; do not tune gain from this alone
-- `floor`: estimated baseline / local floor reference
-  - What to do next: compare this with empty frequencies; if empty channels still look too strong, revisit gain first, then meter calibration
-- `snr`: currently diagnostic only
-  - What to do next: do not make first-pass gain decisions from this field
+- `floor`: FFT-path noise-floor estimate — prints `n/a` in the normal live demod
+  path (only the `computeSignalLevel` / scan / `--calibrate` path fills it in)
+  - What to do next: don't rely on this while listening; read it from `--calibrate` instead
+- `snr`: FFT channel SNR — also prints `n/a` in the live demod path, and is
+  **distinct** from the demod-domain SNR (the REST `snr` field) that actually
+  caps the displayed meter
+  - What to do next: for the SNR that governs the meter, read REST `/api/status` `snr`, not this
 - `level`: mapped UI / XDR display level
   - What to do next: use it for client display sanity, not as your primary gain control signal
 - `filtered`: smoothed display level
@@ -877,17 +886,19 @@ Weak or noisy station:
 - lower `blend`, drifting toward mono
 
 Empty or quiet frequency:
-- low `dbfs`
-- low `level`
+- `dbfs` may still be high under auto-gain (the front end amplifies noise), but
+  `level` reads ~0 because the demod-SNR cap collapses it
 - no meaningful stereo lock
-- if it still looks strong, gain or meter calibration is wrong
+- if `level` itself still looks strong on a truly empty channel, the SNR cap
+  isn't engaging — check that stereo/SNR telemetry is valid (see REST `snr`)
 
 #### What Bad Looks Like
 
 - high `clip`:
   - too much gain; reduce gain first
 - high `level` on empty frequencies:
-  - likely gain or meter calibration problem; do not blame stereo first
+  - the SNR cap should prevent this by design (empty ≈ 0); if it persists the
+    demod-SNR telemetry is suspect, not floor/gain calibration
 - `stereo=1` but low `blend` on a strong station:
   - gain may still be wrong, or the stereo-quality/blend policy is too conservative
 - repeated `[DSP] reset reason=retune` while tuning:
@@ -896,16 +907,20 @@ Empty or quiet frequency:
 #### Example: Reading One Realistic Console Sequence
 
 ```text
-[SIG] dbfs=-1.79 compensated=-13.79 floor=-4.79 snr=0.00 level=115.0 filtered=115.2 clip=0.0000
+[SIG] dbfs=-11.70 compensated=-21.70 floor=n/a snr=n/a level=89.9 filtered=89.5 clip=0.0000
 [ST] pilot=207 stereo=1 quality=0.788 blend=0.633
 [DSP] reset reason=retune
 [XDR] tuning to 105900 kHz
 ```
 
+(`floor=n/a snr=n/a` is normal in the live demod path — those two fields are only
+filled in on the FFT / `computeSignalLevel` path used by scan and `--calibrate`.)
+
 How to interpret it:
 - first `[SIG]` line:
   - `clip=0.0000` means gain is now healthy
-  - `level=115.0` means the station is strong
+  - `level=89.9` means a strong, clean station (high demod SNR clears the cap and
+    the floor/ceil window positions it near the top)
   - action: do not lower gain further just because the station is strong; clipping is already controlled
 - `[ST]` line:
   - `pilot=207` and `stereo=1` mean stereo lock is good
@@ -965,11 +980,11 @@ These keys are display calibration only:
 
 They do not fix RF overload, wrong tuning, or ghosting.
 
-The default 60 dB window (`-65` floor, `-5` ceil) is intentionally wide so it works on most sites without saturating either end. The `[METER]` log line shipped in every run does the legwork for you:
+The default 60 dB window (`-65` floor, `-5` ceil) is intentionally wide so it works on most sites without saturating either end. The `[METER]` log line shipped in every run does the legwork for you (it calibrates the **absolute term** of the meter; the SNR cap is separate and needs no calibration):
 
 ```text
 [METER] mapping window: floor=-65.0 dBFS, ceil=-5.0 dBFS (range 60.0 dB), bias=0.0 dB
-[METER] session observed: min=-53.5 dBFS, max=-26.9 dBFS — for full-scale meter consider floor≈-56, ceil≈-24
+[METER] session observed: min=-53.5 dBFS, max=-26.9 dBFS — for full-scale meter consider floor≈-57, ceil≈-24
 ```
 
 Two procedures, both work end-to-end:
@@ -981,18 +996,20 @@ Two procedures, both work end-to-end:
 ```
 
 The output includes:
-- a per-frequency table (dBFS + meter level at every 100 kHz step)
+- a per-frequency table (dBFS + meter level at every 100 kHz step). Note the
+  "meter level" column uses the FFT channel-SNR path, so it won't in general
+  equal the live client meter, which caps by the demod-domain SNR
 - a sorted list of detected stations (level120 > 30)
-- a recommendation block with `signal_floor_dbfs`, `signal_ceil_dbfs`, and `signal_bias_db` chosen so the 0..120 meter spans the actual signal envelope at your site
+- a recommendation block with `signal_floor_dbfs`, `signal_ceil_dbfs`, and `signal_bias_db` chosen so the absolute term spans the signal envelope at your site (the SNR cap still governs the low end live)
 
 Paste the recommendation block into the `[sdr]` section of your INI and restart. Takes ~45 seconds, no XDR client or audio backend needed. Re-run any time the antenna or location changes.
 
 **Procedure B — Live auto-suggester (for tweaking while listening).**
 1. Start the tuner with the default wide window.
 2. Tune through your representative stations (strong local, mid, fringe, empty) over ~1 minute.
-3. Read the `[METER] session observed` line. It tracks the running min/max of compensated dBFS and recommends `floor ≈ min − 3 dB`, `ceil ≈ max + 3 dB` so the meter spans 0..120 across your real signal range.
+3. Read the `[METER] session observed` line. It tracks the running min/max of compensated dBFS and recommends `floor ≈ min − 3 dB`, `ceil ≈ max + 3 dB` so the absolute term spans your real signal range (it is blind to the SNR cap).
 4. Apply those values to `[sdr]` in your INI.
-5. Restart and confirm: strong locals now settle near 100–110 (with room for exceptional signals), and fringe stations register meaningfully around 20–40.
+5. Restart and confirm: strong locals now settle near the top. Fringe-station readings are set by the SNR cap, not this window, so they won't rise past their SNR-derived level however you set floor/ceil.
 
 Manual fallback (if you prefer the by-hand approach):
 1. Tune an empty or very weak frequency and note typical `dbfs`/`compensated`.
@@ -1000,7 +1017,7 @@ Manual fallback (if you prefer the by-hand approach):
 3. Set `signal_floor_dbfs` ≈ empty-frequency compensated − 3 dB; `signal_ceil_dbfs` ≈ strong-station compensated + 3 dB.
 
 Symptoms of bad meter calibration:
-- empty channels always look too strong: floor is too high, or gain is still wrong
+- empty channels always look too strong: the SNR cap should force these to ~0, so if they read high the demod-SNR telemetry is suspect (not floor/gain)
 - every strong station saturates at 120: ceil is too low
 - everything looks compressed into the middle: floor/ceil window is too wide
 - weak stations clamp to 0: floor is too high (raise the window's bottom; the `[METER]` suggester catches this automatically)

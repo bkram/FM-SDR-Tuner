@@ -155,14 +155,19 @@ is optional and falls back to the default shown.
 | `freq_correction_ppm` | `0` | Crystal correction, ppm. |
 | `default_custom_gain_flags` | `0` | Packed TEF flags: tens=RF, ones=IF (e.g. `11`). |
 | `sdrpp_rtl_agc` / `sdrpp_rtl_agc_gain_db` | `false` / `18` | SDR++-strategy IF AGC + gain. |
-| `signal_floor_dbfs` | `-65.0` | Compensated dBFS mapped to meter level **0**. |
-| `signal_ceil_dbfs` | `-5.0` | Compensated dBFS mapped to meter level **120**. |
-| `signal_bias_db` | `0.0` | Overall meter offset. |
+| `signal_floor_dbfs` | `-65.0` | Compensated dBFS mapped to meter level **0** (absolute term). |
+| `signal_ceil_dbfs` | `-5.0` | Compensated dBFS mapped to meter level **120** (absolute term). |
+| `signal_bias_db` | `0.0` | Overall meter offset (absolute term). |
 | `low_latency_iq` | `false` | Drop stale IQ backlog rather than buffer it — set `true` for scanning to avoid retune audio bursts. |
 
 > The signal level is a **relative**, install-calibrated reading (not absolute
-> field strength). Run `--calibrate` or watch the `[METER]` log line to set the
-> `floor`/`ceil` window for your antenna. See the README for the full guide.
+> field strength). It is the **lower of two terms**: the `floor`/`ceil` mapping
+> above and a gain-invariant demod-SNR cap. The three keys above set only the
+> absolute term; the SNR cap ensures an empty or weak frequency reads ~0 (and
+> only a genuinely strong, clean signal approaches the top) regardless of where
+> auto-gain has parked the front-end gain. Run `--calibrate` or watch the
+> `[METER]` log line to set the `floor`/`ceil` window for your antenna (that
+> calibrates the absolute term only). See the README for the full guide.
 
 ### `[audio]` — output
 | Key | Default | Meaning |
@@ -376,7 +381,7 @@ curl  http://127.0.0.1:9090/api/status
 | **BER** | Bit Error Rate — how many RDS data blocks arrive corrupted; lower is better. |
 | **SNR** | Signal-to-noise ratio. Here, a demod-domain reception-quality figure (high on clean signals). |
 | **dBFS** | Decibels relative to full scale — the receiver's internal power reference (not absolute field strength). |
-| **Signal level (0–120)** | The "dBf"-style meter value: a relative reading mapped from dBFS across the `floor`/`ceil` window. |
+| **Signal level (0–120)** | The "dBf"-style meter value: the lower of a relative reading mapped from dBFS across the `floor`/`ceil` window and a gain-invariant demod-SNR cap, so an empty/weak channel reads ~0 and only a strong, clean signal approaches the top. |
 | **Deviation** | How far the FM carrier swings; ±75 kHz is full modulation. Pilot/RDS/MAX-DEV are reported in kHz. |
 | **AGC** | Automatic Gain Control — adjusts gain to keep the signal in range. RF/IF AGC (front-end) here, not audio AGC. |
 | **Overload / clipping** | The ADC railing because gain is too high; causes distortion and image/ghost artifacts. Reduce gain. |
