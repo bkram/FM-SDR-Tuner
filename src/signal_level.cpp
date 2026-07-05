@@ -399,6 +399,15 @@ SignalLevelResult computeSignalLevel(const uint8_t *iq, size_t samples,
   return out;
 }
 
+float snrLevel120FromSnrDb(double snrDb) {
+  if (!std::isfinite(snrDb)) {
+    return 120.0f;
+  }
+  const double snrNorm = (snrDb - kSignalLevelSnrGateDb) /
+                         (kSignalLevelSnrCeilDb - kSignalLevelSnrGateDb);
+  return std::clamp(static_cast<float>(snrNorm * 120.0), 0.0f, 120.0f);
+}
+
 float computeDisplaySignalLevel120(double channelDbfs, double noiseFloorDbfs,
                                    int appliedGainDb, double gainCompFactor,
                                    double signalBiasDb, double floorDbfs,
@@ -417,12 +426,7 @@ float computeDisplaySignalLevel120(double channelDbfs, double noiseFloorDbfs,
     const double snrDb = std::max(
         0.0, 10.0 * std::log10((signalExcessPower + kPowerFloor) /
                                (noisePower + kPowerFloor)));
-    const double snrNorm =
-        (snrDb - kSignalLevelSnrGateDb) /
-        (kSignalLevelSnrCeilDb - kSignalLevelSnrGateDb);
-    const float snrLevel =
-        std::clamp(static_cast<float>(snrNorm * 120.0), 0.0f, 120.0f);
-    level120 = std::min(level120, snrLevel);
+    level120 = std::min(level120, snrLevel120FromSnrDb(snrDb));
   }
   return level120;
 }

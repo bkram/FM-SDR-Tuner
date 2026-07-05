@@ -103,6 +103,18 @@ bool processAudioBlock(
         displaySignal.dbfs, displaySignal.noiseFloorDbfs, effectiveAppliedGainDb,
         signalGainCompFactor, config.sdr.signal_bias_db,
         config.sdr.signal_floor_dbfs, config.sdr.signal_ceil_dbfs, false);
+    // The demodulator channel-power estimate above is smooth and accurate for
+    // the tuned channel but is an absolute-power term with no noise reference:
+    // at high auto-gain the RTL front-end saturates it near full scale for
+    // empty spectrum and strong stations alike, so an absolute-only mapping
+    // pegs the meter on noise (field reports: "signal reads max even on an
+    // empty frequency"). Cap it by the gain-invariant demod-domain (noise-
+    // triangle) SNR -- always available here, unlike the FFT channel SNR -- so
+    // empty channels read low and only genuine received signal climbs the
+    // scale, restoring the min(absolute, SNR) semantics the channel-aware path
+    // already applies.
+    displaySignal.level120 = std::min(
+        displaySignal.level120, snrLevel120FromSnrDb(dspOut.demodSnrDb));
   }
 
   const bool stereoDetected = dspOut.stereoDetected;
