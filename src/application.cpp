@@ -890,6 +890,14 @@ int Application::run() {
   auto lastGainDown =
       std::chrono::steady_clock::now() - std::chrono::seconds(5);
   auto lastGainUp = std::chrono::steady_clock::now() - std::chrono::seconds(5);
+  // Periodic device-state keep-alive (see the retune/reassert note in
+  // runtime_loop.cpp). When parked on one frequency for hours — the typical
+  // FM-DX-webserver deployment — no retune ever re-asserts the tuner's
+  // gain/AGC/mode registers, so silently lost or drifted device state used to
+  // persist until an app restart. Rewriting the same register values is
+  // inaudible (the auto-gain path already does live gain writes routinely).
+  constexpr auto kDeviceReassertInterval = std::chrono::minutes(5);
+  auto lastDeviceReassert = std::chrono::steady_clock::now();
   fm_tuner::AdaptiveBandwidthState adaptiveBwState;
   fm_tuner::AdaptiveBandwidthMode adaptiveBwMode =
       fm_tuner::AdaptiveBandwidthMode::Off;
@@ -949,6 +957,13 @@ int Application::run() {
     if (!tunerActive) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
+    }
+
+    if (rtlConnected && !scanWideActive && !scanEngine.isActive() &&
+        (std::chrono::steady_clock::now() - lastDeviceReassert) >=
+            kDeviceReassertInterval) {
+      lastDeviceReassert = std::chrono::steady_clock::now();
+      applyRtlGainAndAgc("periodic/reassert");
     }
 
     if (runtime_loop::handleControlAndScan(

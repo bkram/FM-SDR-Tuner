@@ -48,6 +48,14 @@ bool handleControlAndScan(
       // through the pending-frequency path, so without this an XDR client (e.g.
       // FM-DX-Webserver) would report a stale frequency after a REST change.
       xdrServer.setFrequencyState(targetFrequencyHz);
+      // Re-assert the full gain/AGC/mode device state on every retune. A plain
+      // retune otherwise reprograms ONLY the center frequency; gain-mode, gain
+      // and AGC registers are written once at connect(). Field reports show
+      // reception degrading over hours with "retune doesn't help, restart
+      // does" — a restart heals because reconnect reprograms everything. Make
+      // a retune re-establish the same reprogrammable state so silently lost
+      // or drifted tuner registers are corrected without a restart.
+      applyRtlGainAndAgc("retune/reassert");
       audioOut.clearRealtimeQueue();
       dspRuntime.reset(fm_tuner::dsp::ResetReason::Retune);
       retuneMuteSamplesRemaining = kRetuneMuteSamples;

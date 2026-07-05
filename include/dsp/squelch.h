@@ -66,6 +66,20 @@ public:
 
   bool adaptiveEnabled() const { return m_adaptive; }
 
+  // Clear the runtime gate state while keeping the configuration. Called on
+  // retune/DSP reset: the adaptive references track the *previous* station's
+  // level/SNR, and the gate/gain must not carry a stale closed state onto the
+  // new frequency (this state used to survive every retune and was only
+  // cleared by an app restart).
+  void reset() {
+    m_gain = 1.0f;
+    m_isOpen = true;
+    m_refInit = false;
+    m_refDbfs = -120.0f;
+    m_snrRefInit = false;
+    m_snrRef = 0.0f;
+  }
+
   // Update the gate decision from a per-block channel power estimate.
   // Stateless w.r.t. samples — call once per processing block (we already
   // compute channelPowerDbfs in DspPipeline::Result).
