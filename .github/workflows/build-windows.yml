@@ -149,7 +149,7 @@ jobs:
         fi
 
     - name: Upload artifact (MinGW-w64)
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@v7
       with:
         name: fm-sdr-tuner-windows-mingw
         path: dist/windows-mingw

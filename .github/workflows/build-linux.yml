@@ -39,7 +39,7 @@ jobs:
           --html-details build-coverage/coverage.html
 
     - name: Upload coverage artifact
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@v7
       with:
         name: fm-sdr-tuner-coverage-ubuntu-24.04
         path: |
@@ -101,7 +101,7 @@ jobs:
         cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@v7
       with:
         name: fm-sdr-tuner-linux-deb-ubuntu-24.04-${{ matrix.arch }}
         path: dist/linux
@@ -162,7 +162,7 @@ jobs:
         cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@v7
       with:
         name: fm-sdr-tuner-linux-deb-debian-trixie-${{ matrix.arch }}
         path: dist/linux
@@ -225,7 +225,7 @@ jobs:
         cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@v7
       with:
         name: fm-sdr-tuner-linux-rpm-fedora-42-${{ matrix.arch }}
         path: dist/linux
@@ -288,7 +288,7 @@ jobs:
         cp ../scripts/rest_test_panel.py ../scripts/run_rest_panel.sh ../dist/linux/
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@v7
       with:
         name: fm-sdr-tuner-linux-rpm-fedora-43-${{ matrix.arch }}
         path: dist/linux
@@ -309,13 +309,13 @@ jobs:
 
     steps:
     - name: Download Ubuntu package artifact
-      uses: actions/download-artifact@v5
+      uses: actions/download-artifact@v8
       with:
         name: fm-sdr-tuner-linux-deb-ubuntu-24.04-${{ matrix.arch }}
         path: /tmp/artifacts/ubuntu
 
     - name: Download Debian package artifact
-      uses: actions/download-artifact@v5
+      uses: actions/download-artifact@v8
       with:
         name: fm-sdr-tuner-linux-deb-debian-trixie-${{ matrix.arch }}
         path: /tmp/artifacts/debian
@@ -361,13 +361,13 @@ jobs:
 
     steps:
     - name: Download Fedora 42 package artifact
-      uses: actions/download-artifact@v5
+      uses: actions/download-artifact@v8
       with:
         name: fm-sdr-tuner-linux-rpm-fedora-42-${{ matrix.arch }}
         path: /tmp/artifacts/fedora-42
 
     - name: Download Fedora 43 package artifact
-      uses: actions/download-artifact@v5
+      uses: actions/download-artifact@v8
       with:
         name: fm-sdr-tuner-linux-rpm-fedora-43-${{ matrix.arch }}
         path: /tmp/artifacts/fedora-43
