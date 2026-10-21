@@ -331,6 +331,43 @@ configuration nothing: with no password the server accepts `SHA1(salt)`, which
 is exactly what the reference client sends for an empty password, so such a
 client is fully authenticated rather than a guest.
 
+**Stations are reported on their own frequency.** The European FM plan
+allocates channels every 200 kHz starting at 87.6 MHz, but the client's
+default sweep starts at 87.5 MHz. A grid anchored there lands on the
+*midpoints* between the stations, so a station on 96.2 MHz would be reported
+on the 96.1 grid point and clicking the plot would tune to the wrong
+frequency. The grid is therefore aligned with the station raster whenever the
+requested step divides it — a 100 kHz step from 87.5 MHz already contains
+87.6, 87.8, …, so the requested start is kept as-is, while a 200 kHz step
+cannot hold every station and the grid is shifted onto the raster. A step that
+does not divide the 200 kHz raster is reported in the log:
+
+```text
+[SCAN] warning: a 300 kHz step does not divide the 200 kHz CCIR channel
+raster, so some stations are reported at the nearest grid point instead of
+their own frequency
+```
+
+**Levels are on the client's plot scale.** The reference client draws the scan
+in a fixed 3..84 window and clips everything outside it, so the scan line is
+remapped onto that window — on the meter's raw 0..120 scale every station
+above −23 dBFS would be pinned flat against the top of the plot and the plot
+would stop telling strong stations apart. The "S" line and the REST status
+keep the 0..120 scale, because the clients that read them do the conversion
+themselves (the webserver's dBm mode subtracts 120, the plugin shows the value
+out of 120) and the client writes the meter's value straight into the scan
+plot, so the two scales have to stay comparable. The window is configurable:
+
+```ini
+[sdr]
+scan_use_client_window = true   # false keeps the raw 0..120 scale
+scan_client_min_level = 3.0
+scan_client_max_level = 84.0
+```
+
+A channel that has not been swept yet keeps its `0.0` "no signal" marker
+rather than being lifted to the bottom of the window.
+
 ## REST control API (fm-dx-webserver plugin)
 
 An optional anonymous HTTP API exposes the SDR settings on a dedicated port,
