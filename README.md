@@ -775,6 +775,14 @@ Weak-signal tuning keys (all default to off / static):
 
 ## Setup And Tuning Guide
 
+> **Short version:** the antenna dominates everything (15–25 dB — more than
+> every DSP knob combined). Get the RF path right first; no amount of software
+> recovers a signal that never reaches the dongle.
+>
+> For a condensed, ordered version of this guide — which factor matters most,
+> which gain profile to start from, and what each adaptive feature is actually
+> for — see **[RECEPTION-STRATEGIES.md](RECEPTION-STRATEGIES.md)**.
+
 This project behaves best when it is tuned like a real radio front end. Most
 bad behavior comes from getting the order wrong.
 
