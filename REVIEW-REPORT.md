@@ -44,6 +44,11 @@ running instance **was** checked against a running instance.
 | **D8** fabricated online-client count | **fixed** | Unit test: two guests → `o0,2`, and the first client is told when the second leaves. |
 | **D9** any disconnect aborted a scan | **fixed** | Scan ownership is tracked; only the owning client's disconnect cancels. |
 | **D10** SDRplay parameter data race | **fixed** | `m_paramMutex` held across every parameter write + `Update()`; `m_hwVer` is atomic. |
+| **C1** scan grid off the station raster | **fixed** | Unit test: a 200 kHz grid is shifted onto 87.6 MHz; a 100 kHz grid keeps the requested start. Live: a station on 96.2 MHz is reported on 96200 kHz. |
+| **C2** scan integrated ¼ of the channel | **fixed** | Unit test: the scan and the signal meter read the same level (109.5) for the same station. |
+| **C3** capture centres erased the stations | **fixed** | Unit test: a station is reported on its own grid point at every step size. |
+| **C4** scan scale clipped by the client's window | **fixed** | Unit test: every reported level is inside 3..84; the `S` line and the REST status keep the 0..120 scale. |
+| **C5** retune measured the previous band | **fixed** | Unit test: `flushBuffers()` drops the in-flight IQ. Live: three consecutive sweeps find both stations at a stable level. |
 
 ### Additional findings from the DSP/SDR deep-audit
 
@@ -464,6 +469,147 @@ then restoring the fix and confirming it passes.
 
 ---
 
+## Spectral-scan accuracy audit
+
+The scan was re-audited against the reference client's **scale** and
+**geometry** requirements, because two symptoms were reported from the field:
+the reported strength was wrong, and a station on 96.2 MHz was drawn on
+96.1 MHz.
+
+The reference client's contract was read out of the source rather than
+assumed:
+
+- `research/xdr-gtk/src/scan.c` — the plot is drawn in a **fixed 3..84
+  window** (`SCAN_DEFAULT_MIN_LEVEL 3.0`, `SCAN_DEFAULT_MAX_LEVEL 84.0`) and
+  `scan_draw_spectrum()` **clips** everything outside it.
+- `research/xdr-gtk/src/ui-signal.c` — `signal_level()` maps the server's
+  value onto dBm/dBµV/dBf depending on the client's unit; the **dBf** unit
+  (the default) is `value + conf.signal_offset`.
+- `research/xdr-gtk/src/ui-tuner-update.c:165` — `scan_update_value()` writes
+  the meter's **S line** value into the scan plot, so the `S` line and the
+  `U` line have to share one scale.
+- `research/FM-DX-Tuner/src/Controllers/Tuner/TEF668X/TEF668X.cpp` — the
+  reference `getQualityRssi()` returns `value + 1125`; the protocol scale is
+  therefore **0..120**, which is also what the fm-dx-webserver expects
+  (`web/js/main.js:864` subtracts 120 for dBm, and the plugin shows the value
+  out of 120).
+
+### C1 — the reporting grid was anchored on the client's default, not on the station raster **[fixed]**
+
+The grid started at the client's default 87.5 MHz. The European FM plan
+allocates channels every 200 kHz starting at **87.6 MHz**, so a grid anchored
+at 87.5 MHz lands on the *midpoints* between the stations. With a 200 kHz
+step a station on 96.2 MHz was reported on the 96.1 grid point — the reported
+"offset" symptom. The radio was never wrong; the grid was.
+
+**Fix:** the grid is aligned with the CCIR raster whenever the step allows
+it. The alignment is applied only when the step divides the 200 kHz raster,
+and the phase is taken modulo the **cell** step rather than the raster step,
+so a 100 kHz grid from 87.5 MHz (which already contains 87.6, 87.8, …) is
+left where the client asked for it while a 200 kHz grid is shifted onto
+87.6. A step that does not divide the raster produces a `[SCAN] warning`
+naming the consequence.
+
+### C2 — the scan integrated a quarter of the channel bandwidth **[fixed]**
+
+The per-channel measurement window was a quarter of the channel bandwidth, so
+every station was reported about **6 dB** low. The client mixes the `S` line
+and the `U` line on one plot, so the tuned station visibly jumped when it was
+added to the plot.
+
+**Fix:** the measurement integrates the **full** channel bandwidth, exactly
+like the signal meter, and the scan and the meter now read the same value for
+the same station (109.5 on the 0..120 scale in the regression test).
+
+### C3 — the capture centres landed on the stations and erased them **[fixed]**
+
+The estimator rejects the bins around DC (they carry the tuner's own DC
+spike), and the capture centres were placed **on** the reporting grid points —
+which is where the stations are. A station sitting on a capture centre was
+therefore removed from its own measurement window and vanished from the plot.
+The repeating three-value pattern seen in the field was this artefact: its
+period is the least common multiple of the grid step and the capture-centre
+step.
+
+**Fix:** the capture centres run **half a cell** away from every grid point
+and their step is a whole number of cells, so the phase never drifts back
+onto a station.
+
+### C4 — the 0..120 scale was clipped by the client's fixed plot window **[fixed]**
+
+The `U` line carried the meter's 0..120 scale, but the client draws the plot
+in a fixed 3..84 window and clips everything outside it. Every station above
+−23 dBFS was therefore pinned flat against the top of the plot, and the plot
+stopped telling the strong stations apart.
+
+**Fix:** the scan line alone is remapped onto the client's plot window, with
+`[sdr] scan_use_client_window`, `scan_client_min_level` and
+`scan_client_max_level`. The remap is applied at **emission** time, so a
+channel that has not been swept yet keeps its `0.0` "no signal" marker
+instead of being lifted to the bottom of the window. The `S` line and the
+REST status deliberately keep the 0..120 scale, because the clients that read
+those convert it themselves — the webserver's dBm mode subtracts 120 and the
+plugin shows the value out of 120 — and the plugin needs no change.
+
+### C5 — a retune measured the band the tuner had just left **[fixed]**
+
+`TunerController::flushBuffers()` only emptied the **USB dongle's** ring, so
+on the `rtl_tcp` source it was a no-op. The samples of the centre frequency
+the tuner had just left stayed in the socket buffer and were read as if they
+belonged to the new centre, so every capture mixed the spectrum of two
+different bands. The symptom was a **flaky** detection: the same station was
+found on one sweep and missed on the next.
+
+**Fix:** `RTLTCPClient::flushBuffers()` drains the IQ that is still in flight
+and drops the half-byte left over from an earlier read; the controller
+dispatches the flush to whichever source is in use.
+
+### C6 — the reference `rtl_tcp` server does not acknowledge commands **[documentation]**
+
+While building the test harness it became clear that the real `rtl_tcp`
+server (osmocom/rtl-sdr, `src/rtl_tcp.c`) sends **no reply** to any command:
+only the 12-byte `RTL0` header, then a continuous IQ stream, with the
+commands read on a separate thread. A server that acknowledges the commands
+injects those bytes into the IQ stream as garbage. `scripts/fake_rtl_tcp.py`
+now reproduces the reference behaviour exactly (no acks, a command-reader
+thread and an IQ-writer thread, a paced stream, and an NCO that restarts on a
+retune).
+
+### Live verification
+
+Without an SDR attached, the whole path was exercised against
+`scripts/fake_rtl_tcp.py`, which plays a synthetic band with carriers on
+**96.2 MHz** and **101.2 MHz**:
+
+| Check | Result |
+|---|---|
+| Sweep of 95–103 MHz at a 100 kHz step | 83 retunes, one `U` line per retune |
+| Grid | 81 entries, 95000→103000 kHz, uniform 100 kHz step, trailing comma present |
+| Station on 96.2 MHz | reported at **96200 kHz**, level **47.2** |
+| Station on 101.2 MHz | reported at **101200 kHz**, level **47.2** |
+| Neighbouring grid points (96100, 96300, 101100, 101300) | 9.0–9.4 — the noise floor, no bleed |
+| All levels | 8.4–47.2, every one inside the client's 3..84 window |
+| Repeatability | three consecutive sweeps, both stations at **47.2** every time |
+| Before the C5 fix | the same sweep reported 96.2 MHz on one run and missed it on the next |
+
+The client's own scale was confirmed on the wire as well: the `U` line's
+frequency labels carry the station's **own** frequency, and the levels sit on
+the plot window the client draws.
+
+### Regression tests added
+
+| Test | Target |
+|---|---|
+| `ScanEngine reports a station on the grid point of its own frequency` | `scan_diag` |
+| `ScanEngine keeps the noise floor low and flat across the band` | `scan_diag` |
+| `ScanEngine reports a station on the same scale as the signal meter` | `scan_diag` |
+| `ScanEngine reports levels inside the client's plot window` | `scan_diag` |
+| `ScanEngine aligns the reporting grid with the station raster` | `scan_diag` |
+| `RTLTCPClient flushBuffers drops the stale IQ of the previous centre` | `protocol` |
+| `Config parses the scan plot window` | `config` |
+
+---
+
 ## Build & test baseline
 
 | Check | Result |
@@ -490,9 +636,10 @@ then restoring the fix and confirming it passes.
 | *Deep-audit (D1–D4)* | *4* | *4* |
 | *SDR/control audit (D5–D10)* | *6* | *6* |
 | *Band-scan audit (B1–B3)* | *3* | *3* |
-| **Total** | **33** | **33** |
+| *Scan-accuracy audit (C1–C5)* | *5* | *5* |
+| **Total** | **38** | **38** |
 
-All 33 findings are fixed. Every fix carries a regression test, and every fix
+All 38 findings are fixed. Every fix carries a regression test, and every fix
 that could be checked against a running instance was checked against one.
 
 A fourth audit covered the XDR band-scan path (B1–B3) and corrected one
@@ -501,6 +648,18 @@ sweep, so the client watched an empty plot for the whole run; a wide grid
 silently overflowed the client's receive buffer and lost the plot's last
 entry; and the scan queue was too small to carry a sweep. See
 [Band-scan audit](#band-scan-audit-xdr-spectral-scan).
+
+A fifth audit covered the **accuracy** of the scan (C1–C5) and addressed the
+two symptoms reported from the field — a station on 96.2 MHz drawn on
+96.1 MHz, and a wrong reported strength. The grid was anchored on the
+client's default start instead of the CCIR station raster; the per-channel
+measurement integrated a quarter of the channel bandwidth and so read 6 dB
+low; the capture centres were placed on the stations themselves, where the
+DC-reject notch erased them; the 0..120 scale was clipped by the client's
+fixed 3..84 plot window, pinning every strong station flat against the top;
+and a retune on the `rtl_tcp` source measured the band the tuner had just
+left, which made the detection flaky. See
+[Spectral-scan accuracy audit](#spectral-scan-accuracy-audit).
 
 The most serious issues are a **protocol regression in XDR guest mode** (unauthenticated clients can retune and reconfigure the tuner, where the reference `xdrd` treats guests as read-only), a **process-killing SIGPIPE in the REST server**, and **integer-overflow in the REST frequency setter**.
 
