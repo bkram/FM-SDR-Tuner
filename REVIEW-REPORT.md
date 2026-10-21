@@ -321,6 +321,8 @@ atomic with respect to other setters. `m_hwVer` is now `std::atomic<int>`.
 | `XDRServer: a bystander disconnect does not cancel a scan` | `protocol` |
 | `SDRplay connect diagnostics honour the verbose flag` | `sdrplay_verbose` |
 | `TunerController forwards the verbose flag to the SDRplay source` | `sdrplay_verbose` |
+| `ScanEngine publishes the spectrum incrementally during the sweep` | `scan_engine` |
+| `ScanEngine widens the step when the grid would overflow one line` | `scan_engine` |
 
 Each of D1, D2, D3 and D4 was checked by **reverting the fix and confirming
 the new test fails**, then restoring the fix and confirming it passes — so the
@@ -345,6 +347,120 @@ instance connected to a real RTL-SDR, with a password configured
 | Online count, one guest | `o0,1` |
 | Online count, second guest joins | `o0,2`, and the first client is **broadcast** `o0,2` |
 | Online count, second guest leaves | the first client is broadcast `o0,1` |
+
+---
+
+## Band-scan audit (XDR spectral scan)
+
+The XDR protocol's band-scan command produces the spectrum overview in
+XDR-GTK. It "never really worked great", so the scan path was audited against
+the reference client (`research/xdr-gtk/src/scan.c`, `tuner.c`,
+`tuner-scan.c`) and re-checked live against a real RTL-SDR (NESDR SMArt v5,
+R820T).
+
+### B1 — the spectrum was published only at the very end **[fixed]**
+
+`ScanEngine::runIfActive` emitted exactly one `U` line, after the entire sweep
+had finished. A full 87.5–108 MHz sweep takes tens of seconds on an RTL dongle,
+so the client sat on an **empty plot for the whole sweep** and only ever saw
+one frame.
+
+**Fix:** a line is now published after every retune. Because the reference
+client *replaces* its dataset on every `U` line rather than merging
+(`scan_update()`), each line describes the **same grid** — same start, same
+step, same channel count — with unmeasured channels reported as `0.0` (the
+client's "no signal" floor), so the x-axis does not shrink as the sweep
+advances. The trailing comma is mandatory (the client's parser sizes its
+array from the comma count and drops the last entry without it).
+
+### B2 — a wide grid silently overflowed the client's receive buffer **[fixed]**
+
+The whole spectrum travels in a single line. The reference client reads into a
+10000-byte buffer and silently drops the overflow
+(`research/xdr-gtk/src/tuner.c`, `SERIAL_BUFFER`), and refuses more than 700
+samples outright (`research/xdr-gtk/src/scan.c`, `SCAN_MAX_SAMPLES`). A 5 kHz
+step across the full band is 4101 channels ≈ 45 KB: the line was truncated
+mid-entry, the trailing comma was lost, the client then dropped the last
+entry, and the plot ended short of the requested stop frequency.
+
+**Fix:** the step is widened so the grid fits within 700 channels, with a
+`[SCAN] warning` naming the requested and applied step.
+
+### B3 — the scan queue was too small to carry a sweep **[fixed]**
+
+`XDRServer::pushScanLine` kept at most 8 queued lines. A full sweep publishes
+one line per retune (43 at a 500 kHz step, 138 at 30 kHz), so a client that
+polled less often than the scan advanced saw only the last few frames.
+
+**Fix:** the bound is now 256 lines — enough for a full sweep — while still
+capping growth for a client that never reads.
+
+### B4 — guest sessions could not run a scan **[not a defect — correction]**
+
+An earlier revision of this report treated "a guest may not run a scan" as a
+defect and relaxed the guest allowlist to include `'S'`. **That was based on a
+false premise and has been reverted.** The evidence:
+
+- The server's challenge/response is `SHA1(salt + password)`. With an empty
+  password that is exactly `SHA1(salt)`, which is precisely what the reference
+  client sends for its default empty password
+  (`research/xdr-gtk/src/tuner-conn.c:158-165`; the client's default is
+  `CONF_CONNECTION_PASSWORD ""`). A stock client against the default
+  configuration is therefore **fully authenticated** (`a2`), not a guest.
+- Guest mode engages only when a client presents a *wrong* hash.
+- The reference daemon lets only an authenticated session drive the tuner
+  (`research/xdrd/xdrd.c:585`).
+
+So the default configuration was never blocked from scanning, and admitting
+`'S'` to guests would have weakened the read-only boundary for no benefit. The
+allowlist is back to `N` / `o` / `P` / an `I` query; a guest asking for a scan
+gets `a0`. A live check confirms it: a wrong-hash client is answered `a1` and
+then `a0` for both `S` and `T101700`, while a correct-hash client gets `a2`
+and a working sweep.
+
+### B5 — the sweep blocks the IQ path **[known limitation, not changed]**
+
+The sweep runs inside the IQ read loop, because it needs the samples. While a
+sweep is in progress the tuner is retuned across the band, so there is no
+audio, no signal-meter update and no RDS decode. The tuner is restored
+afterwards (`[DSP] reset reason=scan_restore` in the log, and the stereo
+decoder relocks).
+
+This is inherent to the current architecture: the scan consumes the same
+sample stream the audio path does. Making the sweep concurrent would mean
+either a second SDR handle or a ring buffer large enough to hold a sweep's
+worth of samples, and would change the tuning discipline that the wide-mode
+SDRplay optimisation depends on. It is left as a known limitation rather than
+changed under cover of a bug fix.
+
+### Live verification
+
+Against a running `fm-sdr-tuner` with an RTL-SDR attached, using a client that
+speaks the reference protocol (salt → `SHA1(salt)` → `x` → scan):
+
+| Check | Result |
+|---|---|
+| Auth with the default (empty) password | `a2` — fully authenticated |
+| Full-band sweep, 500 kHz step | 43 `U` lines, first at **0.2 s** (previously one line at the end) |
+| Grid across all 43 lines | **1** distinct frequency grid, 42 entries, uniform 500 kHz step, 87500→108000 kHz |
+| Trailing comma | present on every line |
+| Longest line | 451 chars (client buffer is 10000) |
+| Measured content | 19 of 42 channels carry signal; strongest 97000 kHz = 36.3, then 105000 = 30.9, 104000 = 26.5, 102500 = 24.5, 88000 = 24.0 — real European FM carriers |
+| 5 kHz step over the full band | widened to 30 kHz: `[SCAN] warning: 4101 channels requested exceeds the 700 …`; 684 entries, 7273 chars, trailing comma intact |
+| Guest (wrong hash) running a scan | `a0` — refused |
+| Guest (wrong hash) retuning | `a0` — refused |
+| Tuner state after the sweep | restored (`[DSP] reset reason=scan_restore`), stereo relocks |
+
+### Regression tests added
+
+| Test | Target |
+|---|---|
+| `ScanEngine publishes the spectrum incrementally during the sweep` | `scan_engine` |
+| `ScanEngine widens the step when the grid would overflow one line` | `scan_engine` |
+
+Both were checked by **reverting the fix and confirming the test fails**
+(`m_scanQueue.size()` was 1, and the grid held 4101 entries instead of ≤700),
+then restoring the fix and confirming it passes.
 
 ---
 
@@ -373,10 +489,18 @@ instance connected to a real RTL-SDR, with a password configured
 | LOW | 6 | 6 |
 | *Deep-audit (D1–D4)* | *4* | *4* |
 | *SDR/control audit (D5–D10)* | *6* | *6* |
-| **Total** | **30** | **30** |
+| *Band-scan audit (B1–B3)* | *3* | *3* |
+| **Total** | **33** | **33** |
 
-All 30 findings are fixed. Every fix carries a regression test, and every fix
+All 33 findings are fixed. Every fix carries a regression test, and every fix
 that could be checked against a running instance was checked against one.
+
+A fourth audit covered the XDR band-scan path (B1–B3) and corrected one
+mis-diagnosis (B4): the spectrum was published only at the very end of a
+sweep, so the client watched an empty plot for the whole run; a wide grid
+silently overflowed the client's receive buffer and lost the plot's last
+entry; and the scan queue was too small to carry a sweep. See
+[Band-scan audit](#band-scan-audit-xdr-spectral-scan).
 
 The most serious issues are a **protocol regression in XDR guest mode** (unauthenticated clients can retune and reconfigure the tuner, where the reference `xdrd` treats guests as read-only), a **process-killing SIGPIPE in the REST server**, and **integer-overflow in the REST frequency setter**.
 

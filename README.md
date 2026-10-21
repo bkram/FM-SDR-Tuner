@@ -280,6 +280,57 @@ mode for the duration of a scan — it drops the hardware decimation (256 kHz �
 drops from ~13 s to under 2 s, then the 256 kHz audio rate is restored
 automatically. This is transparent (no config) and a no-op on RTL.
 
+## XDR Spectral Scan (band overview)
+
+The XDR protocol carries a band-scan command that the XDR-GTK client turns
+into its spectrum plot. The tuner sweeps the requested range, measures each
+channel, and reports the result as `U<freq_kHz>=<level>,…` lines.
+
+```text
+Sa87500     sweep starts at 87.5 MHz
+Sb108000    sweep stops at 108.0 MHz
+Sc500       channel step in kHz (minimum 5)
+Sw56000     measurement bandwidth in Hz
+S           start the sweep
+Sm          start the sweep in continuous mode
+```
+
+The sweep runs on the IQ path, so it owns the tuner while it lasts: audio is
+interrupted and the signal meter freezes until the sweep ends. The tuner is
+restored to the frequency and bandwidth it had before, and the DSP chain is
+reset (`[DSP] reset reason=scan_restore`).
+
+**The plot fills in progressively.** A line is published after every retune, so
+the client shows the spectrum growing instead of an empty graph for the whole
+sweep. Each line describes the *same* grid — the same start frequency, the same
+step, the same channel count — because the reference client replaces its
+dataset on every line rather than merging. Channels not yet measured are
+reported as `0.0` (the client's "no signal" floor), so the x-axis does not
+shrink as the sweep advances. The trailing comma is mandatory: the client's
+parser sizes its array from the comma count and drops the last entry without
+it.
+
+**The step is widened when the grid would not fit.** The whole spectrum travels
+in a single line, and the reference client reads into a 10000-byte buffer and
+silently drops whatever exceeds it — a truncated line loses its trailing comma
+and the client then discards the last entry, ending the plot short of the
+requested stop frequency. The client also refuses more than 700 samples
+outright. A request that would need more channels than that (a 5 kHz step
+across the full band is 4101) is therefore widened automatically to fit, with
+a note in the log:
+
+```text
+[SCAN] warning: 4101 channels requested exceeds the 700 the protocol carries
+in one line; widening the step from 5 to 30 kHz
+```
+
+**Authorization.** The scan retunes the radio, so it is a tuner command, and a
+guest session (a client that failed the challenge/response) may not run one —
+it gets `a0`, the protocol's "not authorized" reply. This costs the default
+configuration nothing: with no password the server accepts `SHA1(salt)`, which
+is exactly what the reference client sends for an empty password, so such a
+client is fully authenticated rather than a guest.
+
 ## REST control API (fm-dx-webserver plugin)
 
 An optional anonymous HTTP API exposes the SDR settings on a dedicated port,
@@ -1202,6 +1253,11 @@ Weak stations never hold stereo:
 Scan or meter looks wrong:
 - fix clipping first
 - then recalibrate `signal_floor_dbfs` / `signal_ceil_dbfs`
+
+Spectrum plot is empty or ends short of the requested frequency:
+- an empty plot during a sweep is normal — the plot fills in as the sweep advances
+- a plot that *ends short* means the line was longer than the client's receive buffer; the tuner now widens the step automatically and logs a `[SCAN] warning`
+- a plot that stays empty after the sweep ended means the client was refused the scan (`a0`); a guest session may not run one — configure a password, or use an authenticated client
 
 Stereo image is too narrow on clearly strong locals:
 - gain may still be wrong

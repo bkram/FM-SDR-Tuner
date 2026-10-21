@@ -230,6 +230,19 @@ TEST_CASE("XDR guest sessions cannot change tuner state", "[xdr_unit]") {
   REQUIRE(volume.load() == 0);
   REQUIRE(startCalls.load() == 0);
 
+  // The spectral scan retunes the radio across the band, so a guest may not
+  // start one — same rule as any other tuner command, and the same rule the
+  // reference daemon applies (research/xdrd/xdrd.c:585). This costs the
+  // default configuration nothing: with no password the challenge/response
+  // accepts SHA1(salt), which is exactly what the reference client sends for
+  // an empty password, so such a client is fully authenticated rather than a
+  // guest.
+  REQUIRE(xdr.processCommand("Sa87500", false, true) == "a0");
+  REQUIRE(xdr.processCommand("S", false, true) == "a0");
+  REQUIRE(xdr.processCommand("Sm", false, true) == "a0");
+  // A guest still cannot reconfigure the tuner.
+  REQUIRE(xdr.processCommand("T101700", false, true) == "a0");
+
   // Read-only queries still answer.
   REQUIRE(xdr.processCommand("N", false, true).rfind("N", 0) == 0);
   // The "o" line reports the real number of connected clients. This test

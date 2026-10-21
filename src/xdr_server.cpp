@@ -653,7 +653,15 @@ void XDRServer::pushScanLine(const std::string &line) {
     return;
   }
   std::lock_guard<std::mutex> lock(m_scanMutex);
-  if (m_scanQueue.size() >= 8) {
+  // The scan publishes one line per retune so the client's plot fills in
+  // while the sweep runs. A full 87.5-108 MHz sweep produces 43 lines at a
+  // 500 kHz step and 138 at the 30 kHz step the grid cap settles on, so the
+  // queue has to hold more than a handful of lines or the client would only
+  // ever see the last few. The queue is bounded so a client that never reads
+  // cannot make the server grow without limit; the bound is generous enough
+  // to cover a full sweep.
+  constexpr size_t kMaxQueuedScanLines = 256;
+  if (m_scanQueue.size() >= kMaxQueuedScanLines) {
     m_scanQueue.pop_front();
   }
   m_scanQueue.emplace_back(m_scanNextSeq++, "U" + line);
@@ -1374,6 +1382,14 @@ std::string XDRServer::processCommand(const std::string &cmd,
       // 'I' with no argument is a query for the current sampling interval;
       // 'I<int>,<detector>' changes it and is therefore not guest-allowed.
     } else {
+      // The spectral scan ('S') is rejected for a guest like any other
+      // tuner command: it retunes the radio across the band, and the
+      // reference daemon likewise lets only an authenticated session drive
+      // the tuner (research/xdrd/xdrd.c:585). Note that this costs the
+      // default configuration nothing: with no password the server's
+      // challenge/response accepts SHA1(salt) — which is exactly what the
+      // reference client sends for an empty password — so such a client is
+      // fully authenticated, not a guest.
       return "a0";
     }
   }

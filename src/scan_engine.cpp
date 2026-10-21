@@ -92,10 +92,33 @@ bool ScanEngine::runIfActive(
   const int stopKHz = std::clamp(std::max(m_config.startKHz, m_config.stopKHz),
                                  static_cast<int>(fm_tuner::kFmBroadcastMinFreqKHz),
                                  static_cast<int>(fm_tuner::kFmBroadcastMaxFreqKHz));
-  const int stepKHz = std::max(5, m_config.stepKHz);
+  const int requestedStepKHz = std::max(5, m_config.stepKHz);
   const int channelBandwidthHz =
       std::clamp((m_config.bandwidthHz > 0) ? m_config.bandwidthHz : 56000,
                  10000, 200000);
+  // The whole spectrum travels in ONE line ("U<f>=<v>,<f>=<v>,..."). The
+  // reference client reads into a 10000-byte buffer and silently drops
+  // everything past it (research/xdr-gtk/src/tuner.c SERIAL_BUFFER), so a
+  // line longer than that is truncated mid-entry: the trailing comma is
+  // lost, the client's parser then discards the last entry, and the plot
+  // ends short of the requested stop frequency. The client itself refuses
+  // more than 700 samples (research/xdr-gtk/src/scan.c SCAN_MAX_SAMPLES),
+  // so this is never the binding limit for a client that plays by the
+  // rules — it only protects against a hand-rolled client asking for a
+  // 5 kHz step over the whole band. Widen the step so the result fits.
+  constexpr int kMaxScanChannels = 700;
+  const int requestedChannelCount =
+      ((stopKHz - startKHz) / requestedStepKHz) + 1;
+  int stepKHz = requestedStepKHz;
+  if (requestedChannelCount > kMaxScanChannels) {
+    const int widenedStep =
+        ((stopKHz - startKHz) / (kMaxScanChannels - 1)) + 1;
+    stepKHz = std::max(stepKHz, widenedStep);
+    std::cerr << "[SCAN] warning: " << requestedChannelCount
+              << " channels requested exceeds the " << kMaxScanChannels
+              << " the protocol carries in one line; widening the step from "
+              << requestedStepKHz << " to " << stepKHz << " kHz\n";
+  }
   const int channelCount = ((stopKHz - startKHz) / stepKHz) + 1;
   std::vector<float> levelByChannel(
       static_cast<size_t>(channelCount),
@@ -329,6 +352,32 @@ bool ScanEngine::runIfActive(
     }
   };
 
+  // Build the "U" line for the channels measured so far and hand it to the
+  // client. The xdr-gtk client REPLACES its dataset on every "U" line
+  // (research/xdr-gtk/src/scan.c scan_update()) and never merges, so a line
+  // must always describe the same grid: the same start frequency, the same
+  // step, and the same channel count. Emitting only the measured prefix
+  // would make the client's x-axis shrink as the sweep grows, so the
+  // unmeasured channels are emitted as 0.0 (the client's "no signal" floor)
+  // and the line keeps the full grid width from the first frame on.
+  //
+  // The trailing comma is mandatory: the client's parser sizes its array
+  // from the comma count and drops the last entry when the comma is
+  // missing (research/xdr-gtk/src/tuner-scan.c tuner_scan_parse()).
+  auto pushPartialScanLine = [&]() {
+    std::ostringstream scanLine;
+    for (int ch = 0; ch < channelCount; ch++) {
+      const float rfLevel = levelByChannel[static_cast<size_t>(ch)];
+      const float value = std::isfinite(rfLevel) ? rfLevel : 0.0f;
+      scanLine << (startKHz + ch * stepKHz) << "="
+               << std::fixed << std::setprecision(1) << value << ",";
+    }
+    const std::string line = scanLine.str();
+    if (!line.empty()) {
+      xdrServer.pushScanLine(line);
+    }
+  };
+
   for (; centerHz <= endCenterHz; centerHz += centerStepHz) {
     if (!shouldRun() || xdrServer.consumeScanCancel()) {
       m_active = false;
@@ -361,6 +410,11 @@ bool ScanEngine::runIfActive(
       (void)estimateLevelsFromCapture(centerHz, samples, 0, channelCount - 1,
                                       false);
     }
+
+    // Publish what has been measured so far. The client shows the plot
+    // filling in instead of staring at an empty graph for the whole sweep
+    // (a full 87.5-108 MHz sweep takes tens of seconds on an RTL dongle).
+    pushPartialScanLine();
   }
 
   // Fallback for uncovered channels so the client receives complete scan lines.
@@ -462,20 +516,9 @@ bool ScanEngine::runIfActive(
     ch = batchEnd + 1;
   }
 
-  std::ostringstream scanLine;
-  for (int ch = 0; ch < channelCount; ch++) {
-    const float rfLevel = levelByChannel[static_cast<size_t>(ch)];
-    if (!std::isfinite(rfLevel)) {
-      continue;
-    }
-    const int f = startKHz + ch * stepKHz;
-    scanLine << f << "=" << std::fixed << std::setprecision(1) << rfLevel
-             << ",";
-  }
-
-  if (!scanLine.str().empty()) {
-    xdrServer.pushScanLine(scanLine.str());
-  }
+  // Final pass: the fallback sampling above has filled in the channels the
+  // main sweep could not cover, so the complete grid is published once more.
+  pushPartialScanLine();
 
   if (!m_config.continuous || !m_active) {
     m_active = false;
