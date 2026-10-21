@@ -310,6 +310,49 @@ size_t RTLTCPClient::readIQ(uint8_t *buffer, size_t maxSamples) {
   return totalRead / 2;
 }
 
+void RTLTCPClient::flushBuffers() {
+  if (!m_connected || m_socket < 0) {
+    return;
+  }
+  // Drain whatever the server has already sent but that has not been read
+  // yet. The bytes belong to the centre frequency the tuner just left, so
+  // keeping them would put the previous band's spectrum into the next
+  // measurement.
+  //
+  // The drain uses a short receive timeout rather than a non-blocking mode:
+  // MSG_DONTWAIT does not exist on Windows, and a 1 ms timeout gives the
+  // same "return what is there, do not wait" behaviour on every platform.
+  // The bound stops a fast server from keeping the drain busy forever.
+  constexpr int kDrainTimeoutMs = 1;
+  constexpr size_t kMaxDrainBytes = 1024 * 1024;
+  uint8_t drain[16384];
+  size_t drained = 0;
+  setRecvTimeoutMs(m_socket, kDrainTimeoutMs);
+  while (drained < kMaxDrainBytes) {
+    const long n = recv(m_socket, reinterpret_cast<char *>(drain), sizeof(drain),
+                        0);
+    if (n > 0) {
+      drained += static_cast<size_t>(n);
+      continue;
+    }
+    if (n == 0) {
+      // The server closed the connection.
+      m_connected = false;
+      break;
+    }
+    const int err = lastSocketError();
+    if (socketInterrupted(err)) {
+      continue;
+    }
+    break; // timeout / EAGAIN: nothing left to drain
+  }
+  // A half-byte left over from the previous read no longer has a partner in
+  // the stream, so it cannot be carried over.
+  m_havePendingIqByte = false;
+  m_pendingIqByte = 0;
+  setRecvTimeoutMs(m_socket, 2000);
+}
+
 bool RTLTCPClient::setFrequency(uint32_t freqHz) {
   if (sendCommand(0x01, freqHz)) {
     m_frequency = freqHz;

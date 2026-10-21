@@ -187,8 +187,22 @@ uint32_t TunerController::setScanWideMode(bool wide) {
 }
 
 void TunerController::flushBuffers() {
-  if (m_kind == SourceKind::RtlSdr) {
+  switch (m_kind) {
+  case SourceKind::RtlSdr:
     m_rtlSdrDevice.flushBuffers();
+    break;
+  case SourceKind::RtlTcp:
+    // A network source cannot have its server-side buffer emptied, but the
+    // stale IQ still sitting in the socket belongs to the previous centre
+    // frequency, so it is dropped here. Without this the spectral scan
+    // measures the band the tuner just left.
+    m_rtlTcpClient.flushBuffers();
+    break;
+  case SourceKind::SdrPlay:
+  default:
+    // The SDRplay source raises its own reset flag on a scan retune and
+    // flushes the ring itself.
+    break;
   }
 }
 

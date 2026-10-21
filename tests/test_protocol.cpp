@@ -406,6 +406,119 @@ TEST_CASE("RTLTCPClient command and IQ handling with mock rtl_tcp server",
   REQUIRE(serverOk.load());
 }
 
+TEST_CASE("RTLTCPClient flushBuffers drops the stale IQ of the previous centre",
+          "[protocol][rtl_tcp]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  std::atomic<bool> serverReady{false};
+  std::atomic<bool> serverOk{false};
+
+  std::thread server([&]() {
+    int listenSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenSock < 0) {
+      return;
+    }
+    const int opt = 1;
+#if defined(_WIN32)
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char *>(&opt), sizeof(opt));
+#else
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
+
+    sockaddr_in addr{};
+#if defined(__APPLE__)
+    addr.sin_len = sizeof(addr);
+#endif
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (bind(listenSock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
+        listen(listenSock, 1) != 0) {
+      closeSock(listenSock);
+      return;
+    }
+    serverReady = true;
+
+    sockaddr_in clientAddr{};
+    SocketLen clientLen = sizeof(clientAddr);
+    int clientSock =
+        accept(listenSock, reinterpret_cast<sockaddr *>(&clientAddr), &clientLen);
+    if (clientSock < 0) {
+      closeSock(listenSock);
+      return;
+    }
+
+    const uint8_t header[12] = {'R', 'T', 'L', '0', 0, 0, 0, 0, 0, 0, 0, 0};
+    if (!sendAll(clientSock, header, sizeof(header))) {
+      closeSock(clientSock);
+      closeSock(listenSock);
+      return;
+    }
+
+    // The stale block: samples that belong to the centre frequency the
+    // tuner is about to leave.
+    const uint8_t stale[4] = {0xAA, 0xAA, 0xAA, 0xAA};
+    if (!sendAll(clientSock, stale, sizeof(stale))) {
+      closeSock(clientSock);
+      closeSock(listenSock);
+      return;
+    }
+    // The fresh block follows later, so it is still in flight while the
+    // client flushes.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const uint8_t fresh[4] = {0x55, 0x55, 0x55, 0x55};
+    if (!sendAll(clientSock, fresh, sizeof(fresh))) {
+      closeSock(clientSock);
+      closeSock(listenSock);
+      return;
+    }
+    serverOk = true;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    closeSock(clientSock);
+    closeSock(listenSock);
+  });
+
+  for (int i = 0; i < 50 && !serverReady.load(); i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  REQUIRE(serverReady.load());
+
+  RTLTCPClient client("127.0.0.1", port);
+  REQUIRE(client.connect());
+
+  // Read one sample of the stale block, so the rest of it is left in the
+  // socket buffer.
+  uint8_t first[4] = {};
+  REQUIRE(client.readIQ(first, 1) == 1);
+  REQUIRE(first[0] == 0xAA);
+
+  // The flush has to drop the samples of the previous centre, so the next
+  // read returns the fresh block. Without the flush the stale samples are
+  // still in the socket buffer and are read as if they belonged to the new
+  // centre -- which is exactly what made the spectral scan measure the band
+  // the tuner had just left.
+  client.flushBuffers();
+
+  uint8_t iq[8] = {};
+  const size_t samples = client.readIQ(iq, 2);
+  REQUIRE(samples == 2);
+  REQUIRE(iq[0] == 0x55);
+  REQUIRE(iq[1] == 0x55);
+  REQUIRE(iq[2] == 0x55);
+  REQUIRE(iq[3] == 0x55);
+
+  client.disconnect();
+  server.join();
+  REQUIRE(serverOk.load());
+}
+
 TEST_CASE("RTLTCPClient rejects malformed rtl_tcp header",
           "[protocol][rtl_tcp]") {
 #if defined(_WIN32)
