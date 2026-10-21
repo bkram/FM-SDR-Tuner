@@ -33,6 +33,17 @@ struct Config {
     double signal_floor_dbfs = -65.0;
     double signal_ceil_dbfs = -5.0;
     double signal_bias_db = 0.0;
+    // The spectral-scan plot window of the reference client. xdr-gtk draws
+    // the scan in a FIXED 3..84 window (SCAN_DEFAULT_MIN_LEVEL/MAX_LEVEL)
+    // and clips everything outside it, so a scale that runs to 120 pins every
+    // strong station flat against the top of the plot. When enabled, the
+    // scan line is remapped from the meter's 0..120 onto this window; the
+    // "S" line and the REST status keep the 0..120 scale, because the
+    // clients that read those convert it themselves (the webserver's dBm
+    // mode subtracts 120, the plugin shows it out of 120).
+    bool scan_use_client_window = true;
+    double scan_client_min_level = 3.0;
+    double scan_client_max_level = 84.0;
     bool low_latency_iq = false;
   } sdr;
 

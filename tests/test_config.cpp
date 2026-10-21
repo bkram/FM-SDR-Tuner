@@ -67,6 +67,31 @@ TEST_CASE("Config parses sdr section with gain strategy", "[config]") {
     std::remove("test_config.ini");
 }
 
+TEST_CASE("Config parses the scan plot window", "[config]") {
+    Config config;
+    config.loadDefaults();
+
+    // The reference client draws the scan in a fixed 3..84 window, so the
+    // remap onto that window is on by default.
+    REQUIRE(config.sdr.scan_use_client_window == true);
+    REQUIRE(config.sdr.scan_client_min_level == 3.0);
+    REQUIRE(config.sdr.scan_client_max_level == 84.0);
+
+    std::ofstream file("test_config.ini");
+    file << "[sdr]\n";
+    file << "scan_use_client_window = false\n";
+    file << "scan_client_min_level = 10.0\n";
+    file << "scan_client_max_level = 90.0\n";
+    file.close();
+
+    REQUIRE(config.loadFromFile("test_config.ini"));
+    REQUIRE(config.sdr.scan_use_client_window == false);
+    REQUIRE(config.sdr.scan_client_min_level == 10.0);
+    REQUIRE(config.sdr.scan_client_max_level == 90.0);
+
+    std::remove("test_config.ini");
+}
+
 TEST_CASE("Config parses tuner source sdrplay", "[config]") {
     Config config;
     config.loadDefaults();

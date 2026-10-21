@@ -116,7 +116,7 @@ ScanOutcome runScan(uint32_t carrierHz, int stepKHz, int startKHz = 87500,
                      requestedBandwidthHz, pendingBandwidth,
                      [](uint32_t, int) {});
 
-  Config::SDRSection sdrConfig{};
+  Config::SDRSection sdrConfig = Config::SDRSection{};
   FakeBand band(kSampleRateHz, carrierHz, kSamples,
                 carrierHz == 0 ? 0.0f : 0.5f, 0.05f);
   std::vector<uint8_t> buffer(kSamples * 2, 127);
@@ -213,15 +213,36 @@ TEST_CASE("ScanEngine reports a station on the same scale as the signal meter",
   std::vector<uint8_t> buffer(kSamples * 2, 127);
   band.read(buffer.data());
 
-  Config::SDRSection sdrConfig{};
+  Config::SDRSection sdrConfig = Config::SDRSection{};
   const SignalLevelResult meter = computeSignalLevel(
       buffer.data(), kSamples, 0, 0.0, sdrConfig.signal_bias_db,
       sdrConfig.signal_floor_dbfs, sdrConfig.signal_ceil_dbfs, kSampleRateHz,
       kChannelBwHz);
 
   // The scan integrates the full channel bandwidth, so the two agree to
-  // within a fraction of a dB-scale unit (2 units per dB).
-  REQUIRE(std::abs(scanLevel - meter.level120) < 6.0f);
+  // within a fraction of a dB-scale unit (2 units per dB) once the scan's
+  // value is put back on the meter's scale.
+  const float scanOnMeterScale =
+      ((scanLevel - sdrConfig.scan_client_min_level) /
+       (sdrConfig.scan_client_max_level - sdrConfig.scan_client_min_level)) *
+      120.0f;
+  REQUIRE(std::abs(scanOnMeterScale - meter.level120) < 6.0f);
+}
+
+TEST_CASE("ScanEngine reports levels inside the client's plot window",
+          "[scan_engine][xdr]") {
+  // The reference client draws the scan in a fixed 3..84 window and clips
+  // everything outside it, so a level above 84 is pinned flat against the
+  // top of the plot and strong stations stop telling each other apart.
+  // Every measured level has to land inside the window.
+  const ScanOutcome outcome = runScan(96200000, 100);
+  REQUIRE(outcome.ran);
+  REQUIRE(outcome.levels.size() > 100);
+
+  for (const auto &kv : outcome.levels) {
+    REQUIRE(kv.second >= 3.0f);
+    REQUIRE(kv.second <= 84.0f);
+  }
 }
 
 TEST_CASE("ScanEngine aligns the reporting grid with the station raster",

@@ -63,7 +63,7 @@ TEST_CASE("ScanEngine emits xdr-gtk-compatible U lines with trailing comma",
 
   std::vector<uint8_t> iqBuffer(4096 * 2, 127);
 
-  Config::SDRSection sdrConfig{};
+  Config::SDRSection sdrConfig = Config::SDRSection{};
   const bool ran = scan.runIfActive(
       xdr, true, []() { return true; },
       [](uint32_t) -> bool { return true; },
@@ -79,7 +79,9 @@ TEST_CASE("ScanEngine emits xdr-gtk-compatible U lines with trailing comma",
   // during the sweep; the last line carries the complete grid.
   REQUIRE(!xdr.m_scanQueue.empty());
   const std::string &line = xdr.m_scanQueue.back().second;
-  REQUIRE(line == "U87500=0.0,87600=0.0,");
+  // Both channels were measured (an empty spectrum is the floor), so they
+  // carry the bottom of the client's plot window.
+  REQUIRE(line == "U87500=3.0,87600=3.0,");
 }
 
 TEST_CASE("ScanEngine suppresses empty-channel FFT peaks with local floor gating",
@@ -111,7 +113,7 @@ TEST_CASE("ScanEngine suppresses empty-channel FFT peaks with local floor gating
   FakeBand band(kSampleRateHz, 87600000, kSamples, 0.70f, 0.02f);
   std::vector<uint8_t> iqBuffer(kSamples * 2, 127);
 
-  Config::SDRSection sdrConfig{};
+  Config::SDRSection sdrConfig = Config::SDRSection{};
   const bool ran = scan.runIfActive(
       xdr, true, []() { return true; },
       [&](uint32_t hz) -> bool {
@@ -166,7 +168,7 @@ TEST_CASE("ScanEngine batches fallback retunes for contiguous uncovered channels
 
   int retuneCount = 0;
   int readCount = 0;
-  Config::SDRSection sdrConfig{};
+  Config::SDRSection sdrConfig = Config::SDRSection{};
   const bool ran = scan.runIfActive(
       xdr, true, []() { return true; },
       [&](uint32_t) -> bool {
@@ -203,8 +205,10 @@ TEST_CASE("ScanEngine batches fallback retunes for contiguous uncovered channels
 
   std::lock_guard<std::mutex> lock(xdr.m_scanMutex);
   REQUIRE(!xdr.m_scanQueue.empty());
+  // Every channel was measured, so every one carries the bottom of the
+  // client's plot window rather than the "not measured" marker.
   REQUIRE(xdr.m_scanQueue.back().second ==
-          "U87500=0.0,87600=0.0,87700=0.0,87800=0.0,87900=0.0,88000=0.0,");
+          "U87500=3.0,87600=3.0,87700=3.0,87800=3.0,87900=3.0,88000=3.0,");
 }
 
 TEST_CASE("ScanEngine flushes the source buffer after every retune",
@@ -232,7 +236,7 @@ TEST_CASE("ScanEngine flushes the source buffer after every retune",
 
   int retuneCount = 0;
   int flushCount = 0;
-  Config::SDRSection sdrConfig{};
+  Config::SDRSection sdrConfig = Config::SDRSection{};
   const bool ran = scan.runIfActive(
       xdr, true, []() { return true; },
       [&](uint32_t) -> bool {
@@ -277,7 +281,7 @@ TEST_CASE("ScanEngine publishes the spectrum incrementally during the sweep",
   std::vector<uint8_t> iqBuffer(kSamples * 2, 127);
 
   int retuneCount = 0;
-  Config::SDRSection sdrConfig{};
+  Config::SDRSection sdrConfig = Config::SDRSection{};
   const bool ran = scan.runIfActive(
       xdr, true, []() { return true; },
       [&](uint32_t) -> bool {
@@ -348,7 +352,7 @@ TEST_CASE("ScanEngine widens the step when the grid would overflow one line",
   constexpr size_t kSamples = 16384;
   std::vector<uint8_t> iqBuffer(kSamples * 2, 127);
 
-  Config::SDRSection sdrConfig{};
+  Config::SDRSection sdrConfig = Config::SDRSection{};
   const bool ran = scan.runIfActive(
       xdr, true, []() { return true; },
       [](uint32_t) -> bool { return true; },

@@ -96,6 +96,11 @@ bool ScanEngine::runIfActive(
   const int channelBandwidthHz =
       std::clamp((m_config.bandwidthHz > 0) ? m_config.bandwidthHz : 56000,
                  10000, 200000);
+  // The plot window the reference client draws the scan in.
+  const bool scanUseClientWindow = sdrConfig.scan_use_client_window;
+  const double scanClientMinLevel = sdrConfig.scan_client_min_level;
+  const double scanClientMaxLevel = std::max(
+      sdrConfig.scan_client_max_level, sdrConfig.scan_client_min_level + 1.0);
   // The whole spectrum travels in ONE line ("U<f>=<v>,<f>=<v>,..."). The
   // reference client reads into a 10000-byte buffer and silently drops
   // everything past it (research/xdr-gtk/src/tuner.c SERIAL_BUFFER), so a
@@ -428,9 +433,8 @@ bool ScanEngine::runIfActive(
       // (no FFT-SNR gate). Stations with low SNR due to adjacent-channel
       // spillover are still real signals worth seeing on the spectrum plot.
       (void)snrDb;
-      const float level120 = absLevel120;
       levelByFine[static_cast<size_t>(n)] =
-          std::max(levelByFine[static_cast<size_t>(n)], level120);
+          std::max(levelByFine[static_cast<size_t>(n)], absLevel120);
     }
 
     return true;
@@ -489,12 +493,28 @@ bool ScanEngine::runIfActive(
   // The trailing comma is mandatory: the client's parser sizes its array
   // from the comma count and drops the last entry when the comma is
   // missing (research/xdr-gtk/src/tuner-scan.c tuner_scan_parse()).
+  //
+  // The measured levels are remapped from the meter's 0..120 onto the plot
+  // window the client draws in (3..84 by default), which clips everything
+  // outside it: on the 0..120 scale every strong station would be pinned
+  // flat against the top of the plot and the plot would stop telling them
+  // apart. The unmeasured channels keep their 0.0 marker, so a channel that
+  // has not been swept yet still reads as "no signal" rather than as the
+  // bottom of the window.
   auto pushPartialScanLine = [&]() {
     foldFineIntoCells();
     std::ostringstream scanLine;
     for (int ch = 0; ch < channelCount; ch++) {
       const float rfLevel = levelByChannel[static_cast<size_t>(ch)];
-      const float value = std::isfinite(rfLevel) ? rfLevel : 0.0f;
+      float value = 0.0f;
+      if (std::isfinite(rfLevel)) {
+        value = scanUseClientWindow
+                    ? static_cast<float>(
+                          scanClientMinLevel +
+                          (std::clamp(rfLevel, 0.0f, 120.0f) / 120.0f) *
+                              (scanClientMaxLevel - scanClientMinLevel))
+                    : rfLevel;
+      }
       scanLine << ((gridStartHz + static_cast<int64_t>(ch) * cellStepHz) / 1000)
                << "=" << std::fixed << std::setprecision(1) << value << ",";
     }
