@@ -447,6 +447,28 @@ Run the normal test suite:
 ctest --test-dir build --output-on-failure --no-tests=error
 ```
 
+### Testing Without An SDR (fake rtl_tcp server)
+
+`scripts/fake_rtl_tcp.py` is a fake `rtl_tcp` server that plays a synthetic
+FM band, so the whole path — the XDR handshake, the scan engine, the wire
+format — can be exercised without a dongle. It reproduces the reference
+server's behaviour exactly: the 12-byte `RTL0` greeting, **no** per-command
+acknowledgements, the commands read on a separate thread from the IQ stream,
+a stream paced at the sample rate, and an NCO that restarts on a retune.
+
+```bash
+# A synthetic band with carriers on 96.2 and 101.2 MHz
+python3 -I scripts/fake_rtl_tcp.py --port 12345 --stations 96200000,101200000
+
+# Point the tuner at it
+./build/fm-sdr-tuner --source rtl_tcp -t 127.0.0.1:12345 --iq-rate 256000 \
+                     --auto-start -w /tmp/wire.wav --no-audio -P test123
+```
+
+A carrier is only present in a read when it falls inside the captured band,
+exactly like a real front end, so the tuner has to sweep to find it — the
+scan is genuinely exercised rather than handed the answer.
+
 ### RTL-SDR Live Hardware Tests
 
 There is now a gated hardware-in-the-loop test target for a real RTL-SDR dongle.
@@ -1295,6 +1317,17 @@ Spectrum plot is empty or ends short of the requested frequency:
 - an empty plot during a sweep is normal — the plot fills in as the sweep advances
 - a plot that *ends short* means the line was longer than the client's receive buffer; the tuner now widens the step automatically and logs a `[SCAN] warning`
 - a plot that stays empty after the sweep ended means the client was refused the scan (`a0`); a guest session may not run one — configure a password, or use an authenticated client
+
+A station is drawn on the wrong frequency:
+- the reporting grid is aligned with the CCIR raster (87.6 MHz + n × 0.2 MHz) whenever the step divides it, so a station is drawn on its own frequency
+- a step that does not divide the 200 kHz raster cannot hold every station exactly; the tuner logs a `[SCAN] warning` naming the consequence
+- if *every* station sits slightly off, that is the dongle's frequency error — set `freq_correction_ppm` from a station whose exact frequency you know
+- if one strong station has a weaker copy next to it, that is an overload image — reduce the gain first
+
+The scan levels and the signal meter disagree:
+- they are measured on the same scale but through different paths (FFT integration versus the meter's demodulator SNR), so a few units of difference on a marginal station is normal
+- if the scan is uniformly much lower, check that the channel bandwidth matches what the meter is using (`Sw` / `w0_bandwidth_hz`)
+- the scan line is remapped onto the client's fixed 3..84 plot window; the `S` line and the REST status keep the 0..120 scale, so the two are not directly comparable as numbers
 
 Stereo image is too narrow on clearly strong locals:
 - gain may still be wrong
