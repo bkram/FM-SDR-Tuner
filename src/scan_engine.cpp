@@ -119,10 +119,86 @@ bool ScanEngine::runIfActive(
               << " the protocol carries in one line; widening the step from "
               << requestedStepKHz << " to " << stepKHz << " kHz\n";
   }
-  const int channelCount = ((stopKHz - startKHz) / stepKHz) + 1;
+  // The client asks for one level per point of a (start, step) grid, but the
+  // spectrum has to be measured at a resolution that never misses a station.
+  // A station sitting between two grid points is half a step away from the
+  // nearest one, so integrating a narrow channel window around the grid
+  // points alone leaves most of the band blind: with a 200 kHz step a
+  // station on 96.2 MHz is 100 kHz from the nearest grid point and is never
+  // measured at all. The spectrum is therefore measured on a FINE grid whose
+  // spacing is a quarter of the measurement width (so every station falls
+  // inside at least one measurement window), and each reporting cell takes
+  // the strongest measurement inside it.
+  const int64_t measurementWidthHz = channelBandwidthHz;
+  const int64_t fineStepHz = std::clamp<int64_t>(measurementWidthHz / 4, 2000,
+                                                 25000);
+
+  // The reporting grid is aligned with the CCIR raster (87.6 MHz + n * 0.2
+  // MHz), because that is where the stations actually are. A grid that is
+  // off-raster reports every station on its neighbour's frequency: with a
+  // 200 kHz step anchored at the client's default 87.5 MHz, a station on
+  // 96.2 MHz lands on the 96.1 grid point, and clicking the plot then
+  // tunes to the wrong channel.
+  //
+  // The alignment is only applied when the step allows it. A step that
+  // divides the 200 kHz raster can hold every station exactly, and then
+  // the grid is shifted forward onto the raster — the requested start is
+  // kept whenever the grid already sits on the raster's phase (a 100 kHz
+  // step from 87.5 MHz already contains 87.6, 87.8, ... ), so the client
+  // gets the range it asked for.
+  int64_t gridStartHz = static_cast<int64_t>(startKHz) * 1000;
+  int64_t gridStopHz = static_cast<int64_t>(stopKHz) * 1000;
+  const int64_t cellStepHz = static_cast<int64_t>(stepKHz) * 1000;
+  if (cellStepHz > 0) {
+    // The European FM plan allocates channels every 200 kHz starting at
+    // 87.6 MHz. A grid whose step divides 200 kHz and whose first point
+    // sits on that raster contains every station exactly.
+    constexpr int64_t kCcirChannelStepHz = 200000;
+    constexpr int64_t kCcirRasterAnchorHz = 87600000;
+    if ((kCcirChannelStepHz % cellStepHz) == 0) {
+      // Shift the grid forward onto the raster's phase. The phase is taken
+      // modulo the CELL step, not the raster step: what matters is that
+      // every station frequency is congruent to the grid start.
+      const int64_t phaseHz =
+          ((gridStartHz - kCcirRasterAnchorHz) % cellStepHz + cellStepHz) %
+          cellStepHz;
+      if (phaseHz != 0) {
+        gridStartHz += cellStepHz - phaseHz;
+      }
+    } else {
+      std::cerr << "[SCAN] warning: a " << stepKHz
+                << " kHz step does not divide the 200 kHz CCIR channel "
+                   "raster, so some stations are reported at the nearest grid "
+                   "point instead of their own frequency\n";
+    }
+    // The grid ends at the last point that is still inside the requested
+    // range.
+    gridStopHz = gridStartHz +
+                 ((gridStopHz - gridStartHz) / cellStepHz) * cellStepHz;
+  }
+  const int channelCount =
+      static_cast<int>((gridStopHz - gridStartHz) / cellStepHz) + 1;
   std::vector<float> levelByChannel(
       static_cast<size_t>(channelCount),
       -std::numeric_limits<float>::infinity());
+
+  const int fineCount =
+      static_cast<int>((gridStopHz - gridStartHz) / fineStepHz) + 1;
+  std::vector<float> levelByFine(static_cast<size_t>(fineCount),
+                                 -std::numeric_limits<float>::infinity());
+  // Reporting cell of every fine point: the grid point whose cell centre is
+  // nearest. Cells are centred on the grid points, so a station sitting
+  // exactly on a grid point is attributed to that grid point and not to its
+  // left-hand neighbour.
+  std::vector<int> cellOfFine(static_cast<size_t>(fineCount), -1);
+  for (int n = 0; n < fineCount; n++) {
+    const int64_t fHz = gridStartHz + static_cast<int64_t>(n) * fineStepHz;
+    // floor((f - start + step/2) / step): the cell of the grid point whose
+    // centre (gridStart + c*step) is nearest to f.
+    const int64_t index =
+        (fHz - gridStartHz + cellStepHz / 2) / cellStepHz;
+    cellOfFine[static_cast<size_t>(n)] = static_cast<int>(index);
+  }
 
   if (iqSampleRate == 0) {
     if (!m_config.continuous || !m_active) {
@@ -157,17 +233,36 @@ bool ScanEngine::runIfActive(
   const int64_t preferredStepHz =
       static_cast<int64_t>(static_cast<double>(sampleRateHz) *
                            kCenterStepFraction);
+  // The capture centres must not land on a reporting grid point. The
+  // stations live on the grid, and the estimator rejects the bins around
+  // DC (they carry the tuner's own DC spike), so a capture centred on a
+  // station has the very carrier that matters removed from its own
+  // measurement window and the station disappears from the plot entirely.
+  //
+  // The centres therefore run half a cell away from every grid point, and
+  // their step is a whole number of cells so the phase never drifts back
+  // onto a grid point. Without this the sweep paints a repeating
+  // multi-value pattern whose period is the least common multiple of the
+  // cell step and the centre step: a positional artifact of the capture
+  // geometry, not a spectrum.
+  //
+  // The step is rounded DOWN to a whole number of cells so the captures
+  // keep the overlap they had before; rounding up would leave consecutive
+  // captures touching exactly, with the stations on the seam.
+  const int64_t baseStepHz = std::min(preferredStepHz, coverageCapHz);
   const int64_t centerStepHz = std::max<int64_t>(
-      static_cast<int64_t>(stepKHz) * 1000,
-      std::min(preferredStepHz, coverageCapHz));
-  // Place the first tune center one half-span above the requested start so
-  // the left edge of the first captured span lands at startKHz. Likewise the
-  // last allowed center sits one half-span above stopKHz, so a capture whose
-  // left edge reaches stopKHz is still considered in bounds.
-  int64_t centerHz =
-      static_cast<int64_t>(startKHz) * 1000 + usableHalfSpanHz;
-  const int64_t endCenterHz =
-      static_cast<int64_t>(stopKHz) * 1000 + usableHalfSpanHz;
+      cellStepHz, (baseStepHz / cellStepHz) * cellStepHz);
+  // The first centre of the half-cell phase class whose span still covers
+  // the start of the grid.
+  int64_t firstCenterHz = gridStartHz + (cellStepHz / 2);
+  while (firstCenterHz - usableHalfSpanHz > gridStartHz) {
+    firstCenterHz -= cellStepHz;
+  }
+  // The last centre whose span still reaches the end of the grid.
+  int64_t endCenterHz = firstCenterHz;
+  while (endCenterHz + centerStepHz + usableHalfSpanHz <= gridStopHz) {
+    endCenterHz += centerStepHz;
+  }
   const size_t scanReadSamples =
       std::min(sdrBufSamples, std::max<size_t>(8192, kScanReadSamplesCap));
 
@@ -188,8 +283,8 @@ bool ScanEngine::runIfActive(
   };
 
   auto estimateLevelsFromCapture =
-      [&](int64_t tunedCenterHz, size_t samples, int firstChannel,
-          int lastChannel, bool onlyMissing) -> bool {
+      [&](int64_t tunedCenterHz, size_t samples, int firstFine, int lastFine,
+          bool onlyMissing) -> bool {
     const size_t nfft = nearestPow2(std::min<size_t>(samples, 16384));
     if (nfft < 1024) {
       return false;
@@ -197,18 +292,30 @@ bool ScanEngine::runIfActive(
 
     const float binHz = static_cast<float>(iqSampleRate) /
                         static_cast<float>(nfft);
-    const int binHalf =
-        std::max(1, static_cast<int>(std::lround(
-                        (static_cast<float>(channelBandwidthHz) * 0.5f) / binHz)));
+    // The measurement integrates the FULL channel bandwidth, exactly like
+    // the signal meter does for the "S" line. The client mixes the two: it
+    // writes the meter's value straight into the scan plot
+    // (scan_update_value(tuner_get_freq(), tuner.signal)), so the scan and
+    // the meter have to be on the same scale or the tuned station jumps
+    // when it is added to the plot.
+    //
+    // Integrating only a narrow window instead would capture just a
+    // fraction of the channel's power and bias every station down by
+    // 10*log10(window/channel) — about 6 dB with the default settings.
+    const int binHalf = std::max(
+        1, static_cast<int>(std::lround(
+               (static_cast<float>(channelBandwidthHz) * 0.5f) / binHz)));
     const int dcRejectBins =
         std::max(1, static_cast<int>(std::lround(
                         static_cast<float>(kDcRejectHz) / std::max(binHz, 1.0f))));
     const int guardBins = std::max(
         1, static_cast<int>(std::lround(6000.0f / std::max(binHz, 1.0f))));
-    const int sideSpanBins =
-        std::max(binHalf, static_cast<int>(std::lround(
-                            (static_cast<float>(channelBandwidthHz) * 0.35f) /
-                            std::max(binHz, 1.0f))));
+    // The noise is estimated in a side band just outside the channel, over
+    // the same width as the channel itself.
+    const int sideSpanBins = std::max(
+        binHalf, static_cast<int>(std::lround(
+                      (static_cast<float>(channelBandwidthHz) * 0.5f) /
+                      std::max(binHz, 1.0f))));
     if (!m_fftState.ensureSize(nfft)) {
       return false;
     }
@@ -240,14 +347,13 @@ bool ScanEngine::runIfActive(
     const double nfftNorm =
         static_cast<double>(nfft) * static_cast<double>(nfft);
 
-    for (int ch = firstChannel; ch <= lastChannel; ch++) {
+    for (int n = firstFine; n <= lastFine; n++) {
       if (onlyMissing &&
-          std::isfinite(levelByChannel[static_cast<size_t>(ch)])) {
+          std::isfinite(levelByFine[static_cast<size_t>(n)])) {
         continue;
       }
 
-      const int freqKHz = startKHz + ch * stepKHz;
-      const int64_t fHz = static_cast<int64_t>(freqKHz) * 1000;
+      const int64_t fHz = gridStartHz + static_cast<int64_t>(n) * fineStepHz;
       if (fHz < spanLowHz || fHz > spanHighHz) {
         continue;
       }
@@ -323,8 +429,8 @@ bool ScanEngine::runIfActive(
       // spillover are still real signals worth seeing on the spectrum plot.
       (void)snrDb;
       const float level120 = absLevel120;
-      levelByChannel[static_cast<size_t>(ch)] =
-          std::max(levelByChannel[static_cast<size_t>(ch)], level120);
+      levelByFine[static_cast<size_t>(n)] =
+          std::max(levelByFine[static_cast<size_t>(n)], level120);
     }
 
     return true;
@@ -352,6 +458,25 @@ bool ScanEngine::runIfActive(
     }
   };
 
+  // Fold the fine measurements into the reporting cells the client asked
+  // for, and publish the result. A cell takes the strongest measurement
+  // inside it, so a station that sits between two grid points still lights
+  // up the cell that contains it.
+  auto foldFineIntoCells = [&]() {
+    for (int n = 0; n < fineCount; n++) {
+      const float fine = levelByFine[static_cast<size_t>(n)];
+      if (!std::isfinite(fine)) {
+        continue;
+      }
+      const int cell = cellOfFine[static_cast<size_t>(n)];
+      if (cell < 0 || cell >= channelCount) {
+        continue;
+      }
+      levelByChannel[static_cast<size_t>(cell)] =
+          std::max(levelByChannel[static_cast<size_t>(cell)], fine);
+    }
+  };
+
   // Build the "U" line for the channels measured so far and hand it to the
   // client. The xdr-gtk client REPLACES its dataset on every "U" line
   // (research/xdr-gtk/src/scan.c scan_update()) and never merges, so a line
@@ -365,12 +490,13 @@ bool ScanEngine::runIfActive(
   // from the comma count and drops the last entry when the comma is
   // missing (research/xdr-gtk/src/tuner-scan.c tuner_scan_parse()).
   auto pushPartialScanLine = [&]() {
+    foldFineIntoCells();
     std::ostringstream scanLine;
     for (int ch = 0; ch < channelCount; ch++) {
       const float rfLevel = levelByChannel[static_cast<size_t>(ch)];
       const float value = std::isfinite(rfLevel) ? rfLevel : 0.0f;
-      scanLine << (startKHz + ch * stepKHz) << "="
-               << std::fixed << std::setprecision(1) << value << ",";
+      scanLine << ((gridStartHz + static_cast<int64_t>(ch) * cellStepHz) / 1000)
+               << "=" << std::fixed << std::setprecision(1) << value << ",";
     }
     const std::string line = scanLine.str();
     if (!line.empty()) {
@@ -378,7 +504,8 @@ bool ScanEngine::runIfActive(
     }
   };
 
-  for (; centerHz <= endCenterHz; centerHz += centerStepHz) {
+  for (int64_t centerHz = firstCenterHz; centerHz <= endCenterHz;
+       centerHz += centerStepHz) {
     if (!shouldRun() || xdrServer.consumeScanCancel()) {
       m_active = false;
       break;
@@ -407,7 +534,7 @@ bool ScanEngine::runIfActive(
 
       writeIqCapture(iqBuffer, samples);
 
-      (void)estimateLevelsFromCapture(centerHz, samples, 0, channelCount - 1,
+      (void)estimateLevelsFromCapture(centerHz, samples, 0, fineCount - 1,
                                       false);
     }
 
@@ -417,24 +544,23 @@ bool ScanEngine::runIfActive(
     pushPartialScanLine();
   }
 
-  // Fallback for uncovered channels so the client receives complete scan lines.
-  // Batch contiguous uncovered channels into the largest span one retune can
-  // cover, instead of retuning once per missing channel.
-  for (int ch = 0; ch < channelCount;) {
-    if (std::isfinite(levelByChannel[static_cast<size_t>(ch)])) {
-      ch++;
+  // Fallback for uncovered fine points so the client receives complete scan
+  // lines. Batch contiguous uncovered points into the largest span one
+  // retune can cover, instead of retuning once per missing point.
+  for (int n = 0; n < fineCount;) {
+    if (std::isfinite(levelByFine[static_cast<size_t>(n)])) {
+      n++;
       continue;
     }
 
-    const int batchStart = ch;
-    const int64_t batchStartHz =
-        static_cast<int64_t>(startKHz + batchStart * stepKHz) * 1000;
+    const int batchStart = n;
+    const int64_t batchStartHz = gridStartHz + static_cast<int64_t>(n) * fineStepHz;
     const int64_t batchMaxStopHz = batchStartHz + (usableHalfSpanHz * 2);
     int batchEnd = batchStart;
-    while ((batchEnd + 1) < channelCount &&
-           !std::isfinite(levelByChannel[static_cast<size_t>(batchEnd + 1)])) {
+    while ((batchEnd + 1) < fineCount &&
+           !std::isfinite(levelByFine[static_cast<size_t>(batchEnd + 1)])) {
       const int64_t nextHz =
-          static_cast<int64_t>(startKHz + (batchEnd + 1) * stepKHz) * 1000;
+          gridStartHz + static_cast<int64_t>(batchEnd + 1) * fineStepHz;
       if (nextHz > batchMaxStopHz) {
         break;
       }
@@ -442,7 +568,7 @@ bool ScanEngine::runIfActive(
     }
 
     const int64_t batchEndHz =
-        static_cast<int64_t>(startKHz + batchEnd * stepKHz) * 1000;
+        gridStartHz + static_cast<int64_t>(batchEnd) * fineStepHz;
     const uint32_t batchCenterHz =
         static_cast<uint32_t>((batchStartHz + batchEndHz) / 2);
 
@@ -450,9 +576,9 @@ bool ScanEngine::runIfActive(
       std::cerr << "[SCAN] warning: failed to retune to "
                 << (batchCenterHz / 1000) << " kHz during fallback sampling\n";
       for (int missing = batchStart; missing <= batchEnd; missing++) {
-        levelByChannel[static_cast<size_t>(missing)] = 0.0f;
+        levelByFine[static_cast<size_t>(missing)] = 0.0f;
       }
-      ch = batchEnd + 1;
+      n = batchEnd + 1;
       continue;
     }
     settleAfterRetune();
@@ -467,9 +593,9 @@ bool ScanEngine::runIfActive(
     }
     if (samples == 0) {
       for (int missing = batchStart; missing <= batchEnd; missing++) {
-        levelByChannel[static_cast<size_t>(missing)] = 0.0f;
+        levelByFine[static_cast<size_t>(missing)] = 0.0f;
       }
-      ch = batchEnd + 1;
+      n = batchEnd + 1;
       continue;
     }
 
@@ -477,11 +603,12 @@ bool ScanEngine::runIfActive(
     if (!estimateLevelsFromCapture(batchCenterHz, samples, batchStart, batchEnd,
                                    true)) {
       for (int missing = batchStart; missing <= batchEnd; missing++) {
-        const int freqKHz = startKHz + missing * stepKHz;
-        if (!tunerSetFrequency(static_cast<uint32_t>(freqKHz) * 1000U)) {
-          std::cerr << "[SCAN] warning: failed to retune to " << freqKHz
+        const int64_t fineHz =
+            gridStartHz + static_cast<int64_t>(missing) * fineStepHz;
+        if (!tunerSetFrequency(static_cast<uint32_t>(fineHz))) {
+          std::cerr << "[SCAN] warning: failed to retune to " << (fineHz / 1000)
                     << " kHz during per-channel fallback sampling\n";
-          levelByChannel[static_cast<size_t>(missing)] = 0.0f;
+          levelByFine[static_cast<size_t>(missing)] = 0.0f;
           continue;
         }
         settleAfterRetune();
@@ -495,7 +622,7 @@ bool ScanEngine::runIfActive(
           }
         }
         if (singleSamples == 0) {
-          levelByChannel[static_cast<size_t>(missing)] = 0.0f;
+          levelByFine[static_cast<size_t>(missing)] = 0.0f;
           continue;
         }
         writeIqCapture(iqBuffer, singleSamples);
@@ -504,16 +631,16 @@ bool ScanEngine::runIfActive(
             signalGainCompFactor, sdrConfig.signal_bias_db,
             sdrConfig.signal_floor_dbfs, sdrConfig.signal_ceil_dbfs,
             iqSampleRate, channelBandwidthHz);
-        levelByChannel[static_cast<size_t>(missing)] = signal.level120;
+        levelByFine[static_cast<size_t>(missing)] = signal.level120;
       }
     }
 
     for (int missing = batchStart; missing <= batchEnd; missing++) {
-      if (!std::isfinite(levelByChannel[static_cast<size_t>(missing)])) {
-        levelByChannel[static_cast<size_t>(missing)] = 0.0f;
+      if (!std::isfinite(levelByFine[static_cast<size_t>(missing)])) {
+        levelByFine[static_cast<size_t>(missing)] = 0.0f;
       }
     }
-    ch = batchEnd + 1;
+    n = batchEnd + 1;
   }
 
   // Final pass: the fallback sampling above has filled in the channels the

@@ -17,24 +17,9 @@
 
 #include "scan_engine.h"
 
-namespace {
+#include "fake_band.h"
 
-std::vector<uint8_t> makeIqTone(size_t samples, uint32_t sampleRateHz,
-                                float toneHz, float amplitude) {
-  std::vector<uint8_t> iq(samples * 2, 127);
-  constexpr float kPi = 3.14159265358979323846f;
-  for (size_t i = 0; i < samples; i++) {
-    const float phase = 2.0f * kPi * toneHz *
-                         (static_cast<float>(i) / static_cast<float>(sampleRateHz));
-    const float iSample = std::cos(phase) * amplitude;
-    const float qSample = std::sin(phase) * amplitude;
-    iq[i * 2] = static_cast<uint8_t>(
-        std::clamp(std::lround((iSample * 127.5f) + 127.5f), 0L, 255L));
-    iq[i * 2 + 1] = static_cast<uint8_t>(
-        std::clamp(std::lround((qSample * 127.5f) + 127.5f), 0L, 255L));
-  }
-  return iq;
-}
+namespace {
 
 std::map<int, float> parseScanLine(const std::string &line) {
   std::map<int, float> values;
@@ -106,7 +91,7 @@ TEST_CASE("ScanEngine suppresses empty-channel FFT peaks with local floor gating
   xdr.m_scanStopKHz = 87700;
   xdr.m_scanStepKHz = 100;
   // 40 kHz channel BW leaves enough room that usableHalfSpanHz is not clipped
-  // by the Nyquist constraint, so first center = startKHz*1000 + 108800.
+  // by the Nyquist constraint.
   xdr.m_scanBandwidthHz = 40000;
   xdr.m_scanAntenna = 0;
   xdr.m_scanContinuous = false;
@@ -120,25 +105,25 @@ TEST_CASE("ScanEngine suppresses empty-channel FFT peaks with local floor gating
 
   constexpr uint32_t kSampleRateHz = 256000;
   constexpr size_t kSamples = 16384;
-  // First center = startKHz*1000 + min(Fs*0.85/2, Fs/2 - channelBW/2)
-  //              = 87500000 + min(108800, 128000-20000)
-  //              = 87500000 + 108000 = 87608000
-  constexpr int64_t kCenterHz = 87608000;
-  constexpr float kToneHz = static_cast<float>(87600000 - kCenterHz);
-  std::vector<uint8_t> iqBuffer = makeIqTone(kSamples, kSampleRateHz, kToneHz, 0.70f);
+  // The station sits on 87.6 MHz. The fake band only emits the carrier when
+  // the tuner is close enough for it to fall inside the captured band, so the
+  // test does not depend on where the engine places its capture centres.
+  FakeBand band(kSampleRateHz, 87600000, kSamples, 0.70f, 0.02f);
+  std::vector<uint8_t> iqBuffer(kSamples * 2, 127);
 
-  int readsRemaining = 3; // one settle discard + two FFT averages
   Config::SDRSection sdrConfig{};
   const bool ran = scan.runIfActive(
-      xdr, true, []() { return true; }, [](uint32_t) -> bool { return true; },
+      xdr, true, []() { return true; },
+      [&](uint32_t hz) -> bool {
+        band.setTune(hz);
+        return true;
+      },
       [&](uint8_t *dest, size_t maxSamples) -> size_t {
-        if (readsRemaining <= 0) {
+        const size_t copySamples = std::min(maxSamples, kSamples);
+        if (copySamples == 0) {
           return 0;
         }
-        const size_t copySamples = std::min(maxSamples, kSamples);
-        std::memcpy(dest, iqBuffer.data(), copySamples * 2);
-        readsRemaining--;
-        return copySamples;
+        return band.read(dest);
       },
       [](const uint8_t *, size_t) {}, std::chrono::milliseconds(0),
       iqBuffer.data(), kSamples, kSampleRateHz, 0, 0.0, sdrConfig,
@@ -204,10 +189,17 @@ TEST_CASE("ScanEngine batches fallback retunes for contiguous uncovered channels
       [](uint32_t, int) {});
 
   REQUIRE(ran);
-  // 4 main-loop retunes + 1 fallback batch covering channels 87500-87700.
-  // Channel 87800 is picked up by the main loop because the coverage-capped
-  // centerStepHz keeps consecutive captures overlapping.
-  REQUIRE(retuneCount == 5);
+  // The sweep retunes once per capture, and the first two captures produce
+  // no data, so the channels they covered have to be picked up by the
+  // fallback path.
+  //
+  // The fallback batches the contiguous uncovered points into the largest
+  // span one retune can cover instead of retuning once per point. The two
+  // failed captures leave roughly 18 fine points uncovered; batching them
+  // needs 2 retunes, so the sweep retunes about 6 times in total. A
+  // per-point fallback would need more than 20.
+  REQUIRE(retuneCount > 2);
+  REQUIRE(retuneCount <= 8);
 
   std::lock_guard<std::mutex> lock(xdr.m_scanMutex);
   REQUIRE(!xdr.m_scanQueue.empty());

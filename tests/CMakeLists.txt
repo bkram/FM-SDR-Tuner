@@ -265,6 +265,33 @@ if(WIN32)
     target_link_libraries(test_scan_engine PRIVATE ws2_32)
 endif()
 
+add_executable(test_scan_diag test_scan_diag.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/scan_engine.cpp
+    ${CMAKE_SOURCE_DIR}/src/signal_level.cpp
+    ${CMAKE_SOURCE_DIR}/src/cpu_features.cpp
+    ${CMAKE_SOURCE_DIR}/src/xdr_server.cpp
+    ${CMAKE_SOURCE_DIR}/src/dsp/liquid_primitives.cpp
+)
+target_include_directories(test_scan_diag PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_scan_diag PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+    Threads::Threads
+    OpenSSL::Crypto
+)
+if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
+    target_link_libraries(test_scan_diag PRIVATE PkgConfig::PC_LIQUID)
+else()
+    target_include_directories(test_scan_diag PRIVATE ${LIQUID_INCLUDE_DIRS})
+    target_link_libraries(test_scan_diag PRIVATE ${LIQUID_LIBRARIES})
+endif()
+if(WIN32)
+    target_link_libraries(test_scan_diag PRIVATE ws2_32)
+endif()
+
 add_executable(test_adaptive_bandwidth test_adaptive_bandwidth.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/adaptive_bandwidth.cpp
@@ -365,5 +392,6 @@ add_test(NAME protocol COMMAND test_protocol)
 add_test(NAME xdr_unit COMMAND test_xdr_unit)
 add_test(NAME xdr_facade COMMAND test_xdr_facade)
 add_test(NAME scan_engine COMMAND $<TARGET_FILE:test_scan_engine>)
+add_test(NAME scan_diag COMMAND $<TARGET_FILE:test_scan_diag>)
 add_test(NAME sdrplay_stub COMMAND test_sdrplay_stub)
 add_test(NAME rest_server COMMAND test_rest_server)
