@@ -1,0 +1,94 @@
+# Site profile for the FM-SDR-Tuner.
+#
+# This is the file the tuner reads with `-c fm-sdr-tuner.ini`. It is based on
+# the shipped defaults, with the settings that were wrong for a European FM
+# band corrected, and the spectral scan put on the scale the xdr-gtk client
+# draws.
+#
+# Copy it to `fm-sdr-tuner.ini` and adjust the [sdr] gain and meter window
+# for your own antenna — see the "Setup And Tuning Guide" in README.md, and
+# run `./build/fm-sdr-tuner --calibrate` once with the antenna connected to
+# get copy-paste-ready values for signal_floor_dbfs / signal_ceil_dbfs.
+
+[tuner]
+source = rtl_sdr
+default_freq = 96200
+deemphasis = 0
+
+[sdr]
+# TEF-like gain behaviour with the auto clip-protect loop. This is the
+# stable default for an indoor telescopic antenna.
+gain_strategy = tef
+rtl_gain_db = -1
+default_custom_gain_flags = 1
+
+# RTL dongles are typically off by a few hundred Hz to a few kHz. If the
+# station you tune to is consistently sharp or flat, set this to the
+# dongle's measured offset in ppm. The scan plot is index-based, so a
+# wrong frequency correction shows up as every station in the plot
+# sitting slightly off its true position.
+freq_correction_ppm = 0
+
+# Meter calibration window: maps compensated dBFS to the 0..120 level.
+# The defaults below are the wide, safe window. Run --calibrate and paste
+# its recommendation here for a site-specific scale.
+signal_floor_dbfs = -65.0
+signal_ceil_dbfs = -5.0
+signal_bias_db = 0.0
+
+# Spectral-scan plot scale. The xdr-gtk client draws the scan in a FIXED
+# 3..84 window and clips everything outside it, so the scan line is
+# remapped onto that window. Without this, every station above -23 dBFS
+# is pinned flat against the top of the plot.
+#
+# The "S" line and the REST status keep the 0..120 scale on purpose: the
+# webserver's dBm mode subtracts 120 and the plugin shows the value out
+# of 120, and the client writes the meter's value straight into the scan
+# plot, so the two scales have to stay comparable.
+scan_use_client_window = true
+scan_client_min_level = 3.0
+scan_client_max_level = 84.0
+
+low_latency_iq = false
+
+[audio]
+enable_audio = true
+startup_volume = 100
+
+[processing]
+# Stable middle ground. Verify the gain is not clipping before judging
+# the stereo behaviour.
+agc_mode = 2
+
+# 194 kHz is the correct starting point for normal WFM stereo. Narrow it
+# (168000 / 151000 / 133000) only for adjacent-channel trouble.
+w0_bandwidth_hz = 194000
+
+dsp_agc = off
+stereo_blend = aggressive
+stereo = true
+pilot_canceller = true
+
+# Adaptive features stay off until the baseline is stable: with them on,
+# the bandwidth and the stereo filtering change under you while you are
+# judging the sound.
+hicut = off
+adaptive_bandwidth = off
+multipath_eq = off
+
+# The scan and the meter are already calibrated for this site; do not let
+# a client move the gain underneath them.
+client_gain_allowed = false
+
+[xdr]
+port = 7373
+
+[rest]
+# The fm-dx-webserver plugin talks to this port. Bind to localhost.
+enabled = false
+port = 9090
+bind_address = 127.0.0.1
+
+[reconnection]
+
+[debug]
