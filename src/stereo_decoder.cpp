@@ -23,7 +23,6 @@ constexpr float kPilotCoherenceAcquire = 0.18f;
 constexpr float kPilotCoherenceHold = 0.11f;
 constexpr float kPilotResidualAcquire = 0.95f;
 constexpr float kPilotResidualHold = 1.05f;
-constexpr float kPllLockAcquireHz = 180.0f;
 constexpr float kPllLockHoldHz = 320.0f;
 constexpr float kPilotRatioQualityFloor = 0.080f;
 constexpr float kPilotRatioQualityCeil = 0.110f;

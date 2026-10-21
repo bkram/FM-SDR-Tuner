@@ -180,7 +180,11 @@ void FIRFilter::reset() {
         initWithTaps(m_taps, m_scale);
         return;
     }
-    init(m_length, m_cutoff, m_stopBandAtten, m_center);
+    // The L1-normalize flag must be forwarded: dropping it here silently
+    // rebuilt the filter on the plain Kaiser path, so the iq_fir_l1_normalize
+    // setting had no effect on any filter that had been reset (and every
+    // filter is reset on a retune).
+    init(m_length, m_cutoff, m_stopBandAtten, m_center, m_l1Normalize);
 }
 
 void FIRFilter::push(std::complex<float> sample) const {

@@ -9,6 +9,7 @@
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -35,6 +36,36 @@ using SocketLen = socklen_t;
 #endif
 
 constexpr size_t kMaxClientCommandLen = 1024;
+
+// The widest channel bandwidth the tuner accepts from a client. The
+// signal-meter estimator analyses the channel with an FFT whose length is
+// capped at 8192 points; beyond roughly the sample rate the side-band window
+// wraps back over the channel and the meter measures the signal as its own
+// noise floor. The tuner runs at 256 kHz, so a bandwidth at or above the
+// sample rate is never a meaningful request.
+constexpr int kMaxChannelBandwidthHz = 256000;
+
+// The XDR protocol carries frequencies in kHz: xdr-gtk sends "T101700" for
+// 101.7 MHz and research/xdrd/xdrd.c stores it verbatim (atoi) as kHz. Some
+// non-standard clients send Hz instead, so a 'T' argument at or above this
+// value is taken as Hz. The FM broadcast band starts at 64 MHz = 64000 kHz,
+// so the crossover sits far below any legitimate FM frequency.
+constexpr unsigned long long kHzToHzCrossover = 1000000ULL;
+
+// Protocol detection: how long to keep waiting for the client's first byte,
+// and how long each individual peek waits. The FM-DX client speaks first (it
+// sends its "x" handshake immediately on connect); the XDR client waits for
+// the server's salt and sends nothing, so a client that has not spoken yet is
+// assumed to be an XDR client. The window therefore has to be long enough
+// that a slow FM-DX client is still recognised, and short enough that it
+// fits inside the reference client's own salt timeout
+// (research/xdr-gtk/src/tuner-conn.h: SOCKET_AUTH_TIMEOUT == 5 s).
+constexpr int kProtocolDetectTimeoutMs = 1000;
+constexpr int kProtocolDetectPollMs = 50;
+
+// The FM-DX handshake line and the XDR auth hash must both arrive promptly;
+// without a deadline a stalled client pins its thread forever.
+constexpr int kHandshakeTimeoutMs = 5000;
 
 uint64_t steadyNowMs() {
   return static_cast<uint64_t>(
@@ -91,6 +122,31 @@ void shutdownSocket(int sock) {
 #endif
 }
 
+// Wait until the socket has data (or the timeout elapses). Used to avoid
+// blocking in accept(): shutdown() on a listening socket does not reliably
+// wake a blocked accept() on macOS/BSD, so a poll-based wait is what lets
+// the accept loop notice the shutdown request.
+bool waitForReadable(int sock, int timeoutMs) {
+#if defined(_WIN32)
+  fd_set readSet;
+  FD_ZERO(&readSet);
+  FD_SET(static_cast<SOCKET>(sock), &readSet);
+  timeval tv;
+  tv.tv_sec = timeoutMs / 1000;
+  tv.tv_usec = (timeoutMs % 1000) * 1000;
+  const int ready =
+      select(0, &readSet, nullptr, nullptr, &tv); // ignore fd on Windows
+  return ready > 0;
+#else
+  struct pollfd pfd;
+  pfd.fd = sock;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  const int ready = poll(&pfd, 1, timeoutMs);
+  return ready > 0;
+#endif
+}
+
 int lastSocketError() {
 #if defined(_WIN32)
   return WSAGetLastError();
@@ -112,14 +168,6 @@ bool socketWouldBlock(int err) {
   return err == WSAEWOULDBLOCK || err == WSAETIMEDOUT;
 #else
   return err == EAGAIN || err == EWOULDBLOCK;
-#endif
-}
-
-bool equalsIgnoreCase(const std::string &a, const std::string &b) {
-#if defined(_WIN32)
-  return _stricmp(a.c_str(), b.c_str()) == 0;
-#else
-  return strcasecmp(a.c_str(), b.c_str()) == 0;
 #endif
 }
 
@@ -146,12 +194,17 @@ bool recvLine(int clientSocket, std::string &line, size_t maxLen) {
   return false;
 }
 
+// The single place the protocol's command-length limit is expressed. Both
+// the accumulated-buffer pre-check and the per-line check call this, so the
+// effective limit cannot drift between the two.
+bool lineExceedsLimit(size_t length) { return length > kMaxClientCommandLen; }
+
 bool commandBufferOverflowed(const std::string &commandBuffer) {
   const size_t newlinePos = commandBuffer.find('\n');
   if (newlinePos != std::string::npos) {
-    return newlinePos > kMaxClientCommandLen;
+    return lineExceedsLimit(newlinePos);
   }
-  return commandBuffer.size() > kMaxClientCommandLen;
+  return lineExceedsLimit(commandBuffer.size());
 }
 
 bool parseIntValue(const std::string &arg, int &out) {
@@ -192,8 +245,12 @@ bool parseFrequencyHz(const std::string &arg, uint32_t &outHz) {
     if (parsed != arg.size() || raw == 0) {
       return false;
     }
-    // xdr-gtk uses kHz; some clients use Hz. Accept both.
-    if (raw < 1000000ULL) {
+    // The XDR protocol is kHz-based: xdr-gtk sends "T101700" for 101.7 MHz
+    // and research/xdrd/xdrd.c stores it verbatim (atoi) as kHz. Some
+    // non-standard clients send Hz instead, so a value at or above 1 MHz is
+    // taken as Hz and anything below as kHz. The FM broadcast band starts at
+    // 64 MHz, so no legitimate kHz value is ever near the 1 MHz crossover.
+    if (raw < kHzToHzCrossover) {
       raw *= 1000ULL;
     }
     if (raw > 0xFFFFFFFFULL) {
@@ -275,14 +332,14 @@ void XDRServer::removeClientSocket(int clientSocket) {
 }
 
 void XDRServer::joinClientThreads() {
-  std::vector<std::thread> threads;
+  std::vector<std::shared_ptr<ClientThread>> entries;
   {
     std::lock_guard<std::mutex> lock(m_clientThreadsMutex);
-    threads.swap(m_clientThreads);
+    entries.swap(m_clientThreads);
   }
-  for (std::thread &thread : threads) {
-    if (thread.joinable()) {
-      thread.join();
+  for (const auto &entry : entries) {
+    if (entry->thread.joinable()) {
+      entry->thread.join();
     }
   }
 }
@@ -513,18 +570,63 @@ void XDRServer::updateRDS(uint16_t blockA, uint16_t blockB, uint16_t blockC,
   m_piLastState = piState;
 }
 
+void XDRServer::resetPiHistory() {
+  std::lock_guard<std::mutex> lock(m_rdsMutex);
+  m_piFill = 0;
+  m_piPos = 63;
+  m_piBuffer.fill(0);
+  m_piErrorBuffer.fill(0);
+  m_piLastState = 4;
+  m_piLastValue = 0xFFFF;
+}
+
+void XDRServer::addOnlineClient(bool authenticated) {
+  if (authenticated) {
+    m_onlineAuth.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    m_onlineGuest.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void XDRServer::removeOnlineClient(bool authenticated) {
+  if (authenticated) {
+    m_onlineAuth.fetch_sub(1, std::memory_order_relaxed);
+  } else {
+    m_onlineGuest.fetch_sub(1, std::memory_order_relaxed);
+  }
+}
+
+std::string XDRServer::onlineLine() const {
+  return "o" + std::to_string(m_onlineAuth.load(std::memory_order_relaxed)) +
+         "," + std::to_string(m_onlineGuest.load(std::memory_order_relaxed));
+}
+
+void XDRServer::broadcastOnlineLine() {
+  // The reference daemon pushes the updated count to every client when a
+  // peer connects or disconnects (research/xdrd/xdrd.c:561, :597). A client
+  // that only reads the line on connect would otherwise never learn that
+  // somebody else joined or left.
+  std::string line = onlineLine() + "\n";
+  std::vector<int> sockets;
+  {
+    std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
+    sockets = m_clientSockets;
+  }
+  for (int sock : sockets) {
+    sendSocket(sock, line.c_str(), line.length());
+  }
+}
+
 void XDRServer::setFrequencyState(uint32_t freqHz) {
   if (freqHz == 0) {
     return;
   }
-  if (freqHz != m_frequency) {
-    std::lock_guard<std::mutex> lock(m_rdsMutex);
-    m_piFill = 0;
-    m_piPos = 63;
-    m_piBuffer.fill(0);
-    m_piErrorBuffer.fill(0);
-    m_piLastState = 4;
-    m_piLastValue = 0xFFFF;
+  // Compare against the last frequency this function was told about, not
+  // against m_frequency: the 'T' command handler publishes m_frequency itself
+  // before this runs, so comparing to m_frequency would never see a change.
+  if (freqHz != m_lastAppliedFrequency) {
+    m_lastAppliedFrequency = freqHz;
+    resetPiHistory();
   }
   m_frequency = freqHz;
 }
@@ -567,20 +669,21 @@ bool XDRServer::start() {
     return false;
   }
 
-  m_serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-  if (m_serverSocket < 0) {
+  const int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+  if (serverSocket < 0) {
     std::cerr << "[XDR] failed to create server socket (err=" << lastSocketError()
               << ")" << "\n";
     return false;
   }
+  m_serverSocket = serverSocket;
 
   int opt = 1;
 #if defined(_WIN32)
-  setsockopt(m_serverSocket, SOL_SOCKET, SO_REUSEADDR,
+  setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR,
              reinterpret_cast<const char *>(&opt),
              static_cast<int>(sizeof(opt)));
 #else
-  setsockopt(m_serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #endif
 
   struct sockaddr_in serverAddr;
@@ -589,19 +692,19 @@ bool XDRServer::start() {
   serverAddr.sin_addr.s_addr = INADDR_ANY;
   serverAddr.sin_port = htons(m_port);
 
-  if (bind(m_serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) <
+  if (bind(serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) <
       0) {
     std::cerr << "[XDR] failed to bind to port " << m_port
               << " (err=" << lastSocketError() << ")" << "\n";
-    closeSocket(m_serverSocket);
+    closeSocket(serverSocket);
     m_serverSocket = -1;
     return false;
   }
 
-  if (listen(m_serverSocket, 5) < 0) {
+  if (listen(serverSocket, 5) < 0) {
     std::cerr << "[XDR] failed to listen on port " << m_port
               << " (err=" << lastSocketError() << ")" << "\n";
-    closeSocket(m_serverSocket);
+    closeSocket(serverSocket);
     m_serverSocket = -1;
     return false;
   }
@@ -609,22 +712,53 @@ bool XDRServer::start() {
   m_running = true;
   m_acceptThread = std::thread([this]() {
     while (m_running) {
+      const int serverSocket = m_serverSocket.load();
+      if (serverSocket < 0) {
+        break;
+      }
+      // Wait for a connection with poll() rather than blocking in accept():
+      // shutdown() on a *listening* socket does not reliably wake a blocked
+      // accept() (notably on macOS/BSD), so a blocking accept() would hang
+      // stop() forever. poll() returns on the timeout, which lets the loop
+      // re-check m_running and exit promptly.
+      if (!waitForReadable(serverSocket, 200)) {
+        continue;
+      }
+
       struct sockaddr_in clientAddr;
       SocketLen clientLen = sizeof(clientAddr);
       int clientSocket =
-          accept(m_serverSocket, (struct sockaddr *)&clientAddr, &clientLen);
+          accept(serverSocket, (struct sockaddr *)&clientAddr, &clientLen);
 
       if (clientSocket >= 0) {
         addClientSocket(clientSocket);
-        std::lock_guard<std::mutex> lock(m_clientThreadsMutex);
-        m_clientThreads.emplace_back([this, clientSocket]() {
+        auto entry = std::make_shared<ClientThread>();
+        std::thread worker([this, clientSocket, entry]() {
           handleClient(clientSocket);
           removeClientSocket(clientSocket);
           closeSocket(clientSocket);
+          entry->done.store(true, std::memory_order_release);
         });
+        {
+          std::lock_guard<std::mutex> lock(m_clientThreadsMutex);
+          entry->thread = std::move(worker);
+          m_clientThreads.push_back(entry);
+        }
+        // Reap the threads of clients that have already disconnected. A
+        // std::thread whose function returned but which was never joined still
+        // holds its stack, so leaving them in the vector leaks one stack per
+        // connection for the lifetime of the process.
+        reapFinishedClientThreads();
       } else if (m_running && socketInterrupted(lastSocketError())) {
         continue;
       }
+    }
+    // The accept thread owns the listening socket's close: stop() only
+    // shutdown()s it, so the fd can never be closed and reused underneath a
+    // concurrent accept() call.
+    const int listeningSocket = m_serverSocket.exchange(-1);
+    if (listeningSocket >= 0) {
+      closeSocket(listeningSocket);
     }
   });
 
@@ -634,6 +768,29 @@ bool XDRServer::start() {
   return true;
 }
 
+void XDRServer::reapFinishedClientThreads() {
+  // Collect the finished threads under the lock, then join them outside it:
+  // join() can block, and holding the lock would stall the accept loop.
+  std::vector<std::shared_ptr<ClientThread>> finished;
+  {
+    std::lock_guard<std::mutex> lock(m_clientThreadsMutex);
+    auto it = m_clientThreads.begin();
+    while (it != m_clientThreads.end()) {
+      if ((*it)->done.load(std::memory_order_acquire)) {
+        finished.push_back(*it);
+        it = m_clientThreads.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (const auto &entry : finished) {
+    if (entry->thread.joinable()) {
+      entry->thread.join();
+    }
+  }
+}
+
 void XDRServer::stop() {
   if (!m_running) {
     return;
@@ -641,10 +798,13 @@ void XDRServer::stop() {
 
   m_running = false;
 
-  if (m_serverSocket >= 0) {
-    shutdownSocket(m_serverSocket);
-    closeSocket(m_serverSocket);
-    m_serverSocket = -1;
+  // shutdown() only — the accept thread performs the close(), so the fd is
+  // never closed (and potentially reused) while accept() is in flight. The
+  // accept loop waits with poll(), so it notices m_running going false and
+  // returns within one poll interval.
+  const int serverSocket = m_serverSocket.load();
+  if (serverSocket >= 0) {
+    shutdownSocket(serverSocket);
   }
 
   std::vector<int> clients;
@@ -672,28 +832,53 @@ void XDRServer::handleClient(int clientSocket) {
 
   std::cout << "[XDR] client connected from " << clientIP << "\n";
 
-  setRecvTimeoutMs(clientSocket, 200);
+  // Protocol detection: the FM-DX client opens with an "x" handshake line,
+  // the XDR client waits for the server's salt. Peek with a generous timeout
+  // and keep waiting while nothing has arrived, rather than falling through
+  // to the XDR path on the first timeout: a client that is merely slow to
+  // send its first byte would otherwise be misclassified as an XDR client
+  // and then handed a salt it does not understand.
+  const auto detectDeadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(
+                                              kProtocolDetectTimeoutMs);
+  setRecvTimeoutMs(clientSocket, kProtocolDetectPollMs);
   char firstByte = '\0';
-  const auto n = recv(clientSocket, &firstByte, 1, MSG_PEEK);
+  ssize_t n = 0;
+  while (m_running) {
+    n = recv(clientSocket, &firstByte, 1, MSG_PEEK);
+    if (n > 0) {
+      break;
+    }
+    if (n == 0) {
+      break; // peer closed before saying anything
+    }
+    if (!socketWouldBlock(lastSocketError())) {
+      break; // hard error
+    }
+    // Timed out with nothing to read: keep waiting for the client's first
+    // byte, but bound the total wait so a silent peer cannot pin the thread.
+    if (std::chrono::steady_clock::now() >= detectDeadline) {
+      break;
+    }
+  }
   setRecvTimeoutMs(clientSocket, 0);
 
-  bool isFmdxProtocol = (n > 0 && firstByte == 'x');
+  const bool isFmdxProtocol = (n > 0 && firstByte == 'x');
 
   if (isFmdxProtocol) {
-    // Consume the initial FM-DX handshake line ("x") before command mode.
-    std::string handshake;
-    if (!recvLine(clientSocket, handshake, 16) || handshake != "x") {
-      if (m_verboseLogging.load()) {
-        std::cout << "[XDR] invalid FM-DX handshake payload" << "\n";
-      }
-      std::cout << "[XDR] client disconnected from " << clientIP << "\n";
-      return;
-    }
     if (m_verboseLogging.load()) {
       std::cout << "[XDR] detected FM-DX protocol handshake" << "\n";
     }
-    sendSocket(clientSocket, "1\n", 2);
-    handleFmdxClient(clientSocket);
+    // The "x" startup line is *not* consumed here. The reference FM-DX
+    // client sends it exactly once, in its startup handshake, and expects
+    // the server to answer "\nOK\n" before it enters its command loop
+    // (research/FM-DX-Tuner/src/Controllers/Dispatcher/Dispatcher.cpp:66
+    // — Dispatcher::await() reads until it sees FMDX_TUNER_PROTOCOL_STARTUP
+    // and then returns; the reply comes from cbStartup). Consuming the "x"
+    // here and replying "1" meant the command loop never saw the startup
+    // line, so tunerStarted stayed false and every subsequent command was
+    // answered "ER" — the client could never start or tune the radio.
+    handleFmdxClient(clientSocket, clientIP);
   } else {
     if (m_verboseLogging.load()) {
       std::cout << "[XDR] detected XDR protocol handshake" << "\n";
@@ -704,17 +889,58 @@ void XDRServer::handleClient(int clientSocket) {
   std::cout << "[XDR] client disconnected from " << clientIP << "\n";
 }
 
-void XDRServer::handleFmdxClient(int clientSocket) {
+void XDRServer::handleFmdxClient(int clientSocket, const char *clientIP) {
   bool tunerStarted = false;
   bool disconnectRequested = false;
   char cmdBuffer[256];
   std::string command;
   setRecvTimeoutMs(clientSocket, 200);
 
+  // The FM-DX protocol has no challenge/response of its own, but the tuner
+  // still has to be protected by the configured password. A client that
+  // presents a wrong hash — or no hash at all when a password is set — is
+  // refused here, before any command reaches the tuner.
+  //
+  // The FM-DX startup sequence is: the client sends "x", the server replies
+  // "\nOK\n" (Dispatcher::cbStartup), and the client then sends its commands.
+  // The XDR salt/hash exchange is inserted between those two steps: the
+  // server sends its salt right after the startup reply and expects the
+  // 40-character hash before accepting any further command.
+  //
+  // A client that never sends "x" (the reference sends it exactly once, in
+  // its startup handshake) is refused.
+  bool authenticated = false;
+  bool awaitingAuth = false;
+  if (!m_password.empty()) {
+    // A password is configured: the salt/hash exchange is mandatory.
+    awaitingAuth = true;
+  } else {
+    // No password: guest mode. The client is still allowed to command the
+    // tuner, matching the XDR path's behaviour with an empty password.
+    authenticated = true;
+  }
+  // The very first line must be the startup "x" and nothing else. A first
+  // line that is some other payload is not a valid FM-DX client, and a
+  // first line that is oversized is rejected outright.
+  bool sawStartupLine = false;
+  // The salt sent with the startup reply, and the deadline by which the
+  // client must answer with the matching hash.
+  std::string fmdxSalt;
+  auto fmdxAuthDeadline =
+      std::chrono::steady_clock::time_point::max();
+
   while (m_running && !disconnectRequested) {
     const auto n = recv(clientSocket, cmdBuffer, sizeof(cmdBuffer) - 1, 0);
     if (n < 0) {
       if (socketWouldBlock(lastSocketError())) {
+        // A client that stalls during the auth exchange is dropped once the
+        // handshake deadline passes, so it cannot pin this thread.
+        if (awaitingAuth &&
+            std::chrono::steady_clock::now() >= fmdxAuthDeadline) {
+          std::cout << "[XDR] FM-DX client disconnected before sending auth "
+                       "hash\n";
+          break;
+        }
         continue;
       }
       break;
@@ -735,7 +961,7 @@ void XDRServer::handleFmdxClient(int clientSocket) {
 
     size_t pos;
     while ((pos = command.find('\n')) != std::string::npos) {
-      if (pos > kMaxClientCommandLen) {
+      if (lineExceedsLimit(pos)) {
         if (m_verboseLogging.load()) {
           std::cout << "[XDR] closing FM-DX client due to oversized command line"
                     << "\n";
@@ -750,13 +976,91 @@ void XDRServer::handleFmdxClient(int clientSocket) {
         line.pop_back();
       }
 
+      if (!sawStartupLine) {
+        // The first line has to be the startup "x". Anything else means this
+        // is not an FM-DX client after all (the protocol detection only
+        // looked at the first *byte*).
+        sawStartupLine = true;
+        if (line != "x") {
+          if (m_verboseLogging.load()) {
+            std::cout << "[XDR] invalid FM-DX handshake payload" << "\n";
+          }
+          setRecvTimeoutMs(clientSocket, 0);
+          return;
+        }
+      }
+
       if (line == "x") {
+        if (tunerStarted) {
+          // A second "x" is a duplicate startup line. Answer it the same
+          // way so a client that re-sends the handshake is not left waiting.
+          sendSocket(clientSocket, "\nOK\n", 4);
+          continue;
+        }
         tunerStarted = true;
         if (m_startCallback) {
           m_startCallback();
         }
-        sendSocket(clientSocket, "1\n", 2);
-      } else if (line == "X") {
+        // The reference client's startup reply is "\nOK\n"
+        // (Dispatcher::cbStartup). "1" was never part of the protocol.
+        sendSocket(clientSocket, "\nOK\n", 4);
+
+        if (awaitingAuth) {
+          // Send the salt and require the hash before any further command.
+          std::string salt = generateSalt();
+          if (salt.empty()) {
+            // Secure RNG unavailable: fail closed.
+            std::cout << "[XDR] client disconnected (no salt available)\n";
+            setRecvTimeoutMs(clientSocket, 0);
+            return;
+          }
+          if (m_verboseLogging.load()) {
+            std::cout << "[XDR] sending salt to FM-DX client: '" << salt << "'\n";
+          }
+          std::string saltMsg = salt + "\n";
+          sendSocket(clientSocket, saltMsg.c_str(), saltMsg.length());
+          fmdxSalt = salt;
+          fmdxAuthDeadline = std::chrono::steady_clock::now() +
+                             std::chrono::milliseconds(kHandshakeTimeoutMs);
+        }
+        continue;
+      }
+
+      if (awaitingAuth) {
+        // The next line must be the auth hash. It is read from the same
+        // line buffer as the commands, so a client that pipelines the
+        // startup line and the hash in one write is handled correctly.
+        std::string clientHash = line;
+        if (clientHash.length() == HASH_LENGTH + 1 &&
+            (clientHash[0] == 'P' || clientHash[0] == 'p')) {
+          clientHash = clientHash.substr(1);
+        }
+        const bool authSuccess = authenticate(fmdxSalt, clientHash);
+        if (m_verboseLogging.load()) {
+          std::cout << "[XDR] FM-DX authentication "
+                    << (authSuccess ? "SUCCESS" : "FAILED") << "\n";
+        }
+        if (!authSuccess) {
+          // A wrong hash is refused. Guests are not offered on this path:
+          // the reference FM-DX protocol has no read-only mode, so there is
+          // nothing to downgrade to.
+          sendSocket(clientSocket, "a0\n", 3);
+          std::cout << "[XDR] client disconnected from " << clientIP << "\n";
+          setRecvTimeoutMs(clientSocket, 0);
+          return;
+        }
+        authenticated = true;
+        awaitingAuth = false;
+        continue;
+      }
+
+      if (!authenticated) {
+        sendSocket(clientSocket, "a0\n", 3);
+        disconnectRequested = true;
+        break;
+      }
+
+      if (line == "X") {
         tunerStarted = false;
         if (m_stopCallback) {
           m_stopCallback();
@@ -806,7 +1110,14 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
   sendSocket(clientSocket, msg.c_str(), msg.length());
 
   std::string authMsg;
-  if (!recvLine(clientSocket, authMsg, HASH_LENGTH + 2)) {
+  // The socket's receive timeout is cleared at this point, which on POSIX
+  // means "block forever". Bound the auth read so a client that connects and
+  // then stalls cannot pin this thread indefinitely.
+  setRecvTimeoutMs(clientSocket, kHandshakeTimeoutMs);
+  const bool gotAuth =
+      recvLine(clientSocket, authMsg, HASH_LENGTH + 2);
+  setRecvTimeoutMs(clientSocket, 0);
+  if (!gotAuth) {
     if (m_verboseLogging.load()) {
       std::cout << "[XDR] client disconnected before sending auth hash"
                 << "\n";
@@ -845,10 +1156,15 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
     guestSession = false;
   }
 
-  authenticated = authSuccess || m_guestMode;
+  // A guest session is a *read-only* session, matching the reference daemon's
+  // documented "guest login (read-only access)" (research/xdrd/xdrd.c:321).
+  // Only a session that presented the correct hash is `authenticated`; a guest
+  // is merely allowed to connect and observe.
+  authenticated = authSuccess;
+  const bool sessionEstablished = authSuccess || guestSession;
   uint64_t lastRdsSeq = 0;
   uint64_t lastScanSeq = 0;
-  if (authenticated) {
+  if (sessionEstablished) {
     {
       std::lock_guard<std::mutex> lock(m_rdsMutex);
       if (!m_rdsQueue.empty()) {
@@ -861,8 +1177,13 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
         lastScanSeq = m_scanQueue.back().first;
       }
     }
-    std::string online = guestSession ? "o0,1\n" : "o1,0\n";
+    // The counters are bumped before the line is built so the count this
+    // client sees already includes itself.
+    addOnlineClient(authSuccess);
+    std::string online = onlineLine() + "\n";
     sendSocket(clientSocket, online.c_str(), online.length());
+    // Tell the clients that were already connected that somebody joined.
+    broadcastOnlineLine();
 
     std::string snapshot = buildXdrStateSnapshot();
     snapshot += "\n";
@@ -983,7 +1304,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
 
     size_t pos;
     while ((pos = command.find('\n')) != std::string::npos) {
-      if (pos > kMaxClientCommandLen) {
+      if (lineExceedsLimit(pos)) {
         if (m_verboseLogging.load()) {
           std::cout << "[XDR] closing XDR client due to oversized command line"
                     << "\n";
@@ -998,7 +1319,8 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
         line.pop_back();
       }
 
-      std::string response = processCommand(line, authenticated, guestSession);
+      std::string response =
+          processCommand(line, authenticated, guestSession, clientSocket);
       if (!response.empty()) {
         response += "\n";
         sendSocket(clientSocket, response.c_str(), response.length());
@@ -1007,22 +1329,54 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
   }
   setRecvTimeoutMs(clientSocket, 0);
 
-  m_scanCancelPending = true;
+  // A disconnect cancels the scan only when this client was the one that
+  // armed it. Unconditionally cancelling meant that any second client
+  // connecting and hanging up aborted a sweep that belonged to somebody else.
+  const int scanOwner = m_scanOwnerSocket.load(std::memory_order_relaxed);
+  if (scanOwner < 0 || scanOwner == clientSocket) {
+    m_scanCancelPending = true;
+    if (scanOwner == clientSocket) {
+      m_scanOwnerSocket.store(-1, std::memory_order_relaxed);
+    }
+  }
+
+  if (sessionEstablished) {
+    removeOnlineClient(authSuccess);
+    broadcastOnlineLine();
+  }
 }
 
 std::string XDRServer::processCommand(const std::string &cmd,
-                                      bool authenticated, bool guestSession) {
+                                      bool authenticated, bool guestSession,
+                                      int clientSocket) {
+  // guestSession is no longer consulted: privilege is decided solely by
+  // `authenticated` (H1 made guests read-only). The parameter is kept so the
+  // session role stays visible at the call site and in the tests that cover
+  // the guest path.
+  (void)guestSession;
   if (cmd.empty()) {
     m_scanCancelPending = true;
     return "";
   }
 
-  if (!authenticated) {
-    return "a0";
-  }
-
   char command = cmd[0];
   std::string arg = cmd.length() > 1 ? cmd.substr(1) : "";
+
+  if (!authenticated) {
+    // Guests are read-only, matching the reference daemon's documented
+    // "guest login (read-only access)" (research/xdrd/xdrd.c:585 — only an
+    // authenticated session may command the tuner). Read-only commands are
+    // answered; anything that would reconfigure or retune the tuner is
+    // rejected with "a0" (the protocol's "not authorized" reply).
+    if (command == 'N' || command == 'o' || command == 'P') {
+      // Fall through to the read-only handlers below.
+    } else if (command == 'I' && arg.empty()) {
+      // 'I' with no argument is a query for the current sampling interval;
+      // 'I<int>,<detector>' changes it and is therefore not guest-allowed.
+    } else {
+      return "a0";
+    }
+  }
 
   std::lock_guard<std::mutex> lock(m_callbackMutex);
 
@@ -1051,11 +1405,13 @@ std::string XDRServer::processCommand(const std::string &cmd,
     if (arg.empty()) {
       m_scanContinuous = false;
       m_scanStartPending = true;
+      m_scanOwnerSocket.store(clientSocket, std::memory_order_relaxed);
       return "";
     }
     if (arg == "m") {
       m_scanContinuous = true;
       m_scanStartPending = true;
+      m_scanOwnerSocket.store(clientSocket, std::memory_order_relaxed);
       return "";
     }
     if (arg.size() >= 2) {
@@ -1094,11 +1450,24 @@ std::string XDRServer::processCommand(const std::string &cmd,
   case 'T': {
     uint32_t freqHz = 0;
     if (!parseFrequencyHz(arg, freqHz)) {
-      return "";
+      // A malformed tune is answered with the current frequency rather than
+      // silence, so the client can tell "rejected" from "not yet applied".
+      if (m_verboseLogging.load()) {
+        std::cout << "[XDR] rejected malformed tune command: T" << arg << "\n";
+      }
+      return "T" + std::to_string(m_frequency.load() / 1000);
     }
     if (!fm_tuner::isValidFmBroadcastFreqHz(freqHz)) {
-      return "";
+      if (m_verboseLogging.load()) {
+        std::cout << "[XDR] rejected out-of-band tune command: T" << arg
+                  << " (" << freqHz << " Hz)\n";
+      }
+      return "T" + std::to_string(m_frequency.load() / 1000);
     }
+    // Reset the PI history before the new frequency is published, so the
+    // previous station's PI code is not reported as the new station's.
+    resetPiHistory();
+    m_lastAppliedFrequency = freqHz;
     m_frequency = freqHz;
     if (m_freqCallback) {
       m_freqCallback(freqHz);
@@ -1219,6 +1588,12 @@ std::string XDRServer::processCommand(const std::string &cmd,
     if (!parseIntValue(arg, bandwidth)) {
       return "";
     }
+    // Clamp to the range the tuner can actually measure. The signal-meter
+    // estimator analyses the channel with an 8192-point FFT; a bandwidth at
+    // or above the sample rate makes the side-band window wrap back over
+    // the channel, so the meter would measure the signal as its own noise
+    // floor and report a strong station as no signal.
+    bandwidth = std::clamp(bandwidth, 0, kMaxChannelBandwidthHz);
     m_bandwidth = bandwidth;
     if (m_bandwidthCallback) {
       m_bandwidthCallback(bandwidth);
@@ -1311,7 +1686,8 @@ std::string XDRServer::processCommand(const std::string &cmd,
     return "N" + std::to_string(m_pilotTenthsKHz.load());
 
   case 'o':
-    return guestSession ? "o0,1" : "o1,0";
+    // The real number of connected clients, not a per-session guess.
+    return onlineLine();
 
   default:
     return "";
@@ -1386,6 +1762,14 @@ std::string XDRServer::processFmdxCommand(const std::string &cmd) {
     if (!parseFrequencyHz(arg, freqHz)) {
       return "ER";
     }
+    // Same FM-band guard as the XDR-GTK 'T' handler. Without it an FM-DX
+    // client could drive the tuner off-band (parseFrequencyHz reads a value
+    // below 1000000 as kHz, so "T10" is 10 kHz and "T999999999" is ~1 GHz).
+    if (!fm_tuner::isValidFmBroadcastFreqHz(freqHz)) {
+      return "ER";
+    }
+    resetPiHistory();
+    m_lastAppliedFrequency = freqHz;
     m_frequency = freqHz;
     if (m_freqCallback) {
       m_freqCallback(freqHz);
@@ -1452,6 +1836,9 @@ std::string XDRServer::processFmdxCommand(const std::string &cmd) {
     if (!parseIntValue(arg, bandwidth)) {
       return "ER";
     }
+    // Same clamp as the XDR-GTK 'W' handler: a bandwidth at or above the
+    // sample rate cannot be measured by the signal meter.
+    bandwidth = std::clamp(bandwidth, 0, kMaxChannelBandwidthHz);
     m_bandwidth = bandwidth;
     if (m_bandwidthCallback) {
       m_bandwidthCallback(bandwidth);
@@ -1495,4 +1882,3 @@ std::string XDRServer::processFmdxCommand(const std::string &cmd) {
     return "ER";
   }
 }
-constexpr size_t kMaxClientCommandLen = 1024;

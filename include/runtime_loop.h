@@ -24,7 +24,7 @@ bool handleControlAndScan(
     std::atomic<uint32_t> &requestedFrequencyHz,
     std::atomic<bool> &pendingFrequency, std::atomic<bool> &pendingGain,
     std::atomic<bool> &pendingAGC, std::atomic<int> &requestedBandwidthHz,
-    std::atomic<bool> &pendingBandwidth, int &appliedBandwidthHz,
+    std::atomic<bool> &pendingBandwidth, std::atomic<int> &appliedBandwidthHz,
     bool rtlConnected, bool verboseLogging, AudioOutput &audioOut,
     fm_tuner::dsp::Runtime &dspRuntime, RdsWorker &rdsWorker,
     DspPipeline &dspPipeline, size_t kRetuneMuteSamples,

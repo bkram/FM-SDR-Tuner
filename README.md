@@ -41,7 +41,7 @@ Current architecture:
 - Continuous-quality blend gate (no mono pops on marginal signals)
 - Soft-knee audio limiter with metered clip ratio
 - RDS decode in dedicated worker thread (redsea-port: 171 kHz, 57 kHz PLL, RRC symbol sync, BPSK, block-sync state machine)
-- XDR protocol compatibility for FM-DX clients on port 7373
+- XDR protocol compatibility for FM-DX clients on port 7373. Two wire protocols are served on the same port and told apart by the client's first byte: the XDR-GTK protocol (server sends a 16-char salt, client answers with the SHA-1 hash) and the FM-DX-Tuner protocol (client sends `x`, server answers `\nOK\n`). Both are subject to the configured password.
 - Audio output at 48 kHz (native Core Audio / ALSA / WinMM)
 - Output to speaker (`-s`), WAV (`-w`), MPX WAV (`--mpx-wav`, with configurable rate via `--mpx-rate` for downstream RDS / spectrum / decoder analysis or feeding an FM exciter that accepts raw MPX), live MPX → audio device (`--mpx-audio` on macOS/Linux, typically into BlackHole / snd-aloop for re-encoding or directly into a TX accepting line-in MPX), and/or raw IQ capture (`-i`)
 - Self-documenting signal meter: startup `[METER]` log reports the active calibration window and periodically suggests narrower floor/ceil based on observed session min/max
@@ -531,8 +531,10 @@ A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; no
   default device (`-d` / `[audio] device`).
 - Diagnostic logging (`[SIG]`, `[ST]`, `[AUDIO]`, …) follows `[debug] log_level`
   in the INI (default on). Override per-run with `-v`/`--verbose` or
-  `-q`/`--quiet`.
-- XDR server listens on port `7373`. If `xdr.password` is empty and no `-P` is passed, the server automatically enters guest mode (no auth).
+  `-q`/`--quiet`. The SDRplay source's own connect trace (`[SDRplay] …`) follows
+  the same switch — it is silent under `-q` unless the connect actually fails.
+- XDR server listens on port `7373`. If `xdr.password` is empty and no `-P` is passed, the server automatically enters guest mode (no auth). The password guards **both** wire protocols on that port: a guest may read the tuner state but not change it.
+- The `o<auth>,<guest>` line reports how many clients are actually connected, and is re-sent to every client whenever one joins or leaves.
 - The tuner does not auto-start by default; an XDR client start command activates it. Use `--auto-start` to begin playback without a client.
 - De-emphasis default is 50 µs (EU/ITU). For US/Korea set `[tuner].deemphasis = 1` in the config (75 µs).
 - Default stereo blend profile is `aggressive` (fast mute on marginal pilot); select `normal` or `soft` via `-b` or the config.

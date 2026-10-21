@@ -1361,8 +1361,9 @@ TEST_CASE("Multipath equalizer reduces envelope variance on a 2-ray channel",
       sumMag += m;
       sumMagSq += static_cast<double>(m) * m;
     }
-    const double mean = sumMag / len;
-    const double var = std::max(0.0, sumMagSq / len - mean * mean);
+    const double lenD = static_cast<double>(len);
+    const double mean = sumMag / lenD;
+    const double var = std::max(0.0, sumMagSq / lenD - mean * mean);
     return std::sqrt(var);
   };
 
@@ -1487,17 +1488,18 @@ TEST_CASE("Captured MPX fixture produces audio close to the reference",
   // Skip the front 30% so initial PLL/blend transient doesn't dominate.
   const size_t analyzeStart = produced * 3 / 10;
   const size_t analyzeLen = produced - analyzeStart;
-  REQUIRE(analyzeLen > kOutputRate / 2);
+  REQUIRE(analyzeLen > static_cast<size_t>(kOutputRate / 2));
 
   auto channelRms = [](const float *interleavedStereo, size_t startFrame,
                        size_t frameCount, int chan) {
     if (frameCount == 0) return 0.0f;
     double acc = 0.0;
     for (size_t i = 0; i < frameCount; i++) {
-      const float v = interleavedStereo[(startFrame + i) * 2 + chan];
+      const float v =
+          interleavedStereo[(startFrame + i) * 2 + static_cast<size_t>(chan)];
       acc += static_cast<double>(v) * v;
     }
-    return static_cast<float>(std::sqrt(acc / frameCount));
+    return static_cast<float>(std::sqrt(acc / static_cast<double>(frameCount)));
   };
   auto rms = [](const float *data, size_t count) {
     if (count == 0) return 0.0f;
@@ -1505,7 +1507,7 @@ TEST_CASE("Captured MPX fixture produces audio close to the reference",
     for (size_t i = 0; i < count; i++) {
       acc += static_cast<double>(data[i]) * data[i];
     }
-    return static_cast<float>(std::sqrt(acc / count));
+    return static_cast<float>(std::sqrt(acc / static_cast<double>(count)));
   };
   auto rmsSum = [](const float *a, const float *b, size_t count) {
     if (count == 0) return 0.0f;
@@ -1514,7 +1516,7 @@ TEST_CASE("Captured MPX fixture produces audio close to the reference",
       const double s = static_cast<double>(a[i]) + b[i];
       acc += s * s * 0.25; // (L+R)/2
     }
-    return static_cast<float>(std::sqrt(acc / count));
+    return static_cast<float>(std::sqrt(acc / static_cast<double>(count)));
   };
   auto rmsDiff = [](const float *a, const float *b, size_t count) {
     if (count == 0) return 0.0f;
@@ -1523,7 +1525,7 @@ TEST_CASE("Captured MPX fixture produces audio close to the reference",
       const double s = static_cast<double>(a[i]) - b[i];
       acc += s * s * 0.25; // (L-R)/2
     }
-    return static_cast<float>(std::sqrt(acc / count));
+    return static_cast<float>(std::sqrt(acc / static_cast<double>(count)));
   };
 
   // Reference: skip front 30% as well.
@@ -1577,7 +1579,8 @@ TEST_CASE("Captured MPX fixture produces audio close to the reference",
     refDiffAcc += d * d * 0.25;
   }
   const float refDiffRms = static_cast<float>(
-      std::sqrt(refDiffAcc / std::max<size_t>(1, refAnalyzeLen)));
+      std::sqrt(refDiffAcc /
+                 static_cast<double>(std::max<size_t>(1, refAnalyzeLen))));
   const float ourDiffRms =
       rmsDiff(outL.data() + analyzeStart, outR.data() + analyzeStart,
               analyzeLen);
@@ -1720,4 +1723,33 @@ TEST_CASE("FIRFilter L1 normalized lowpass keeps a unit-magnitude carrier "
     peak = std::max(peak, std::abs(fir.execute()));
   }
   REQUIRE(peak <= 1.0f + 1e-4f);
+}
+
+TEST_CASE("FIRFilter L1 normalization survives reset", "[dsp][firfilter]") {
+  // reset() re-creates the filter from the stored design parameters. It used
+  // to drop the L1-normalize flag on the way, so every filter that had been
+  // reset (which is every filter, on every retune) silently reverted to the
+  // plain Kaiser path and the iq_fir_l1_normalize setting had no effect.
+  const std::uint32_t length = 81;
+  const float cutoff = 0.45f;
+
+  fm_tuner::dsp::liquid::FIRFilter fir;
+  fir.init(length, cutoff, 60.0f, 0.0f, /*l1Normalize=*/true);
+  const float peakBefore = maxAbsImpulseResponse(fir, length + 32);
+
+  fir.reset();
+  const float peakAfter = maxAbsImpulseResponse(fir, length + 32);
+
+  // The bound |y| <= max|x| must still hold after a reset.
+  REQUIRE(peakBefore <= 1.0f + 1e-4f);
+  REQUIRE(peakAfter <= 1.0f + 1e-4f);
+  // And the filter must be the same one, not the un-normalized rebuild.
+  REQUIRE(std::abs(peakAfter - peakBefore) < 1e-6f);
+
+  // The un-normalized reference really is louder, so the assertions above
+  // are not vacuous.
+  fm_tuner::dsp::liquid::FIRFilter plain;
+  plain.init(length, cutoff, 60.0f, 0.0f, /*l1Normalize=*/false);
+  const float peakPlain = maxAbsImpulseResponse(plain, length + 32);
+  REQUIRE(peakPlain > peakAfter + 0.1f);
 }

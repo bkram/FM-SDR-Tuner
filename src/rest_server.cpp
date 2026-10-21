@@ -1,5 +1,7 @@
 #include "rest_server.h"
 
+#include "tuning_limits.h"
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -12,6 +14,7 @@ using SocketLen = int;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 using SocketLen = socklen_t;
 #define CLOSESOCKET ::close
@@ -26,6 +29,29 @@ using SocketLen = socklen_t;
 #include <sstream>
 
 namespace {
+
+// How long a client may take to deliver its request before the server gives
+// up on it. The API is small and local; anything slower than this is not a
+// real client, and holding the accept thread for it would deny the API to
+// every other client.
+constexpr int kClientRecvTimeoutMs = 5000;
+
+// The widest channel bandwidth the tuner accepts. The signal-meter estimator
+// analyses the channel with an FFT whose length is capped at 8192 points;
+// beyond roughly the sample rate the side-band window wraps back over the
+// channel and the meter measures the signal as its own noise floor. The
+// tuner runs at 256 kHz, so a bandwidth at or above the sample rate is never
+// a meaningful request.
+constexpr long long kMaxBandwidthHz = 256000;
+
+// Clamp a requested bandwidth into the range the tuner can actually
+// measure. Applied on every ingress so the raw value never reaches the
+// signal-meter estimator.
+int clampBandwidthHz(long long hz) {
+  if (hz < 0) return 0;
+  if (hz > kMaxBandwidthHz) return static_cast<int>(kMaxBandwidthHz);
+  return static_cast<int>(hz);
+}
 
 std::string urlDecode(const std::string &s) {
   std::string out;
@@ -158,6 +184,46 @@ bool toDouble(const std::string &v, double &out) {
   return true;
 }
 
+// A peer that disconnects mid-response raises SIGPIPE, whose default
+// disposition is to terminate the process. MSG_NOSIGNAL (POSIX) keeps the
+// error local to the send() call, which returns EPIPE instead.
+int sendNoSigPipe(int sock, const char *data, size_t len) {
+#if defined(_WIN32)
+  return ::send(sock, data, static_cast<int>(len), 0);
+#elif defined(MSG_NOSIGNAL)
+  return static_cast<int>(::send(sock, data, len, MSG_NOSIGNAL));
+#else
+  return static_cast<int>(::send(sock, data, len, 0));
+#endif
+}
+
+// SO_NOSIGPIPE is the BSD/macOS equivalent of MSG_NOSIGNAL: it suppresses
+// SIGPIPE for the socket rather than for the individual call.
+void configureSendNoSigPipe(int sock) {
+#if defined(SO_NOSIGPIPE)
+  const int opt = 1;
+  setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE,
+             reinterpret_cast<const char *>(&opt), sizeof(opt));
+#else
+  (void)sock;
+#endif
+}
+
+// Bound how long a single client may hold the server up while it dribbles in
+// a request. Without this, one idle connection stalls every other client.
+void setRecvTimeoutMs(int sock, int timeoutMs) {
+#if defined(_WIN32)
+  const DWORD timeout = timeoutMs > 0 ? static_cast<DWORD>(timeoutMs) : 0;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+             reinterpret_cast<const char *>(&timeout), sizeof(timeout));
+#else
+  struct timeval tv;
+  tv.tv_sec = timeoutMs / 1000;
+  tv.tv_usec = (timeoutMs % 1000) * 1000;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 void sendResponse(int sock, int status, const std::string &statusText,
                   const std::string &body) {
   std::ostringstream oss;
@@ -172,7 +238,7 @@ void sendResponse(int sock, int status, const std::string &statusText,
   const std::string out = oss.str();
   size_t sent = 0;
   while (sent < out.size()) {
-    const auto n = ::send(sock, out.data() + sent, out.size() - sent, 0);
+    const auto n = sendNoSigPipe(sock, out.data() + sent, out.size() - sent);
     if (n <= 0) break;
     sent += static_cast<size_t>(n);
   }
@@ -247,6 +313,27 @@ void RestServer::stop() {
     m_serverSocket = -1;
   }
   if (m_acceptThread.joinable()) m_acceptThread.join();
+  // Shut the live connections down so a worker blocked in recv() returns
+  // immediately, rather than making shutdown wait out the receive timeout.
+  {
+    std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
+    for (int sock : m_clientSockets) {
+#if defined(_WIN32)
+      shutdown(sock, SD_BOTH);
+#else
+      ::shutdown(sock, SHUT_RDWR);
+#endif
+    }
+  }
+  // Join the client workers.
+  std::vector<std::shared_ptr<ClientThread>> clients;
+  {
+    std::lock_guard<std::mutex> lock(m_clientThreadsMutex);
+    clients.swap(m_clientThreads);
+  }
+  for (auto &entry : clients) {
+    if (entry->thread.joinable()) entry->thread.join();
+  }
 }
 
 void RestServer::acceptLoop() {
@@ -259,8 +346,62 @@ void RestServer::acceptLoop() {
       if (!m_running.load()) break;
       continue;
     }
-    handleConnection(client);
-    CLOSESOCKET(client);
+    // Both of these matter for a peer that vanishes mid-exchange: MSG_NOSIGNAL
+    // keeps the resulting SIGPIPE from killing the process, and the receive
+    // timeout keeps a client that connects but never sends from pinning its
+    // own thread.
+    configureSendNoSigPipe(client);
+    setRecvTimeoutMs(client, kClientRecvTimeoutMs);
+    {
+      std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
+      m_clientSockets.push_back(client);
+    }
+    // Serve each connection on its own thread. Handling it inline would make
+    // a single stalled client deny the API to every other client for the
+    // duration of the receive timeout.
+    auto entry = std::make_shared<ClientThread>();
+    std::thread worker([this, client, entry]() {
+      handleConnection(client);
+      {
+        // Remove the socket from the live list and close it under the same
+        // lock. stop() shuts the sockets down while holding this lock, so it
+        // can never act on a descriptor that has already been closed and
+        // possibly reused by a new connection.
+        std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
+        m_clientSockets.erase(
+            std::remove(m_clientSockets.begin(), m_clientSockets.end(), client),
+            m_clientSockets.end());
+        CLOSESOCKET(client);
+      }
+      entry->done.store(true, std::memory_order_release);
+    });
+    {
+      std::lock_guard<std::mutex> lock(m_clientThreadsMutex);
+      m_clientThreads.push_back(entry);
+      entry->thread = std::move(worker);
+    }
+    reapFinishedClientThreads();
+  }
+}
+
+void RestServer::reapFinishedClientThreads() {
+  std::vector<std::shared_ptr<ClientThread>> finished;
+  {
+    std::lock_guard<std::mutex> lock(m_clientThreadsMutex);
+    auto it = m_clientThreads.begin();
+    while (it != m_clientThreads.end()) {
+      if ((*it)->done.load(std::memory_order_acquire)) {
+        finished.push_back(*it);
+        it = m_clientThreads.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  // Join outside the lock: a thread cannot be joined while holding the mutex
+  // its worker might still need.
+  for (auto &entry : finished) {
+    if (entry->thread.joinable()) entry->thread.join();
   }
 }
 
@@ -323,6 +464,11 @@ void RestServer::handleConnection(int clientSocket) {
   // Status endpoint.
   if (path == "/api/status" || path == "/status" ||
       (method == "GET" && (path == "/" || path == "/api"))) {
+    // Connections are served concurrently, so serialize the control-plane
+    // calls: two clients could otherwise interleave a "set gain" and a "read
+    // status" and observe a half-applied state. The lock is taken here, after
+    // the request has been read, so a slow client never blocks the others.
+    std::lock_guard<std::recursive_mutex> controlsLock(m_controlsMutex);
     const std::string status =
         m_controls.statusJson ? m_controls.statusJson() : "{}";
     sendResponse(clientSocket, 200, "OK", status);
@@ -342,7 +488,11 @@ void RestServer::handleConnection(int clientSocket) {
   }
 
   int applied = 0;
-  const std::string responseBody = applyParams(params, applied);
+  std::string responseBody;
+  {
+    std::lock_guard<std::recursive_mutex> controlsLock(m_controlsMutex);
+    responseBody = applyParams(params, applied);
+  }
   sendResponse(clientSocket, 200, "OK", responseBody);
   if (m_verboseLogging.load()) {
     std::cout << "[REST] " << method << " " << path << " applied " << applied
@@ -368,14 +518,23 @@ std::string RestServer::applyParams(
     bool bval = false;
 
     if ((key == "freq_hz" || key == "frequency") && toInt(val, ival)) {
+      // Range-check before the narrowing cast: a value above UINT32_MAX would
+      // silently truncate, and the band check keeps the request inside the
+      // FM broadcast band. The setFrequencyHz control re-checks the band.
       if (m_controls.setFrequencyHz && ival > 0 &&
+          ival <= static_cast<long>(fm_tuner::kFmBroadcastMaxFreqHz) &&
           m_controls.setFrequencyHz(static_cast<uint32_t>(ival)))
         appliedCount++;
       else
         note(key);
     } else if (key == "freq_khz" && toInt(val, ival)) {
-      if (m_controls.setFrequencyHz && ival > 0 &&
-          m_controls.setFrequencyHz(static_cast<uint32_t>(ival) * 1000U))
+      // Multiply in 64-bit, then band-check, then narrow. Doing the multiply
+      // in uint32_t first would wrap (e.g. 5000000 kHz -> 705032704 Hz) and
+      // land the tuner on a plausible-looking but wrong frequency.
+      const long long hz = static_cast<long long>(ival) * 1000LL;
+      if (m_controls.setFrequencyHz && ival > 0 && hz > 0 &&
+          hz <= static_cast<long long>(fm_tuner::kFmBroadcastMaxFreqHz) &&
+          m_controls.setFrequencyHz(static_cast<uint32_t>(hz)))
         appliedCount++;
       else
         note(key);
@@ -390,13 +549,17 @@ std::string RestServer::applyParams(
       else
         note(key);
     } else if (key == "bandwidth_hz" && toInt(val, ival)) {
-      if (m_controls.setBandwidthHz && m_controls.setBandwidthHz(static_cast<int>(ival)))
+      if (m_controls.setBandwidthHz &&
+          m_controls.setBandwidthHz(clampBandwidthHz(ival)))
         appliedCount++;
       else
         note(key);
     } else if (key == "bandwidth_khz" && toInt(val, ival)) {
+      // Multiply in 64-bit, then clamp, then narrow: doing the multiply in
+      // int is signed-integer overflow for a large value.
+      const long long hz = static_cast<long long>(ival) * 1000LL;
       if (m_controls.setBandwidthHz &&
-          m_controls.setBandwidthHz(static_cast<int>(ival) * 1000))
+          m_controls.setBandwidthHz(clampBandwidthHz(hz)))
         appliedCount++;
       else
         note(key);

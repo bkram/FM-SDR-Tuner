@@ -42,6 +42,10 @@ void TunerController::setLowLatencyMode(bool enable) {
   }
 }
 
+void TunerController::setVerboseLogging(bool enable) {
+  m_sdrplayDevice.setVerboseLogging(enable);
+}
+
 bool TunerController::connect() {
   switch (m_kind) {
   case SourceKind::SdrPlay: {

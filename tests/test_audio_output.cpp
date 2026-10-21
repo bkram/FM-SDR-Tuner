@@ -20,8 +20,8 @@ uint32_t readLe32(const std::vector<uint8_t> &b, size_t off) {
 }
 
 uint16_t readLe16(const std::vector<uint8_t> &b, size_t off) {
-  return static_cast<uint16_t>(b[off]) |
-         (static_cast<uint16_t>(b[off + 1]) << 8);
+  return static_cast<uint16_t>(static_cast<uint16_t>(b[off]) |
+                                (static_cast<uint16_t>(b[off + 1]) << 8));
 }
 } // namespace
 

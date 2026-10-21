@@ -471,9 +471,11 @@ TEST_CASE("RTLSDRDevice FM band sweep for calibration", "[rtl_sdr_live]") {
     sortedDbfs.push_back(row.dbfs);
   }
   std::sort(sortedDbfs.begin(), sortedDbfs.end());
-  const double p05 = sortedDbfs[static_cast<size_t>(sortedDbfs.size() * 0.05)];
+  const double p05 = sortedDbfs[static_cast<size_t>(
+      static_cast<double>(sortedDbfs.size()) * 0.05)];
   const double p50 = sortedDbfs[sortedDbfs.size() / 2];
-  const double p95 = sortedDbfs[static_cast<size_t>(sortedDbfs.size() * 0.95)];
+  const double p95 = sortedDbfs[static_cast<size_t>(
+      static_cast<double>(sortedDbfs.size()) * 0.95)];
   const double pMax = sortedDbfs.back();
   const double pMin = sortedDbfs.front();
 

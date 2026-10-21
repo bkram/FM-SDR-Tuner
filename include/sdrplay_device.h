@@ -35,6 +35,16 @@ public:
   bool connect();
   void disconnect();
 
+  /// Gate the device's own diagnostics behind the application's verbose flag.
+  /// Off by default so a connect attempt on a system without the SDRplay API
+  /// stays silent under -q, like every other log line in the app.
+  void setVerboseLogging(bool enable) {
+    m_verboseLogging.store(enable, std::memory_order_relaxed);
+  }
+  bool verboseLogging() const {
+    return m_verboseLogging.load(std::memory_order_relaxed);
+  }
+
   bool setFrequency(uint32_t freqHz);
   bool setSampleRate(uint32_t rate);     // RSP rate is fixed; validates the request
   bool setFrequencyCorrection(int ppm);
@@ -52,7 +62,7 @@ public:
   bool setBiasTee(bool enable);          // RSP bias tee (model-specific)
 
   int antennaCount() const;
-  int hwVer() const { return m_hwVer; }
+  int hwVer() const { return m_hwVer.load(std::memory_order_relaxed); }
   const char *modelName() const;
 
   /// Effective IQ sample rate delivered to the demod (after RSP decimation).
@@ -75,17 +85,27 @@ private:
   size_t drainLocked(std::complex<float> *out, size_t maxSamples);
 
   int m_inputRate = 256000;
-  int m_hwVer = 0;
+  std::atomic<int> m_hwVer{0};
   std::atomic<bool> m_connected{false};
   std::atomic<bool> m_failed{false};
+  std::atomic<bool> m_verboseLogging{false};
+
+  // Serializes every read-modify-write of the device parameter struct and
+  // the matching vendor API update. The REST server's control thread and the
+  // main thread can both drive the device (LNA state, gain, AGC, antenna,
+  // bias tee); without this lock their updates could interleave, leaving the
+  // RSP with the LNA state of one operation and the gain state of another.
+  std::mutex m_paramMutex;
 
   std::mutex m_mutex;
   std::condition_variable m_cv;
   std::vector<std::complex<float>> m_ring;
-  size_t m_readPos = 0, m_writePos = 0;
-  bool m_full = false;
+  // The ring cursors and the device handle are only used by the real
+  // FM_TUNER_HAS_SDRPLAY build; a stub build keeps them but never touches them.
+  [[maybe_unused]] size_t m_readPos = 0, m_writePos = 0;
+  [[maybe_unused]] bool m_full = false;
 
-  void *m_handle = nullptr;
+  [[maybe_unused]] void *m_handle = nullptr;
 };
 
 #endif // SDRPLAY_DEVICE_H

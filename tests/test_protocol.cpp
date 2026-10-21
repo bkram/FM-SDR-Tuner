@@ -12,6 +12,8 @@
 #include "rtl_tcp_client.h"
 #include "xdr_server.h"
 
+#include <openssl/evp.h>
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -19,6 +21,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 using SocketLen = int;
+using SocketResult = int;
+using SocketDataLen = int;
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -26,6 +30,8 @@ using SocketLen = int;
 #include <sys/time.h>
 #include <unistd.h>
 using SocketLen = socklen_t;
+using SocketResult = ssize_t;
+using SocketDataLen = size_t;
 #endif
 
 namespace {
@@ -65,9 +71,9 @@ void setRecvTimeoutMs(int sock, int timeoutMs) {
 bool sendAll(int sock, const uint8_t *data, size_t len) {
   size_t sent = 0;
   while (sent < len) {
-    const int n =
+    const SocketResult n =
         send(sock, reinterpret_cast<const char *>(data + sent),
-             static_cast<int>(len - sent), 0);
+             static_cast<SocketDataLen>(len - sent), 0);
     if (n <= 0) {
       return false;
     }
@@ -80,7 +86,7 @@ bool recvLine(int sock, std::string &line, size_t maxLen = 512) {
   line.clear();
   while (line.size() < maxLen) {
     char ch = '\0';
-    const int n = recv(sock, &ch, 1, 0);
+    const SocketResult n = recv(sock, &ch, 1, 0);
     if (n <= 0) {
       return !line.empty();
     }
@@ -188,7 +194,7 @@ bool waitForSocketClose(int sock, std::chrono::milliseconds timeout) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   char ch = '\0';
   while (std::chrono::steady_clock::now() < deadline) {
-    const int n = recv(sock, &ch, 1, 0);
+    const SocketResult n = recv(sock, &ch, 1, 0);
     if (n == 0) {
       return true;
     }
@@ -207,6 +213,35 @@ bool waitForSocketClose(int sock, std::chrono::milliseconds timeout) {
     }
   }
   return false;
+}
+
+// The XDR challenge/response is SHA-1(salt + password), hex encoded — the
+// same construction xdr-gtk uses (research/xdr-gtk/src/tuner-conn.c) and the
+// same one XDRServer::computeSHA1 implements. The test needs it to drive a
+// genuinely authenticated session.
+std::string sha1Hex(const std::string &data) {
+  unsigned char digest[EVP_MAX_MD_SIZE];
+  unsigned int digestLen = 0;
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  if (ctx == nullptr) {
+    return {};
+  }
+  if (EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr) != 1 ||
+      EVP_DigestUpdate(ctx, data.data(), data.size()) != 1 ||
+      EVP_DigestFinal_ex(ctx, digest, &digestLen) != 1) {
+    EVP_MD_CTX_free(ctx);
+    return {};
+  }
+  EVP_MD_CTX_free(ctx);
+
+  static const char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(digestLen * 2);
+  for (unsigned int i = 0; i < digestLen; i++) {
+    out.push_back(kHex[digest[i] >> 4]);
+    out.push_back(kHex[digest[i] & 0x0Fu]);
+  }
+  return out;
 }
 
 } // namespace
@@ -300,8 +335,9 @@ TEST_CASE("RTLTCPClient command and IQ handling with mock rtl_tcp server",
     std::vector<uint8_t> cmd(25, 0);
     size_t readBytes = 0;
     while (readBytes < cmd.size()) {
-      const int n = recv(clientSock, reinterpret_cast<char *>(cmd.data() + readBytes),
-                         static_cast<int>(cmd.size() - readBytes), 0);
+      const SocketResult n =
+          recv(clientSock, reinterpret_cast<char *>(cmd.data() + readBytes),
+               static_cast<SocketDataLen>(cmd.size() - readBytes), 0);
       if (n <= 0) {
         closeSock(clientSock);
         closeSock(listenSock);
@@ -430,8 +466,7 @@ TEST_CASE("RTLTCPClient rejects malformed rtl_tcp header",
   server.join();
 }
 
-TEST_CASE("XDRServer accepts guest auth and processes core commands",
-          "[protocol][xdr]") {
+TEST_CASE("XDRServer guest sessions are read-only", "[protocol][xdr]") {
 #if defined(_WIN32)
   WinSockInit wsa;
 #endif
@@ -471,7 +506,7 @@ TEST_CASE("XDRServer accepts guest auth and processes core commands",
   REQUIRE(server.start());
 
   int sock = connectLoopback(port);
-  setRecvTimeoutMs(sock, 500);
+  setRecvTimeoutMs(sock, 2500);
 
   std::string line;
   REQUIRE(recvLine(sock, line));
@@ -481,8 +516,120 @@ TEST_CASE("XDRServer accepts guest auth and processes core commands",
   REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(badHash.data()),
                   badHash.size()));
 
+  // A failed authentication in guest mode is granted a read-only session.
   REQUIRE(waitForPrefixLine(sock, "a1", std::chrono::milliseconds(500)));
   REQUIRE(waitForPrefixLine(sock, "o0,1", std::chrono::milliseconds(500)));
+  REQUIRE(waitForPrefixLine(sock, "I", std::chrono::milliseconds(500)));
+
+  auto sendCmd = [&](const std::string &cmd) {
+    const std::string withNl = cmd + "\n";
+    REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(withNl.data()),
+                    withNl.size()));
+  };
+
+  // Every state-changing command must be refused with "a0" (the protocol's
+  // "not authorized" reply) and must not reach the tuner's callbacks.
+  const std::vector<std::string> forbidden = {
+      "T101700", "Y77", "A3", "B1", "I250,1", "x", "X", "W60000", "G20",
+      "M1",     "D1",  "Z2", "Q50", "C1",  "V6",    "Fb2"};
+  for (const std::string &cmd : forbidden) {
+    sendCmd(cmd);
+    REQUIRE(waitForPrefixLine(sock, "a0", std::chrono::milliseconds(700)));
+  }
+
+  REQUIRE(tunedHz.load() == 0u);
+  REQUIRE(volume.load() == 0);
+  REQUIRE(agc.load() == 0);
+  REQUIRE_FALSE(forceMono.load());
+  REQUIRE(sampleInterval.load() == -1);
+  REQUIRE(detector.load() == -1);
+  REQUIRE(startCalls.load() == 0);
+
+  // A guest must not be able to arm a scan either.
+  sendCmd("Sa87500");
+  sendCmd("Sb108000");
+  sendCmd("Sc100");
+  sendCmd("Sw60000");
+  sendCmd("Sz2");
+  sendCmd("S");
+  XDRServer::ScanConfig scan{};
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(700);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (server.consumeScanStart(scan)) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  REQUIRE_FALSE(server.consumeScanStart(scan));
+
+  // Read-only commands still work: 'N' (pilot level), 'o' (online count) and
+  // 'P' (authorization status) are queries, not state changes.
+  sendCmd("N");
+  REQUIRE(waitForPrefixLine(sock, "N", std::chrono::milliseconds(700)));
+  sendCmd("o");
+  REQUIRE(waitForPrefixLine(sock, "o0,1", std::chrono::milliseconds(700)));
+
+  closeSock(sock);
+  server.stop();
+}
+
+TEST_CASE("XDRServer authenticated sessions can command the tuner",
+          "[protocol][xdr]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  const std::string password = "test123";
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  server.setPassword(password);
+  server.setGuestMode(true);
+
+  std::atomic<uint32_t> tunedHz{0};
+  std::atomic<int> volume{0};
+  std::atomic<int> agc{0};
+  std::atomic<int> sampleInterval{-1};
+  std::atomic<int> detector{-1};
+  std::atomic<bool> forceMono{false};
+  std::atomic<int> startCalls{0};
+
+  server.setFrequencyCallback(
+      [&](uint32_t f) { tunedHz.store(f, std::memory_order_relaxed); });
+  server.setVolumeCallback(
+      [&](int v) { volume.store(v, std::memory_order_relaxed); });
+  server.setAGCCallback([&](int m) {
+    agc.store(m, std::memory_order_relaxed);
+    return true;
+  });
+  server.setSamplingCallback([&](int i, int d) {
+    sampleInterval.store(i, std::memory_order_relaxed);
+    detector.store(d, std::memory_order_relaxed);
+  });
+  server.setForceMonoCallback(
+      [&](bool mono) { forceMono.store(mono, std::memory_order_relaxed); });
+  server.setStartCallback(
+      [&]() { startCalls.fetch_add(1, std::memory_order_relaxed); });
+
+  REQUIRE(server.start());
+
+  int sock = connectLoopback(port);
+  setRecvTimeoutMs(sock, 2500);
+
+  std::string salt;
+  REQUIRE(recvLine(sock, salt));
+  REQUIRE(salt.size() == XDRServer::SALT_LENGTH);
+
+  // The correct hash promotes the session to fully privileged.
+  const std::string hash = sha1Hex(salt + password) + "\n";
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(hash.data()),
+                  hash.size()));
+
+  REQUIRE(waitForPrefixLine(sock, "a2", std::chrono::milliseconds(500)));
+  REQUIRE(waitForPrefixLine(sock, "o1,0", std::chrono::milliseconds(500)));
   REQUIRE(waitForPrefixLine(sock, "I", std::chrono::milliseconds(500)));
 
   auto sendCmd = [&](const std::string &cmd) {
@@ -553,7 +700,7 @@ TEST_CASE("XDRServer RDS forwarding requires error-free block B",
   REQUIRE(server.start());
 
   int sock = connectLoopback(port);
-  setRecvTimeoutMs(sock, 250);
+  setRecvTimeoutMs(sock, 2500);
 
   std::string line;
   REQUIRE(recvLine(sock, line));
@@ -595,7 +742,7 @@ TEST_CASE("XDRServer disconnects clients that send oversized unterminated lines"
   REQUIRE(server.start());
 
   int sock = connectLoopback(port);
-  setRecvTimeoutMs(sock, 250);
+  setRecvTimeoutMs(sock, 2500);
 
   std::string line;
   REQUIRE(recvLine(sock, line));
@@ -630,12 +777,12 @@ TEST_CASE("XDRServer disconnects FM-DX clients that send oversized unterminated 
   REQUIRE(server.start());
 
   int sock = connectLoopback(port);
-  setRecvTimeoutMs(sock, 250);
+  setRecvTimeoutMs(sock, 2500);
 
   const std::string handshake = "x\n";
   REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(handshake.data()),
                   handshake.size()));
-  REQUIRE(waitForExactLine(sock, "1", std::chrono::milliseconds(500)));
+  REQUIRE(waitForExactLine(sock, "OK", std::chrono::milliseconds(500)));
 
   const std::string oversized(1500, 'x');
   REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(oversized.data()),
@@ -660,7 +807,7 @@ TEST_CASE("XDRServer rejects oversized FM-DX handshake lines",
   REQUIRE(server.start());
 
   int sock = connectLoopback(port);
-  setRecvTimeoutMs(sock, 250);
+  setRecvTimeoutMs(sock, 2500);
 
   const std::string oversizedHandshake(20, 'x');
   const std::string payload = oversizedHandshake + "\n";
@@ -685,7 +832,7 @@ TEST_CASE("XDRServer rejects oversized XDR auth lines", "[protocol][xdr]") {
   REQUIRE(server.start());
 
   int sock = connectLoopback(port);
-  setRecvTimeoutMs(sock, 250);
+  setRecvTimeoutMs(sock, 2500);
 
   std::string line;
   REQUIRE(recvLine(sock, line));
@@ -697,5 +844,314 @@ TEST_CASE("XDRServer rejects oversized XDR auth lines", "[protocol][xdr]") {
   REQUIRE(waitForSocketClose(sock, std::chrono::milliseconds(1000)));
 
   closeSock(sock);
+  server.stop();
+}
+
+TEST_CASE("XDRServer serves the reference FM-DX startup sequence",
+          "[protocol][xdr][fmdx]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  REQUIRE(server.start());
+
+  std::atomic<uint32_t> tunedHz{0};
+  std::atomic<int> startCalls{0};
+  server.setFrequencyCallback(
+      [&](uint32_t f) { tunedHz.store(f, std::memory_order_relaxed); });
+  server.setStartCallback(
+      [&]() { startCalls.fetch_add(1, std::memory_order_relaxed); });
+
+  int sock = connectLoopback(port);
+  setRecvTimeoutMs(sock, 2500);
+
+  // The reference FM-DX client sends "x" exactly once, in its startup
+  // handshake, and expects "\nOK\n" back (Dispatcher::cbStartup). It then
+  // starts sending commands. The server used to swallow the "x" here, which
+  // left the command loop thinking the tuner had never been started, so
+  // every command was answered "ER" and the client could never tune.
+  const std::string startup = "x\n";
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(startup.data()),
+                  startup.size()));
+  REQUIRE(waitForExactLine(sock, "OK", std::chrono::milliseconds(1000)));
+  REQUIRE(startCalls.load() == 1);
+
+  // A command right after the single startup line must be accepted.
+  const std::string tune = "T101700\n";
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(tune.data()),
+                  tune.size()));
+  REQUIRE(waitForPrefixLine(sock, "OK", std::chrono::milliseconds(1000)));
+  REQUIRE(tunedHz.load() == 101700000u);
+
+  closeSock(sock);
+  server.stop();
+}
+
+TEST_CASE("XDRServer rejects an out-of-band FM-DX tune", "[protocol][xdr][fmdx]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  REQUIRE(server.start());
+
+  std::atomic<uint32_t> tunedHz{0};
+  server.setFrequencyCallback(
+      [&](uint32_t f) { tunedHz.store(f, std::memory_order_relaxed); });
+
+  int sock = connectLoopback(port);
+  setRecvTimeoutMs(sock, 2500);
+
+  const std::string startup = "x\n";
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(startup.data()),
+                  startup.size()));
+  REQUIRE(waitForExactLine(sock, "OK", std::chrono::milliseconds(1000)));
+
+  // "T10" is read as 10 kHz by parseFrequencyHz — far outside the FM
+  // broadcast band. The XDR-GTK path has always rejected such a tune; the
+  // FM-DX path did not, so it could drive the tuner off-band.
+  const std::string badTune = "T10\n";
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(badTune.data()),
+                  badTune.size()));
+  REQUIRE(waitForExactLine(sock, "ER", std::chrono::milliseconds(1000)));
+  REQUIRE(tunedHz.load() == 0u);
+
+  closeSock(sock);
+  server.stop();
+}
+
+TEST_CASE("XDRServer requires the password on the FM-DX path",
+          "[protocol][xdr][fmdx]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  server.setPassword("secret123");
+  server.setGuestMode(false);
+  REQUIRE(server.start());
+
+  std::atomic<uint32_t> tunedHz{0};
+  server.setFrequencyCallback(
+      [&](uint32_t f) { tunedHz.store(f, std::memory_order_relaxed); });
+
+  // A client that sends only "x" and then a tune must not be able to
+  // control the tuner: the password is checked on this path too.
+  {
+    int sock = connectLoopback(port);
+    setRecvTimeoutMs(sock, 2500);
+    const std::string startup = "x\n";
+    REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(startup.data()),
+                    startup.size()));
+    REQUIRE(waitForExactLine(sock, "OK", std::chrono::milliseconds(1000)));
+
+    // The server now asks for the salt/hash.
+    std::string salt;
+    REQUIRE(recvLine(sock, salt));
+    REQUIRE(salt.size() == XDRServer::SALT_LENGTH);
+
+    const std::string badHash = "P0000000000000000000000000000000000000000\n";
+    REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(badHash.data()),
+                    badHash.size()));
+    REQUIRE(waitForPrefixLine(sock, "a0", std::chrono::milliseconds(1000)));
+
+    const std::string tune = "T101700\n";
+    REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(tune.data()),
+                    tune.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(tunedHz.load() == 0u);
+    closeSock(sock);
+  }
+
+  // With the correct hash the same sequence works.
+  {
+    int sock = connectLoopback(port);
+    setRecvTimeoutMs(sock, 2500);
+    const std::string startup = "x\n";
+    REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(startup.data()),
+                    startup.size()));
+    REQUIRE(waitForExactLine(sock, "OK", std::chrono::milliseconds(1000)));
+
+    std::string salt;
+    REQUIRE(recvLine(sock, salt));
+    REQUIRE(salt.size() == XDRServer::SALT_LENGTH);
+
+    const std::string hash = sha1Hex(salt + "secret123") + "\n";
+    REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(hash.data()),
+                    hash.size()));
+
+    const std::string tune = "T101700\n";
+    REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(tune.data()),
+                    tune.size()));
+    REQUIRE(waitForPrefixLine(sock, "OK", std::chrono::milliseconds(1000)));
+    REQUIRE(tunedHz.load() == 101700000u);
+    closeSock(sock);
+  }
+
+  server.stop();
+}
+
+TEST_CASE("XDRServer reports the real number of connected clients",
+          "[protocol][xdr]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  server.setGuestMode(true);
+  REQUIRE(server.start());
+
+  int first = connectLoopback(port);
+  setRecvTimeoutMs(first, 2500);
+  std::string line;
+  REQUIRE(recvLine(first, line)); // salt
+  const std::string badHash = "P0000000000000000000000000000000000000000\n";
+  REQUIRE(sendAll(first, reinterpret_cast<const uint8_t *>(badHash.data()),
+                  badHash.size()));
+  REQUIRE(waitForPrefixLine(first, "a1", std::chrono::milliseconds(1000)));
+  REQUIRE(waitForPrefixLine(first, "o0,1", std::chrono::milliseconds(1000)));
+
+  // A second guest joins: the count goes to two and the first client is
+  // told about it. The server used to synthesise the line from the
+  // *current* session's own role, so it always claimed exactly one user.
+  int second = connectLoopback(port);
+  setRecvTimeoutMs(second, 2500);
+  REQUIRE(recvLine(second, line)); // salt
+  REQUIRE(sendAll(second, reinterpret_cast<const uint8_t *>(badHash.data()),
+                  badHash.size()));
+  REQUIRE(waitForPrefixLine(second, "a1", std::chrono::milliseconds(1000)));
+  REQUIRE(waitForPrefixLine(second, "o0,2", std::chrono::milliseconds(1000)));
+
+  // The first client is notified of the new arrival.
+  REQUIRE(waitForPrefixLine(first, "o0,2", std::chrono::milliseconds(1000)));
+
+  // When the second client leaves the count drops again.
+  closeSock(second);
+  REQUIRE(waitForPrefixLine(first, "o0,1", std::chrono::milliseconds(2000)));
+
+  closeSock(first);
+  server.stop();
+}
+
+TEST_CASE("XDRServer accepts a pipelined FM-DX startup and auth hash",
+          "[protocol][xdr][fmdx]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  server.setPassword("secret123");
+  server.setGuestMode(false);
+  REQUIRE(server.start());
+
+  std::atomic<uint32_t> tunedHz{0};
+  server.setFrequencyCallback(
+      [&](uint32_t f) { tunedHz.store(f, std::memory_order_relaxed); });
+
+  int sock = connectLoopback(port);
+  setRecvTimeoutMs(sock, 2500);
+
+  // The client sends the startup line and then the hash. If the server
+  // reads the hash with a separate blocking read it would swallow the line
+  // already sitting in the command buffer, and the client would hang
+  // waiting for a reply that never comes.
+  const std::string startup = "x\n";
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(startup.data()),
+                  startup.size()));
+  REQUIRE(waitForExactLine(sock, "OK", std::chrono::milliseconds(1000)));
+
+  std::string salt;
+  REQUIRE(recvLine(sock, salt));
+  REQUIRE(salt.size() == XDRServer::SALT_LENGTH);
+
+  // The hash and the first command arrive in one write.
+  const std::string payload = sha1Hex(salt + "secret123") + "\nT101700\n";
+  REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(payload.data()),
+                  payload.size()));
+  REQUIRE(waitForPrefixLine(sock, "OK", std::chrono::milliseconds(1000)));
+  REQUIRE(tunedHz.load() == 101700000u);
+
+  closeSock(sock);
+  server.stop();
+}
+
+TEST_CASE("XDRServer: a bystander disconnect does not cancel a scan",
+          "[protocol][xdr]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  server.setPassword("secret123");
+  server.setGuestMode(false);
+  REQUIRE(server.start());
+
+  // The scan owner connects and authenticates, then arms a scan.
+  int owner = connectLoopback(port);
+  setRecvTimeoutMs(owner, 2500);
+  std::string line;
+  REQUIRE(recvLine(owner, line));
+  REQUIRE(line.size() == XDRServer::SALT_LENGTH);
+  const std::string hash = sha1Hex(line + "secret123") + "\n";
+  REQUIRE(sendAll(owner, reinterpret_cast<const uint8_t *>(hash.data()),
+                  hash.size()));
+  REQUIRE(waitForPrefixLine(owner, "a2", std::chrono::milliseconds(1000)));
+
+  const std::string arm = "S\n";
+  REQUIRE(sendAll(owner, reinterpret_cast<const uint8_t *>(arm.data()),
+                  arm.size()));
+  // The command is processed on the client thread, so give it a moment to
+  // reach the handler before asking whether the scan was armed.
+  XDRServer::ScanConfig cfg{};
+  bool armed = false;
+  for (int i = 0; i < 20 && !armed; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    armed = server.consumeScanStart(cfg);
+  }
+  REQUIRE(armed);
+
+  // A second client authenticates and then disconnects. It never armed the
+  // scan, so the owner's sweep must survive. (The bystander has to get past
+  // the auth phase: a client that is rejected with "a0" returns before the
+  // command loop, so it never reaches the disconnect handling at all.)
+  int bystander = connectLoopback(port);
+  setRecvTimeoutMs(bystander, 2500);
+  REQUIRE(recvLine(bystander, line));
+  const std::string bystanderHash = sha1Hex(line + "secret123") + "\n";
+  REQUIRE(sendAll(bystander,
+                  reinterpret_cast<const uint8_t *>(bystanderHash.data()),
+                  bystanderHash.size()));
+  REQUIRE(waitForPrefixLine(bystander, "a2", std::chrono::milliseconds(1000)));
+  closeSock(bystander);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  REQUIRE_FALSE(server.consumeScanCancel());
+
+  closeSock(owner);
   server.stop();
 }

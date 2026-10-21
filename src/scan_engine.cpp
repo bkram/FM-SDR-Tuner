@@ -174,15 +174,18 @@ bool ScanEngine::runIfActive(
 
     const float binHz = static_cast<float>(iqSampleRate) /
                         static_cast<float>(nfft);
-    const int binHalf = std::max(
-        1, static_cast<int>(std::lround((channelBandwidthHz * 0.5f) / binHz)));
-    const int dcRejectBins = std::max(
-        1, static_cast<int>(std::lround(kDcRejectHz / std::max(binHz, 1.0f))));
+    const int binHalf =
+        std::max(1, static_cast<int>(std::lround(
+                        (static_cast<float>(channelBandwidthHz) * 0.5f) / binHz)));
+    const int dcRejectBins =
+        std::max(1, static_cast<int>(std::lround(
+                        static_cast<float>(kDcRejectHz) / std::max(binHz, 1.0f))));
     const int guardBins = std::max(
         1, static_cast<int>(std::lround(6000.0f / std::max(binHz, 1.0f))));
-    const int sideSpanBins = std::max(
-        binHalf, static_cast<int>(std::lround((channelBandwidthHz * 0.35f) /
-                                              std::max(binHz, 1.0f))));
+    const int sideSpanBins =
+        std::max(binHalf, static_cast<int>(std::lround(
+                            (static_cast<float>(channelBandwidthHz) * 0.35f) /
+                            std::max(binHz, 1.0f))));
     if (!m_fftState.ensureSize(nfft)) {
       return false;
     }

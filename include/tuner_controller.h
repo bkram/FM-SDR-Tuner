@@ -32,6 +32,9 @@ public:
   // No-ops for RTL sources.
   void configureSdrplay(int lnaState, int antenna, bool biasTee);
 
+  // Gate the source's own diagnostics behind the application's verbose flag.
+  void setVerboseLogging(bool enable);
+
   void setLowLatencyMode(bool enable);
 
   bool connect();

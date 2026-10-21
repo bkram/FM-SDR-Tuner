@@ -59,21 +59,6 @@ bool parseInt(const std::string &raw, int &out) {
   }
 }
 
-bool parseFloat(const std::string &raw, float &out) {
-  try {
-    const std::string t = trim(raw);
-    size_t idx = 0;
-    const float value = std::stof(t, &idx);
-    if (idx != t.size()) {
-      return false;
-    }
-    out = value;
-    return true;
-  } catch (...) {
-    return false;
-  }
-}
-
 bool parseDouble(const std::string &raw, double &out) {
   try {
     const std::string t = trim(raw);

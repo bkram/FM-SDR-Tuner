@@ -18,7 +18,7 @@ bool handleControlAndScan(
     std::atomic<uint32_t> &requestedFrequencyHz,
     std::atomic<bool> &pendingFrequency, std::atomic<bool> &pendingGain,
     std::atomic<bool> &pendingAGC, std::atomic<int> &requestedBandwidthHz,
-    std::atomic<bool> &pendingBandwidth, int &appliedBandwidthHz,
+    std::atomic<bool> &pendingBandwidth, std::atomic<int> &appliedBandwidthHz,
     bool rtlConnected, bool verboseLogging, AudioOutput &audioOut,
     fm_tuner::dsp::Runtime &dspRuntime, RdsWorker &rdsWorker,
     DspPipeline &dspPipeline, size_t kRetuneMuteSamples,
@@ -35,8 +35,8 @@ bool handleControlAndScan(
     const std::function<uint32_t(bool)> &setScanWideMode, bool &scanWideActive,
     uint32_t &scanWideRate, const std::function<void()> &tunerFlush) {
   scanEngine.handleControl(xdrServer, requestedFrequencyHz.load(),
-                           appliedBandwidthHz, rtlConnected, verboseLogging,
-                           requestedBandwidthHz, pendingBandwidth,
+                           appliedBandwidthHz.load(), rtlConnected,
+                           verboseLogging, requestedBandwidthHz, pendingBandwidth,
                            restoreAfterScan);
 
   if (rtlConnected && pendingFrequency.exchange(false)) {
@@ -79,11 +79,12 @@ bool handleControlAndScan(
 
   if (bandwidthChanged) {
     const int targetBandwidthHz = requestedBandwidthHz.load();
-    if (targetBandwidthHz != appliedBandwidthHz) {
+    const int previousBandwidthHz = appliedBandwidthHz.load();
+    if (targetBandwidthHz != previousBandwidthHz) {
       dspPipeline.setBandwidthHz(targetBandwidthHz);
       if (verboseLogging) {
         std::cout << "[BW] applied W" << targetBandwidthHz << " (previous W"
-                  << appliedBandwidthHz << ")\n";
+                  << previousBandwidthHz << ")\n";
       }
       appliedBandwidthHz = targetBandwidthHz;
     }

@@ -193,9 +193,11 @@ int runBandSweep(const BandSweepOptions &options) {
     dbfsSorted.push_back(row.dbfs);
   }
   std::sort(dbfsSorted.begin(), dbfsSorted.end());
-  const double p05 = dbfsSorted[static_cast<size_t>(dbfsSorted.size() * 0.05)];
+  const double p05 =
+      dbfsSorted[static_cast<size_t>(static_cast<double>(dbfsSorted.size()) * 0.05)];
   const double p50 = dbfsSorted[dbfsSorted.size() / 2];
-  const double p95 = dbfsSorted[static_cast<size_t>(dbfsSorted.size() * 0.95)];
+  const double p95 =
+      dbfsSorted[static_cast<size_t>(static_cast<double>(dbfsSorted.size()) * 0.95)];
   const double pMax = dbfsSorted.back();
   const double pMin = dbfsSorted.front();
 
@@ -221,7 +223,8 @@ int runBandSweep(const BandSweepOptions &options) {
   // meaningful percentile (e.g. very hot antenna with no gain reduction).
   const double cleanP95 =
       (dbfsCleanSorted.size() >= 10)
-          ? dbfsCleanSorted[static_cast<size_t>(dbfsCleanSorted.size() * 0.95)]
+          ? dbfsCleanSorted[static_cast<size_t>(
+                static_cast<double>(dbfsCleanSorted.size()) * 0.95)]
           : p95;
 
   std::cout << "\n[CALIBRATE] signal envelope: min=" << pMin << " p05=" << p05

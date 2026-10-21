@@ -36,9 +36,12 @@ private:
   void asyncReadLoop();
   size_t availableBytesLocked() const;
 
-  uint32_t m_deviceIndex;
+  // These three are only read inside the FM_TUNER_HAS_RTLSDR branch; a build
+  // without librtlsdr keeps the members (so the layout and the constructor
+  // stay the same) but never touches them.
+  [[maybe_unused]] uint32_t m_deviceIndex;
   std::atomic<bool> m_connected;
-  void *m_deviceHandle;
+  [[maybe_unused]] void *m_deviceHandle;
   std::vector<int> m_supportedGains;
   std::thread m_asyncThread;
   std::atomic<bool> m_asyncRunning;

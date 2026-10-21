@@ -25,6 +25,7 @@
 #include "scan_engine.h"
 #include "signal_level.h"
 #include "tuner_controller.h"
+#include "tuning_limits.h"
 #include "tuner_session.h"
 #include "wav_writer.h"
 #include "xdr_facade.h"
@@ -301,9 +302,16 @@ int Application::run() {
 
   signal(SIGINT, signalHandler);
   signal(SIGTERM, signalHandler);
+  // A control-plane peer that disconnects mid-write (browser tab closing during
+  // a REST poll, an rtl_tcp server going away) raises SIGPIPE, whose default
+  // disposition terminates the process. The per-socket MSG_NOSIGNAL /
+  // SO_NOSIGPIPE guards cover the sends we control; this is the belt-and-braces
+  // backstop so no future socket path can take the tuner down.
+  signal(SIGPIPE, SIG_IGN);
 
   TunerController tuner(tunerSource, tcpHost, tcpPort, rtlDeviceIndex);
   tuner.setLowLatencyMode(lowLatencyIq);
+  tuner.setVerboseLogging(verboseLogging);
   if (tuner.isSdrPlay()) {
     tuner.configureSdrplay(config.sdrplay.lna_state, config.sdrplay.antenna,
                            config.sdrplay.bias_tee);
@@ -537,7 +545,7 @@ int Application::run() {
     }
   }
   dspRuntime.addResetHandler([&]() { dspPipeline.reset(); });
-  int appliedBandwidthHz = requestedBandwidthHz.load();
+  std::atomic<int> appliedBandwidthHz{requestedBandwidthHz.load()};
   int appliedDeemphasis = requestedDeemphasis.load();
   bool appliedForceMono = requestedForceMono.load();
   bool appliedEffectiveForceMono = appliedForceMono;
@@ -551,7 +559,7 @@ int Application::run() {
   SignalLevelSmoother rfLevelSmoother;
   dspPipeline.setDeemphasisMode(appliedDeemphasis);
   dspPipeline.setForceMono(appliedEffectiveForceMono);
-  dspPipeline.setBandwidthHz(appliedBandwidthHz);
+  dspPipeline.setBandwidthHz(appliedBandwidthHz.load());
 
   AudioOutput audioOut;
   WavWriter mpxWavOut;
@@ -684,21 +692,41 @@ int Application::run() {
   if (config.rest.enabled && config.rest.port != 0) {
     RestServer::Controls controls;
     controls.setFrequencyHz = [&](uint32_t hz) {
+      // Reject out-of-band frequencies here rather than at the parse site:
+      // this is the single funnel every REST retune passes through, and the
+      // XDR path applies the same band check (xdr_server.cpp 'T' handler).
+      if (!fm_tuner::isValidFmBroadcastFreqHz(hz)) {
+        return false;
+      }
       requestedFrequencyHz.store(hz, std::memory_order_relaxed);
       pendingFrequency.store(true, std::memory_order_release);
       return true;
     };
+    // Each setter below updates restPanel only after the underlying tuner
+    // call succeeds. Writing the panel first meant a rejected change (a
+    // disconnected SDRplay, a refused gain step) still left /api/status
+    // reporting a value the hardware never accepted.
     controls.setGainDb = [&](double db) {
-      restPanel.gainDb = std::clamp(db, 0.0, 50.0);
+      const double clamped = std::clamp(db, 0.0, 50.0);
+      if (!tuner.setGainMode(true)) {
+        return false;
+      }
+      if (!tuner.setGain(static_cast<uint32_t>(std::lround(clamped * 10.0)))) {
+        return false;
+      }
+      restPanel.gainDb = clamped;
       restPanel.autoGain = false;
-      tuner.setGainMode(true);
-      return tuner.setGain(
-          static_cast<uint32_t>(std::lround(restPanel.gainDb * 10.0)));
+      return true;
     };
     controls.setAutoGain = [&](bool on) {
+      if (!tuner.setGainMode(!on)) {
+        return false;
+      }
+      if (!tuner.setAGC(on)) {
+        return false;
+      }
       restPanel.autoGain = on;
-      tuner.setGainMode(!on);
-      return tuner.setAGC(on);
+      return true;
     };
     controls.setBandwidthHz = [&](int hz) {
       requestedBandwidthHz = hz;
@@ -706,24 +734,39 @@ int Application::run() {
       return true;
     };
     controls.setLnaState = [&](int s) {
+      if (!tuner.setLnaState(s)) {
+        return false;
+      }
       restPanel.lna = s;
-      return tuner.setLnaState(s);
+      return true;
     };
     controls.setAntenna = [&](int i) {
+      if (!tuner.setAntenna(i)) {
+        return false;
+      }
       restPanel.antenna = i;
-      return tuner.setAntenna(i);
+      return true;
     };
     controls.setBiasTee = [&](bool e) {
+      if (!tuner.setBiasTee(e)) {
+        return false;
+      }
       restPanel.biasTee = e;
-      return tuner.setBiasTee(e);
+      return true;
     };
     controls.setPpm = [&](int ppm) {
+      if (!tuner.setFrequencyCorrection(ppm)) {
+        return false;
+      }
       restPanel.ppm = ppm;
-      return tuner.setFrequencyCorrection(ppm);
+      return true;
     };
     controls.setRtlAgc = [&](bool e) {
+      if (!tuner.setAGC(e)) {
+        return false;
+      }
       restPanel.rtlAgc = e;
-      return tuner.setAGC(e);
+      return true;
     };
     controls.setDeemphasis = [&](int m) {
       if (m < 0 || m > 2) return false;
@@ -770,7 +813,7 @@ int Application::run() {
           << tuner.modelName() << "\",\"antenna_count\":" << tuner.antennaCount()
           << ",\"running\":" << (tunerActive.load() ? "true" : "false")
           << ",\"frequency_hz\":" << requestedFrequencyHz.load()
-          << ",\"bandwidth_hz\":" << appliedBandwidthHz
+          << ",\"bandwidth_hz\":" << appliedBandwidthHz.load()
           << ",\"gain_db\":" << restPanel.gainDb
           << ",\"auto_gain\":" << (restPanel.autoGain ? "true" : "false")
           << ",\"lna\":" << restPanel.lna << ",\"antenna\":" << restPanel.antenna
@@ -1020,8 +1063,10 @@ int Application::run() {
         continue;
       }
       for (size_t i = 0; i < samples; i++) {
-        const float si = std::lround(iqComplexStorage[i].real() * 127.5f + 127.5f);
-        const float sq = std::lround(iqComplexStorage[i].imag() * 127.5f + 127.5f);
+        const float si = static_cast<float>(
+            std::lround(iqComplexStorage[i].real() * 127.5f + 127.5f));
+        const float sq = static_cast<float>(
+            std::lround(iqComplexStorage[i].imag() * 127.5f + 127.5f));
         iqBuffer[2 * i] = static_cast<uint8_t>(std::clamp(si, 0.0f, 255.0f));
         iqBuffer[2 * i + 1] = static_cast<uint8_t>(std::clamp(sq, 0.0f, 255.0f));
       }
@@ -1035,7 +1080,7 @@ int Application::run() {
     }
 
     (void)processing_runner::processAudioBlock(
-        iqBuffer, samples, OUTPUT_RATE, iqSampleRate, appliedBandwidthHz,
+        iqBuffer, samples, OUTPUT_RATE, iqSampleRate, appliedBandwidthHz.load(),
         effectiveAppliedGainDb(),
         kSignalGainCompFactor, config, verboseLogging, rfLevelSmoother,
         [&](const SignalLevelResult &signal, double clipRatio,
@@ -1054,7 +1099,8 @@ int Application::run() {
               rfLevelFiltered, verboseLogging, agcModeToGainDb);
           runtime_loop::maybeAdjustAdaptiveBandwidth(
               adaptiveBwMode, adaptiveBwState, requestedBandwidthHz,
-              pendingBandwidth, appliedBandwidthHz, signal, verboseLogging);
+              pendingBandwidth, appliedBandwidthHz.load(), signal,
+              verboseLogging);
         },
         targetForceMono, appliedEffectiveForceMono, dspPipeline, rdsWorker,
         xdrServer, retuneMuteSamplesRemaining, retuneMuteTotalSamples, audioOut,

@@ -127,7 +127,10 @@ TEST_CASE("XDR processCommand updates state and invokes callbacks", "[xdr_unit]"
   REQUIRE(xdr.processCommand("T101700000", true, false) == "T101700");
   REQUIRE(tuned.load() == 101700000u);
 
-  REQUIRE(xdr.processCommand("T14900", true, false).empty());
+  // An out-of-band tune is rejected and answered with the *current*
+  // frequency, so the client can tell "rejected" from "not yet applied"
+  // (the server used to answer with silence).
+  REQUIRE(xdr.processCommand("T14900", true, false) == "T101700");
   REQUIRE(tuned.load() == 101700000u);
   REQUIRE(xdr.getFrequency() == 101700000u);
 
@@ -135,6 +138,17 @@ TEST_CASE("XDR processCommand updates state and invokes callbacks", "[xdr_unit]"
   REQUIRE(volume.load() == 77);
   REQUIRE(xdr.getVolume() == 77);
 
+  REQUIRE(xdr.processCommand("W250000", true, false) == "W250000");
+  REQUIRE(xdr.getBandwidth() == 250000);
+
+  // 'W' is clamped to the widest bandwidth the tuner can actually measure.
+  // Beyond the sample rate the signal-meter estimator's side-band window
+  // wraps back over the channel and the meter measures the signal as its own
+  // noise floor.
+  REQUIRE(xdr.processCommand("W999999999", true, false) == "W256000");
+  REQUIRE(xdr.getBandwidth() == 256000);
+  REQUIRE(xdr.processCommand("W-1", true, false) == "W0");
+  REQUIRE(xdr.getBandwidth() == 0);
   REQUIRE(xdr.processCommand("W250000", true, false) == "W250000");
   REQUIRE(xdr.getBandwidth() == 250000);
 
@@ -192,6 +206,80 @@ TEST_CASE("XDR scan commands are clamped and exposed via consumeScanStart",
   REQUIRE(cfg.bandwidthHz == 400000);
   REQUIRE(cfg.antenna == 9);
   REQUIRE(cfg.continuous);
+}
+
+TEST_CASE("XDR guest sessions cannot change tuner state", "[xdr_unit]") {
+  XDRServer xdr;
+  xdr.setVerboseLogging(false);
+
+  std::atomic<uint32_t> tuned{0};
+  std::atomic<int> volume{0};
+  std::atomic<int> startCalls{0};
+  xdr.setFrequencyCallback([&](uint32_t f) { tuned = f; });
+  xdr.setVolumeCallback([&](int v) { volume = v; });
+  xdr.setStartCallback([&]() { startCalls++; });
+
+  // A guest is not authenticated: every state-changing command is refused
+  // with "a0" and never reaches the tuner.
+  const char *forbidden[] = {"T101700", "Y77", "A3", "B1", "I250,1",
+                             "x",     "X",   "W60000", "G20", "M1"};
+  for (const char *cmd : forbidden) {
+    REQUIRE(xdr.processCommand(cmd, false, true) == "a0");
+  }
+  REQUIRE(tuned.load() == 0u);
+  REQUIRE(volume.load() == 0);
+  REQUIRE(startCalls.load() == 0);
+
+  // Read-only queries still answer.
+  REQUIRE(xdr.processCommand("N", false, true).rfind("N", 0) == 0);
+  // The "o" line reports the real number of connected clients. This test
+  // drives processCommand() directly without a socket, so nobody is
+  // connected.
+  REQUIRE(xdr.processCommand("o", false, true) == "o0,0");
+  REQUIRE(xdr.processCommand("I", false, true).rfind("I", 0) == 0);
+
+  // An authenticated session gets the same commands through.
+  REQUIRE(xdr.processCommand("T101700", true, false) == "T101700");
+  REQUIRE(tuned.load() == 101700000u);
+}
+
+TEST_CASE("XDR tune resets the RDS PI history", "[xdr_unit]") {
+  XDRServer xdr;
+  xdr.setVerboseLogging(false);
+
+  // Feed enough clean groups for the PI to be reported.
+  for (int i = 0; i < 8; i++) {
+    xdr.updateRDS(0x1234, 0xABCD, 0x1111, 0x2222, 0x00);
+  }
+  {
+    std::lock_guard<std::mutex> lock(xdr.m_rdsMutex);
+    REQUIRE(xdr.m_piLastValue == 0x1234);
+    REQUIRE(xdr.m_piFill > 0);
+  }
+
+  // A tune must clear the previous station's PI history.
+  REQUIRE(xdr.processCommand("T101700", true, false) == "T101700");
+  {
+    std::lock_guard<std::mutex> lock(xdr.m_rdsMutex);
+    REQUIRE(xdr.m_piLastValue == 0xFFFF);
+    REQUIRE(xdr.m_piFill == 0);
+  }
+
+  // setFrequencyState() must also reset when it is told about a new
+  // frequency, even though m_frequency was already updated by the command.
+  for (int i = 0; i < 8; i++) {
+    xdr.updateRDS(0x5678, 0xABCD, 0x1111, 0x2222, 0x00);
+  }
+  {
+    std::lock_guard<std::mutex> lock(xdr.m_rdsMutex);
+    REQUIRE(xdr.m_piLastValue == 0x5678);
+  }
+  xdr.setFrequencyState(90900000u);
+  {
+    std::lock_guard<std::mutex> lock(xdr.m_rdsMutex);
+    REQUIRE(xdr.m_piLastValue == 0xFFFF);
+    REQUIRE(xdr.m_piFill == 0);
+  }
 }
 
 TEST_CASE("XDR updateRDS suppresses groups with block B errors", "[xdr_unit]") {

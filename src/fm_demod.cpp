@@ -9,7 +9,6 @@
 #include <limits>
 
 namespace {
-constexpr float kPi = 3.14159265358979323846f;
 constexpr std::array<int, 30> kXdrFmBwHz = {
     309000, 298000, 281000, 263000, 246000, 229000, 211000, 194000,
     177000, 159000, 142000, 125000, 108000, 95000,  90000,  83000,

@@ -31,6 +31,20 @@ void closeSocket(int sock) {
 #endif
 }
 
+// The length argument of send()/recv() is size_t on POSIX and int on
+// Windows. Clamp to int on Windows (a single socket transfer never reaches
+// 2 GB) and pass the size_t through unchanged elsewhere, so neither platform
+// trips a sign-conversion warning.
+#if defined(_WIN32)
+using SocketLength = int;
+inline SocketLength socketLength(size_t n) {
+  return static_cast<int>(n > 0x7FFFFFFFu ? 0x7FFFFFFFu : n);
+}
+#else
+using SocketLength = size_t;
+inline SocketLength socketLength(size_t n) { return n; }
+#endif
+
 int lastSocketError() {
 #if defined(_WIN32)
   return WSAGetLastError();
@@ -200,8 +214,17 @@ bool RTLTCPClient::sendAll(const uint8_t *data, size_t len) {
 
   size_t sent = 0;
   while (sent < len) {
-    const auto n = send(m_socket, reinterpret_cast<const char *>(data + sent),
-                        static_cast<int>(len - sent), 0);
+    // MSG_NOSIGNAL: a server that vanishes mid-command must surface as a
+    // failed send, not as a SIGPIPE that terminates the tuner process.
+#if defined(MSG_NOSIGNAL)
+    const long n = static_cast<long>(
+        send(m_socket, reinterpret_cast<const char *>(data + sent),
+             socketLength(len - sent), MSG_NOSIGNAL));
+#else
+    const long n = static_cast<long>(
+        send(m_socket, reinterpret_cast<const char *>(data + sent),
+             socketLength(len - sent), 0));
+#endif
     if (n <= 0) {
       return false;
     }
@@ -229,12 +252,13 @@ bool RTLTCPClient::readResponse(uint8_t *buffer, size_t len) {
 
   size_t totalRead = 0;
   while (totalRead < len) {
-    const auto n = recv(m_socket, reinterpret_cast<char *>(buffer + totalRead),
-                        static_cast<int>(len - totalRead), 0);
+    const long n = static_cast<long>(
+        recv(m_socket, reinterpret_cast<char *>(buffer + totalRead),
+             socketLength(len - totalRead), 0));
     if (n <= 0) {
       return false;
     }
-    totalRead += n;
+    totalRead += static_cast<size_t>(n);
   }
   return true;
 }
@@ -256,8 +280,9 @@ size_t RTLTCPClient::readIQ(uint8_t *buffer, size_t maxSamples) {
   }
 
   while (totalRead < bytesToRead) {
-    const auto n = recv(m_socket, reinterpret_cast<char *>(buffer + totalRead),
-                        static_cast<int>(bytesToRead - totalRead), 0);
+    const long n = static_cast<long>(
+        recv(m_socket, reinterpret_cast<char *>(buffer + totalRead),
+             socketLength(bytesToRead - totalRead), 0));
     if (n > 0) {
       totalRead += static_cast<size_t>(n);
       continue;

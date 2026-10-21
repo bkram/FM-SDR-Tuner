@@ -1,22 +1,11 @@
 #include "signal_level.h"
 
-#include "cpu_features.h"
 #include "dsp/iq_saturation.h"
 #include "dsp/liquid_primitives.h"
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <complex>
 #include <vector>
-
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
-    defined(_M_IX86)
-#include <immintrin.h>
-#endif
-
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
-#include <arm_neon.h>
-#endif
 
 namespace {
 
@@ -26,132 +15,15 @@ constexpr double kPowerFloor = 1e-20;
 constexpr double kSignalLevelSnrGateDb = 3.0;
 constexpr double kSignalLevelSnrCeilDb = 30.0;
 
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
-    defined(_M_IX86)
-#if defined(__has_attribute)
-#if __has_attribute(target)
-#define SIGLEV_HAS_AVX2 1
-#define SIGLEV_AVX2_TARGET __attribute__((target("avx2,fma")))
-#endif
-#elif defined(__GNUC__)
-#define SIGLEV_HAS_AVX2 1
-#define SIGLEV_AVX2_TARGET __attribute__((target("avx2,fma")))
-#endif
-#if !defined(SIGLEV_HAS_AVX2) && defined(_MSC_VER) && defined(__AVX2__)
-#define SIGLEV_HAS_AVX2 1
-#define SIGLEV_AVX2_TARGET
-#endif
-#endif
-
-#ifndef SIGLEV_HAS_AVX2
-#define SIGLEV_HAS_AVX2 0
-#define SIGLEV_AVX2_TARGET
-#endif
-
-double computeNormalizedIqPowerSumScalar(const uint8_t *iq, size_t count,
-                                         const float *lut) {
-  double powerSum = 0.0;
-  size_t i = 0;
-  for (; i + 4 <= count; i += 4) {
-    powerSum += lut[iq[i]];
-    powerSum += lut[iq[i + 1]];
-    powerSum += lut[iq[i + 2]];
-    powerSum += lut[iq[i + 3]];
+// Map a signed FFT bin offset onto the [0, nfft) range. The scan engine uses
+// the same wrapping for its own estimator; keeping the two consistent means
+// an index can never run off the end of the transform output.
+size_t wrapBin(int bin, size_t nfft) {
+  int wrapped = bin % static_cast<int>(nfft);
+  if (wrapped < 0) {
+    wrapped += static_cast<int>(nfft);
   }
-  for (; i < count; i++) {
-    powerSum += lut[iq[i]];
-  }
-  return powerSum;
-}
-
-#if SIGLEV_HAS_AVX2
-SIGLEV_AVX2_TARGET double computeNormalizedIqPowerSumAvx2(const uint8_t *iq,
-                                                          size_t count,
-                                                          const float *lut) {
-  __m256 acc = _mm256_setzero_ps();
-  size_t i = 0;
-  for (; i + 8 <= count; i += 8) {
-    const __m128i b8 =
-        _mm_loadl_epi64(reinterpret_cast<const __m128i *>(iq + i));
-    const __m256i idx = _mm256_cvtepu8_epi32(b8);
-    const __m256 vals = _mm256_i32gather_ps(lut, idx, 4);
-    acc = _mm256_add_ps(acc, vals);
-  }
-  alignas(32) float lanes[8];
-  _mm256_store_ps(lanes, acc);
-  double powerSum = lanes[0] + lanes[1] + lanes[2] + lanes[3] + lanes[4] +
-                    lanes[5] + lanes[6] + lanes[7];
-  for (; i < count; i++) {
-    powerSum += lut[iq[i]];
-  }
-  return powerSum;
-}
-#endif
-
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
-double computeNormalizedIqPowerSumNeon(const uint8_t *iq, size_t count) {
-  const float32x4_t vMid = vdupq_n_f32(127.0f);
-  const float32x4_t vInv = vdupq_n_f32(1.0f / 127.5f);
-  float32x4_t acc = vdupq_n_f32(0.0f);
-  size_t i = 0;
-  for (; i + 16 <= count; i += 16) {
-    const uint8x16_t v = vld1q_u8(iq + i);
-    const uint16x8_t lo16 = vmovl_u8(vget_low_u8(v));
-    const uint16x8_t hi16 = vmovl_u8(vget_high_u8(v));
-    const uint32x4_t lo32a = vmovl_u16(vget_low_u16(lo16));
-    const uint32x4_t lo32b = vmovl_u16(vget_high_u16(lo16));
-    const uint32x4_t hi32a = vmovl_u16(vget_low_u16(hi16));
-    const uint32x4_t hi32b = vmovl_u16(vget_high_u16(hi16));
-    float32x4_t f0 = vcvtq_f32_u32(lo32a);
-    float32x4_t f1 = vcvtq_f32_u32(lo32b);
-    float32x4_t f2 = vcvtq_f32_u32(hi32a);
-    float32x4_t f3 = vcvtq_f32_u32(hi32b);
-    f0 = vmulq_f32(vsubq_f32(f0, vMid), vInv);
-    f1 = vmulq_f32(vsubq_f32(f1, vMid), vInv);
-    f2 = vmulq_f32(vsubq_f32(f2, vMid), vInv);
-    f3 = vmulq_f32(vsubq_f32(f3, vMid), vInv);
-    acc = vaddq_f32(acc, vmulq_f32(f0, f0));
-    acc = vaddq_f32(acc, vmulq_f32(f1, f1));
-    acc = vaddq_f32(acc, vmulq_f32(f2, f2));
-    acc = vaddq_f32(acc, vmulq_f32(f3, f3));
-  }
-#if defined(__aarch64__)
-  double powerSum = static_cast<double>(vaddvq_f32(acc));
-#else
-  float tmp[4];
-  vst1q_f32(tmp, acc);
-  double powerSum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
-#endif
-  for (; i < count; i++) {
-    const float norm = (static_cast<float>(iq[i]) - 127.0f) * (1.0f / 127.5f);
-    powerSum += static_cast<double>(norm * norm);
-  }
-  return powerSum;
-}
-#endif
-
-double computeNormalizedIqPowerSum(const uint8_t *iq, size_t samples) {
-  static const std::array<float, 256> kNormSqLut = []() {
-    std::array<float, 256> lut{};
-    for (int v = 0; v < 256; v++) {
-      const float norm = (static_cast<float>(v) - 127.0f) / 127.5f;
-      lut[static_cast<size_t>(v)] = norm * norm;
-    }
-    return lut;
-  }();
-  const size_t count = samples * 2;
-  static const CPUFeatures cpu = detectCPUFeatures();
-#if SIGLEV_HAS_AVX2
-  if (cpu.avx2 && cpu.fma) {
-    return computeNormalizedIqPowerSumAvx2(iq, count, kNormSqLut.data());
-  }
-#endif
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
-  if (cpu.neon) {
-    return computeNormalizedIqPowerSumNeon(iq, count);
-  }
-#endif
-  return computeNormalizedIqPowerSumScalar(iq, count, kNormSqLut.data());
+  return static_cast<size_t>(wrapped);
 }
 
 size_t nearestPow2(size_t n) {
@@ -218,14 +90,43 @@ ChannelPowerEstimate estimateCenteredChannelPower(const uint8_t *iq,
   }
 
   const int bandHalf = std::max(
-      1, static_cast<int>(std::lround((channelBandwidthHz * 0.5f) / binHz)));
+      1, static_cast<int>(std::lround((static_cast<float>(channelBandwidthHz) * 0.5f) / binHz)));
   const int dcRejectBins =
       std::max(1, static_cast<int>(std::lround(4000.0f / binHz)));
   const int guardBins =
       std::max(1, static_cast<int>(std::lround(4000.0f / binHz)));
-  const int sideSpanBins = std::max(
-      bandHalf, static_cast<int>(std::lround((channelBandwidthHz * 0.5f) / binHz)));
   if (bandHalf <= dcRejectBins) {
+    return out;
+  }
+  const int maxBin = static_cast<int>(nfft) - 1;
+  if (bandHalf > maxBin) {
+    return out;
+  }
+  // The side band measures the noise *away* from the channel. Its window
+  // spans magnitudes [bandHalf + guard, bandHalf + guard + sideSpan]. The
+  // negative-frequency half of that window must stay below the transform's
+  // Nyquist point (nfft/2): once it passes that, it aliases onto the
+  // positive half of the spectrum where the station sits, the "noise"
+  // estimate picks up the signal itself, the noise floor collapses onto the
+  // signal power, the SNR pins to 0 and a strong station reads as no signal
+  // at all.
+  //
+  // The window does not have to be as wide as the channel — it only needs
+  // enough bins for a stable noise estimate — so it is *capped* to whatever
+  // fits below Nyquist rather than being dropped entirely. The mean is over
+  // the same number of bins on both sides, so the noise power is still
+  // estimated per bin and scaled to the channel width.
+  const int nyquistBin = static_cast<int>(nfft) / 2;
+  const int sideSpanBins = std::max(
+      bandHalf, static_cast<int>(std::lround((static_cast<float>(channelBandwidthHz) * 0.5f) / binHz)));
+  const int maxSideSpan = nyquistBin - bandHalf - guardBins;
+  if (maxSideSpan <= 0) {
+    // The channel itself already reaches Nyquist: no side band exists.
+    return out;
+  }
+  const int effectiveSideSpan = std::min(sideSpanBins, maxSideSpan);
+  const int sideOuter = bandHalf + guardBins + effectiveSideSpan;
+  if (sideOuter > maxBin) {
     return out;
   }
 
@@ -261,8 +162,7 @@ ChannelPowerEstimate estimateCenteredChannelPower(const uint8_t *iq,
     if (std::abs(b) <= dcRejectBins) {
       continue;
     }
-    const size_t idx =
-        static_cast<size_t>((b >= 0) ? b : static_cast<int>(nfft) + b);
+    const size_t idx = wrapBin(b, nfft);
     const float re = cache.fftOut[idx].real();
     const float im = cache.fftOut[idx].imag();
     channelSum += static_cast<double>(re) * static_cast<double>(re) +
@@ -274,11 +174,10 @@ ChannelPowerEstimate estimateCenteredChannelPower(const uint8_t *iq,
   int sideBins = 0;
   for (int sign : {-1, 1}) {
     const int start = sign * (bandHalf + guardBins);
-    const int stop = sign * (bandHalf + guardBins + sideSpanBins);
+    const int stop = sign * (bandHalf + guardBins + effectiveSideSpan);
     const int step = (start <= stop) ? 1 : -1;
     for (int b = start; b != stop + step; b += step) {
-      const size_t idx =
-          static_cast<size_t>((b >= 0) ? b : static_cast<int>(nfft) + b);
+      const size_t idx = wrapBin(b, nfft);
       const float re = cache.fftOut[idx].real();
       const float im = cache.fftOut[idx].imag();
       sideSum += static_cast<double>(re) * static_cast<double>(re) +
@@ -334,12 +233,22 @@ SignalLevelResult computeWidebandSignalLevel(const uint8_t *iq, size_t samples) 
     sumII += iNorm * iNorm;
     sumQQ += qNorm * qNorm;
 
-    if (fm_tuner::dsp::isRtlSdrIqByteSaturated(iByte) ||
-        fm_tuner::dsp::isRtlSdrIqByteSaturated(qByte)) {
-      hardClipCount += 2;
+    // The clip ratios are fractions of *bytes* (the denominator below is
+    // samples * 2), so each byte is counted individually. Counting 2 for a
+    // sample whose I byte alone was saturated reported twice the true
+    // fraction, which crossed the 2% auto-gain step-down threshold for a
+    // station that was never actually overloaded.
+    if (fm_tuner::dsp::isRtlSdrIqByteSaturated(iByte)) {
+      hardClipCount += 1;
     }
-    if (iByte <= 8 || iByte >= 247 || qByte <= 8 || qByte >= 247) {
-      nearClipCount += 2;
+    if (fm_tuner::dsp::isRtlSdrIqByteSaturated(qByte)) {
+      hardClipCount += 1;
+    }
+    if (iByte <= 8 || iByte >= 247) {
+      nearClipCount += 1;
+    }
+    if (qByte <= 8 || qByte >= 247) {
+      nearClipCount += 1;
     }
   }
 

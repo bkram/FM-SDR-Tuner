@@ -11,11 +11,11 @@
 #include "app_options.h"
 
 class AudioOutput;
-class CPUFeatures;
 class MpxAudioOutput;
 class TunerSession;
 class WavWriter;
 class XDRServer;
+struct CPUFeatures;
 
 class Application {
 public:

@@ -194,8 +194,8 @@ bool processAudioBlock(
     const bool overloadGhostSuspected =
         suspectGhostingFromOverload(displaySignal, clipRatio);
     if (overloadGhostSuspected) {
-      const uint32_t count = ++overloadGhostHintCount;
-      if (!overloadGhostHintActive || count <= 3 || (count % 50) == 0) {
+      const uint32_t hintCount = ++overloadGhostHintCount;
+      if (!overloadGhostHintActive || hintCount <= 3 || (hintCount % 50) == 0) {
         std::cerr << "[RF] overload/image ghosting suspected: clip="
                   << std::fixed << std::setprecision(4) << clipRatio
                   << " level=" << std::setprecision(1) << displaySignal.level120

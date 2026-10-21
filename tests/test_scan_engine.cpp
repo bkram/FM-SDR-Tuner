@@ -24,8 +24,8 @@ std::vector<uint8_t> makeIqTone(size_t samples, uint32_t sampleRateHz,
   std::vector<uint8_t> iq(samples * 2, 127);
   constexpr float kPi = 3.14159265358979323846f;
   for (size_t i = 0; i < samples; i++) {
-    const float phase =
-        2.0f * kPi * toneHz * (static_cast<float>(i) / sampleRateHz);
+    const float phase = 2.0f * kPi * toneHz *
+                         (static_cast<float>(i) / static_cast<float>(sampleRateHz));
     const float iSample = std::cos(phase) * amplitude;
     const float qSample = std::sin(phase) * amplitude;
     iq[i * 2] = static_cast<uint8_t>(

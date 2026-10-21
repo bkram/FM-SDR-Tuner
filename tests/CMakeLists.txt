@@ -308,6 +308,31 @@ if(WIN32)
     target_link_libraries(test_sdrplay_stub PRIVATE ws2_32)
 endif()
 
+# The verbose-gating of the SDRplay connect diagnostics can only be exercised
+# against the real (non-stub) device, so this target is built only when the
+# SDRplay SDK headers are present.
+if(FM_TUNER_HAVE_SDRPLAY AND NOT WIN32)
+    add_executable(test_sdrplay_verbose test_sdrplay_verbose.cpp
+        ${FM_TUNER_TEST_MAIN_SOURCE}
+        ${CMAKE_SOURCE_DIR}/src/sdrplay_device.cpp
+        ${CMAKE_SOURCE_DIR}/src/tuner_controller.cpp
+        ${CMAKE_SOURCE_DIR}/src/rtl_sdr_device.cpp
+        ${CMAKE_SOURCE_DIR}/src/rtl_tcp_client.cpp
+    )
+    target_compile_definitions(test_sdrplay_verbose PRIVATE FM_TUNER_HAS_SDRPLAY)
+    target_include_directories(test_sdrplay_verbose PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${SDRPLAY_INCLUDE_DIR}
+        ${Catch2_INCLUDE_DIRS}
+    )
+    target_link_libraries(test_sdrplay_verbose PRIVATE
+        ${FM_TUNER_CATCH2_TARGET}
+        Threads::Threads
+        ${CMAKE_DL_LIBS}
+    )
+    add_test(NAME sdrplay_verbose COMMAND test_sdrplay_verbose)
+endif()
+
 add_executable(test_rest_server test_rest_server.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/rest_server.cpp

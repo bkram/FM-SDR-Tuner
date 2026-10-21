@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -56,6 +58,10 @@ public:
 private:
   void acceptLoop();
   void handleConnection(int clientSocket);
+  // Joins the client threads that have already finished. Called from the
+  // accept loop so finished connections do not accumulate for the lifetime
+  // of the process.
+  void reapFinishedClientThreads();
   // Applies the parsed key/value parameters and returns the JSON response body.
   std::string applyParams(const std::vector<std::pair<std::string, std::string>> &params,
                           int &appliedCount);
@@ -67,6 +73,28 @@ private:
   std::atomic<bool> m_running{false};
   std::atomic<bool> m_verboseLogging{false};
   std::thread m_acceptThread;
+
+  // Connections are served concurrently, so calls into the control plane are
+  // serialized here. The controls touch shared tuner state and the panel
+  // snapshot; before connections were served inline on a single thread that
+  // serialization was implicit. Recursive because applyParams() calls
+  // statusJson() to embed the current state in its reply.
+  std::recursive_mutex m_controlsMutex;
+
+  // Each accepted connection is served on its own thread, so a client that
+  // connects and then stalls cannot deny the API to every other client.
+  std::mutex m_clientThreadsMutex;
+  struct ClientThread {
+    std::atomic<bool> done{false};
+    std::thread thread;
+  };
+  std::vector<std::shared_ptr<ClientThread>> m_clientThreads;
+
+  // The sockets of the connections currently being served. stop() shuts them
+  // down so a worker blocked in recv() returns immediately instead of
+  // waiting out the whole receive timeout.
+  std::mutex m_clientSocketsMutex;
+  std::vector<int> m_clientSockets;
 };
 
 #endif // REST_SERVER_H

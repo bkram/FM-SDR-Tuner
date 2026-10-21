@@ -853,6 +853,14 @@ AudioOutput::~AudioOutput() { shutdown(); }
 
 bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
                        const std::string &deviceSelector, bool verboseLogging) {
+  // The device selector is consumed by whichever native backend this build
+  // has. A build with no backend (and the unit-test build, which compiles
+  // this file without one) has no consumer for it.
+#if !(defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)) &&               \
+    !(defined(__linux__) && defined(FM_TUNER_HAS_ALSA)) &&                   \
+    !(defined(_WIN32) && defined(FM_TUNER_HAS_WINMM))
+  (void)deviceSelector;
+#endif
   m_enableSpeaker = enableSpeaker;
   m_wavFile = wavFile;
   m_verboseLogging = verboseLogging;

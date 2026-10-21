@@ -323,3 +323,86 @@ TEST_CASE("computeSignalLevel remains selective at higher sample rates",
     REQUIRE(inChannelLevel.dbfs > blockerLevel.dbfs + 8.0);
     REQUIRE(std::abs(mixedLevel.dbfs - inChannelLevel.dbfs) < 2.5);
 }
+
+TEST_CASE("signal level meter survives an over-wide channel bandwidth",
+          "[signal_level]") {
+  // A channel bandwidth wider than the analysis window used to run the
+  // side-band estimator off the end of the FFT output: the positive branch
+  // read past the end, and the negative branch produced a negative index that
+  // was cast to a huge size_t. Below the overflow threshold the side window
+  // wrapped back over the channel, so the "noise floor" measured the signal
+  // itself and a strong station reported as no signal at all.
+  const uint32_t sampleRateHz = 256000;
+  const size_t samples = 8192;
+  auto iq = makeIqBuffer(samples, sampleRateHz, {{10000.0f, 0.5f}});
+
+  // The widths that overflowed the 8192-point transform.
+  for (int bwHz : {252000, 309000, 400000, 1000000, 2147483647}) {
+    const SignalLevelResult r = computeSignalLevel(
+        iq.data(), samples, 0, 0.5, 0.0, -65.0, -5.0, sampleRateHz, bwHz);
+    // The meter must not report a corrupted estimate. A NaN snrDb is the
+    // documented "no channel-aware estimate available" sentinel, so it is an
+    // acceptable outcome; what must never happen is a *finite* SNR derived
+    // from a noise floor that measured the signal itself (which is what made
+    // a strong station read as zero signal).
+    REQUIRE(std::isfinite(r.dbfs));
+    REQUIRE(std::isfinite(r.noiseFloorDbfs));
+    REQUIRE(std::isfinite(r.level120));
+    REQUIRE(r.level120 >= 0.0f);
+    REQUIRE(r.level120 <= 120.0f);
+    if (std::isfinite(r.snrDb)) {
+      // A finite SNR means an estimate was made: the noise floor must then
+      // be genuinely below the signal, and the SNR must be positive.
+      REQUIRE(r.noiseFloorDbfs < r.dbfs);
+      REQUIRE(r.snrDb > 0.0);
+    }
+  }
+
+  // The failure that actually bit: below the hard overflow, the negative
+  // side-band window aliased past Nyquist onto the positive spectrum where
+  // the station sits. The noise floor collapsed onto the signal power, the
+  // SNR pinned to 0 and the meter showed a strong station as no signal.
+  for (int bwHz : {242000, 244000, 246000}) {
+    const SignalLevelResult r = computeSignalLevel(
+        iq.data(), samples, 0, 0.5, 0.0, -65.0, -5.0, sampleRateHz, bwHz);
+    REQUIRE(std::isfinite(r.snrDb));
+    REQUIRE(r.snrDb > 10.0);
+    REQUIRE(r.noiseFloorDbfs < r.dbfs - 10.0);
+    REQUIRE(r.level120 > 50.0f);
+  }
+
+  // At a sane width the meter must still work — the guard must not disable
+  // the estimator for normal bandwidths.
+  const SignalLevelResult good = computeSignalLevel(
+      iq.data(), samples, 0, 0.5, 0.0, -65.0, -5.0, sampleRateHz, 194000);
+  REQUIRE(good.dbfs > -60.0);
+  REQUIRE(good.noiseFloorDbfs < good.dbfs);
+  REQUIRE(good.snrDb > 0.0);
+  REQUIRE(good.level120 > 0.0f);
+}
+
+TEST_CASE("clip ratio counts bytes, not samples", "[signal_level]") {
+  // The clip ratio is a fraction of IQ *bytes* (the denominator is
+  // samples * 2). Counting a whole sample whenever either byte was
+  // saturated reported twice the true fraction, so a station whose I
+  // component alone clipped looked 2x over the auto-gain step-down
+  // threshold and lost several dB of sensitivity for no reason.
+  constexpr size_t kSamples = 1000;
+  std::vector<uint8_t> iq(kSamples * 2, 128);
+  // Only the I byte is saturated.
+  for (size_t s = 0; s < kSamples; s++) {
+    iq[2 * s] = 255;
+  }
+  const SignalLevelResult r =
+      computeSignalLevel(iq.data(), kSamples, 0, 0.5, 0.0, -65.0, -5.0);
+  REQUIRE(r.hardClipRatio > 0.49);
+  REQUIRE(r.hardClipRatio < 0.51);
+
+  // Both bytes saturated: the ratio is then 1.0.
+  for (size_t s = 0; s < kSamples; s++) {
+    iq[2 * s + 1] = 255;
+  }
+  const SignalLevelResult r2 =
+      computeSignalLevel(iq.data(), kSamples, 0, 0.5, 0.0, -65.0, -5.0);
+  REQUIRE(r2.hardClipRatio > 0.99);
+}
