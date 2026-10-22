@@ -439,6 +439,15 @@ Recognised keys: `freq_hz` / `freq_khz`, `gain_db`, `agc` (bool), `bandwidth_hz`
 `deemphasis` (0=50µs,1=75µs,2=off), `force_mono` (bool), `volume` (0–100),
 `action` (`start`/`stop`).
 
+The gain keys drive the **tuner's own gain state**, not the hardware
+registers: `gain_db` pins a manual gain, `agc` hands the gain back to the
+tuner's auto-gain ladder, and `rtl_agc` switches the front end's own IF AGC.
+A gain set here therefore survives a retune, a reconnect and the periodic
+gain re-assert — and the software ladder never fights the hardware AGC over
+the same register. The gain keys are refused when `client_gain_allowed` is
+false in the profile, or when the gain was pinned on the command line with
+`-g`.
+
 Examples:
 
 ```bash
@@ -686,6 +695,25 @@ A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; no
   triggered the front-end overload warnings on a perfectly healthy front end.
   The raw IQ capture (`-i`) still contains it, because the capture is the
   tuner's raw output.
+- Engaging the front end's **own AGC** costs a short silence (~600 ms), for
+  the same reason. The dongle's analog auto-gain overshoots when it is
+  switched on: on an R820T the samples right after the switch saturate the
+  converter for 100–600 ms (measured here: 55–90% of the samples at the rail)
+  before the AGC settles ~7 dB below the ceiling. Left in, that burst reached
+  the listener as noise, and it tripped the overload/duplicate warning for a
+  front end that was not overloaded — the exact false "duplicate station"
+  report the plugin shows. The settling burst is dropped instead, and the
+  audio fades back in over the gap. A re-assert of an already-running AGC
+  (the periodic keep-alive) leaves the AGC alone instead of restarting its
+  attack, so it does not cost a silence every few minutes.
+- The gain is the **tuner's** state, not the hardware's. A client that sets
+  the gain — the fm-dx-webserver plugin over REST, an XDR client over the XDR
+  protocol — sets it in the tuner, so it survives a retune, a reconnect and
+  the periodic gain re-assert, and the software auto-gain ladder never fights
+  the front end's own AGC over the same register. A `-g` on the command line
+  pins the gain: no client may change it after that. The gain in the profile
+  is only the starting point, unless the profile sets
+  `client_gain_allowed = false`.
 - De-emphasis default is 50 µs (EU/ITU). For US/Korea set `[tuner].deemphasis = 1` in the config (75 µs).
 - Default stereo blend profile is `aggressive` (fast mute on marginal pilot); select `normal` or `soft` via `-b` or the config.
 
@@ -710,12 +738,20 @@ the one for your hardware over `fm-sdr-tuner.ini` and tune it for your site
 (your personal `fm-sdr-tuner.ini` is git-ignored, so it is never committed):
 
 ```bash
-cp fm-sdr-tuner.ini.example fm-sdr-tuner.ini          # RTL-SDR (sane defaults)
+cp fm-sdr-tuner.ini.example fm-sdr-tuner.ini          # RTL-SDR
 # or, for an SDRplay RSP (macOS/Linux, SDRplay build only):
 cp fm-sdr-tuner-sdrplay.ini.example fm-sdr-tuner.ini
 
 ./build/fm-sdr-tuner            # or: -c fm-sdr-tuner.ini to be explicit
 ```
+
+The RTL example is the profile that was measured on this site (an R820T with
+the indoor antenna): a fixed 10 dB gain, the meter window that goes with it
+(`-43 / -19`), and the REST control API enabled on `127.0.0.1:9090` — the
+address the fm-dx-webserver plugin talks to by default. The gain, the meter
+window and the antenna in it are the ones that were verified on real
+hardware; re-derive them with `--calibrate` after a change of antenna or
+cable.
 
 Both examples enable the REST control API (`[rest] enabled = true`, port 9090)
 and the bundled test panel (`scripts/rest_test_panel.py`, shipped in the
@@ -821,19 +857,20 @@ clipping.
 
 ### 1. Start From A Known-Good Baseline
 
-The binary ships with measured, site-independent defaults (`gain_strategy = tef`, `agc_mode = 2`, `w0_bandwidth_hz = 194000`, `stereo_blend = aggressive`, `signal_floor_dbfs = -55`, `signal_ceil_dbfs = -10`, `signal_bias_db = 0`, deemph 50 µs, `pilot_canceller = true`). The meter window puts the noise floor of an empty band at 0 and a strong local station near 115; widen or narrow it for your own site (see below). The optional adaptive features (`hicut`, `adaptive_bandwidth`, `multipath_eq`) default to off so the audio is identical to a passive demod chain until you opt in.
+The shipped RTL profile (`fm-sdr-tuner.ini.example`) is the one that was measured on real hardware at this site: a fixed 10 dB gain with the most headroom of the settings tried, the meter window that goes with it (`-43 / -19`), and the REST control API on `127.0.0.1:9090` so the fm-dx-webserver plugin can drive the tuner. Copy it over `fm-sdr-tuner.ini` and start from there. The optional adaptive features (`hicut`, `adaptive_bandwidth`, `multipath_eq`) are off so the audio is identical to a passive demod chain until you opt in.
 
 For a dedicated site profile, put overrides in `fm-sdr-tuner.ini`:
 
 ```ini
 [sdr]
 gain_strategy = tef
-rtl_gain_db = -1
-default_custom_gain_flags = 1
+rtl_gain_db = 10
+default_custom_gain_flags = 0
 freq_correction_ppm = 0
-# Wide default; watch [METER] log and narrow once you know the local range.
-signal_floor_dbfs = -55.0
-signal_ceil_dbfs = -10.0
+# The window measured with the 10 dB gain above: the empty band reads 0 and
+# the local station reads 91-100 of 120.
+signal_floor_dbfs = -43.0
+signal_ceil_dbfs = -19.0
 signal_bias_db = 0.0
 
 [processing]
@@ -847,15 +884,23 @@ pilot_canceller = true
 hicut = off
 adaptive_bandwidth = off
 multipath_eq = off
+# false freezes the gain (and with it the meter calibration) against a client
+# that would move it; true lets the plugin's gain control work.
 client_gain_allowed = false
 ```
 
 Why this baseline:
-- `tef` is the best default when local RF conditions are not yet known
-- `agc_mode = 2` is a stable middle ground
+- `rtl_gain_db = 10` is the measured setting for this site: 9.7 dB between the
+  station's peaks and the converter's ceiling, no pumping, and the meter off
+  the top of its scale
+- `default_custom_gain_flags = 0` leaves the dongle's own AGC off, so the
+  software auto-gain ladder stays in charge and its clip-protect can act. The
+  IF flag (= 1) turns that hardware AGC on, and a hardware AGC sets the level
+  by itself, so the ladder has to stand down
+- `agc_mode = 2` is a stable middle ground for the ladder
 - `w0_bandwidth_hz = 194000` is the correct starting point for normal WFM stereo
 - `stereo_blend = aggressive` pairs well with the adaptive Hi-Blend post-filter — the HF of stereo fades cleanly on marginal signals without audible pops
-- `client_gain_allowed = false` prevents XDR clients from changing gain while you tune the site profile
+- `client_gain_allowed = false` prevents clients from changing gain while you tune the site profile — set it to `true` when the plugin's gain control should work
 
 ### 2. Validate Basic Hardware First
 
@@ -937,11 +982,13 @@ Do not chase the highest signal number. The correct gain is the highest gain
 that does not produce sustained clipping on strong stations.
 
 The clip column is the one to watch on FM specifically: the modulation peaks
-of an FM station sit about 10 dB above its average, so a gain that looks
+of an FM station sit a few dB above its average, so a gain that looks
 comfortable on the level readout can still clip the ADC on the peaks. If
-`clip` is not `0.0000` on your strongest station while using the dongle's own
-AGC (`rtl_gain_db = -1`), switch to a fixed manual gain (see "Duplicates of
-strong stations" for the measured numbers).
+`clip` is not `0.0000` on your strongest station, lower the gain — and if it
+*is* `0.0000` but the peaks sit within a couple of dB of the ceiling, lower
+it anyway: that is the margin that decides whether a stronger neighbour turns
+into a duplicate of the station (see "Duplicates of strong stations" for the
+measured numbers).
 
 ### 5. How To Read The Console Output
 
@@ -1239,22 +1286,37 @@ restarts the programme (the tuner skips the redundant retune and only
 re-asserts the gain/AGC registers), so what you hear is a genuine second
 copy, not the DSP restarting.
 
-**Why the dongle's own AGC causes this on FM.** An AGC targets the *average*
-level of the signal, but an FM station's modulation peaks sit roughly 10 dB
-above its average. An AGC that parks the average at −15 dBFS therefore drives
-the peaks into the ADC's clipper, and a saturated front end mixes the strong
-station with itself — the intermodulation product is heard as a second copy of
-that station. Measured on an R820T with the local station at 96.2 MHz:
+**How much headroom a gain setting leaves.** An FM station's modulation peaks
+sit a few dB above its average level, and a saturated front end mixes the
+strong station with itself — the intermodulation product is heard as a second
+copy of that station. What decides whether that happens is how much room the
+peaks have below the converter's ceiling, not the average level. Measured on
+an R820T with the local station on 96.2 MHz (peak = the highest sample in
+the capture, ceiling = full scale):
 
-| Gain setting | Station level | Clip ratio | SNR |
-|---|---|---|---|
-| dongle AGC (`rtl_gain_db = -1`) | −14 dBFS | 0.04 – 0.11 | 11 – 20 dB |
-| manual 10 dB | −19 dBFS | 0.0000 | 7 – 14 dB |
-| manual 0 dB | −34 dBFS | 0.0000 | 7 – 11 dB |
+| Gain setting | Station (channel) | Peak | Headroom | Clip ratio |
+|---|---|---|---|---|
+| manual 10 dB | −19 dBFS | −9.7 dBFS | 9.7 dB | 0.0000 |
+| manual 12 dB | −16 dBFS | −7.3 dBFS | 7.3 dB | 0.0000 |
+| manual 14 dB | −15 dBFS | −5.4 dBFS | 5.4 dB | 0.0000 |
+| dongle AGC (`rtl_gain_db = -1`) | −14 dBFS | −6.2 dBFS | 6.2 dB | 0.0000 |
+| auto ladder (climbs to 18 dB) | −13 dBFS | −3.4 dBFS | 3.4 dB | 0.0000 |
 
-The AGC path clips intermittently; a manual gain that leaves ~10 dB of
-headroom for the peaks does not. That is why the shipped site profile uses a
-fixed 10 dB instead of the dongle's AGC.
+So on this site nothing clips in steady state, and the AGC is not the villain
+it looks like in the numbers. But the margin is what matters: 3.4 dB of
+headroom is one strong neighbour away from the clipper, while 9.7 dB is not.
+That is why the shipped profile uses a fixed 10 dB: the most headroom, no
+pumping, and the meter off the top of its scale.
+
+One thing *does* clip with the dongle's AGC: the front end's own auto-gain
+overshoots when it is engaged. On an R820T the samples right after the switch
+saturate the converter for 100–600 ms (measured here: 55–90% of the samples
+at the rail) before the AGC settles ~7 dB below the ceiling. The tuner drops
+that burst before the DSP sees it (see "Runtime Behavior"), so the switch
+costs a short silence instead of a burst of noise and a false "duplicate
+station" warning. The same window covers the settling burst after a connect
+or a reconnect.
+
 
 #### 3. Nearby strong station leaking into adjacent channels: suspect adjacent-channel leakage
 
