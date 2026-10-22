@@ -1,6 +1,7 @@
 #include "runtime_loop.h"
 
 #include "auto_gain_policy.h"
+#include "retune_policy.h"
 
 #include <algorithm>
 #include <iomanip>
@@ -25,6 +26,7 @@ bool handleControlAndScan(
     size_t &retuneMuteSamplesRemaining, size_t &retuneMuteTotalSamples,
     const std::function<void(const char *reason)> &applyRtlGainAndAgc,
     const std::function<bool(uint32_t)> &tunerSetFrequency,
+    const std::function<uint32_t()> &currentTunerFrequencyHz,
     const std::function<size_t(uint8_t *, size_t)> &tunerReadIQ,
     const std::function<void(const uint8_t *, size_t)> &writeIqCapture,
     const std::chrono::milliseconds &scanRetrySleep, uint8_t *iqBuffer,
@@ -41,7 +43,25 @@ bool handleControlAndScan(
 
   if (rtlConnected && pendingFrequency.exchange(false)) {
     const uint32_t targetFrequencyHz = requestedFrequencyHz.load();
-    if (tunerSetFrequency(targetFrequencyHz)) {
+    const uint32_t appliedFrequencyHz =
+        currentTunerFrequencyHz ? currentTunerFrequencyHz() : 0U;
+    if (fm_tuner::isRedundantRetune(targetFrequencyHz, appliedFrequencyHz)) {
+      // The tuner is already on the requested frequency. Do NOT retune: a
+      // retune flushes the audio queue, resets the DSP and mutes the output
+      // while the demodulator settles, and the listener hears the programme
+      // restart -- the station "repeats" itself. Clients re-send the
+      // frequency they are already on routinely (xdr-gtk on every click of
+      // the tuned entry, the REST panel on every poll that carries a
+      // frequency), so this is the common case. Re-assert the gain/AGC
+      // registers only: that is inaudible and keeps the "a retune heals
+      // drifted tuner registers" property.
+      xdrServer.setFrequencyState(targetFrequencyHz);
+      applyRtlGainAndAgc("retune/reassert(same frequency)");
+      if (verboseLogging) {
+        std::cout << "[XDR] already tuned to " << (targetFrequencyHz / 1000)
+                  << " kHz; no retune\n";
+      }
+    } else if (tunerSetFrequency(targetFrequencyHz)) {
       // Reflect the applied frequency in the XDR server state regardless of who
       // requested it (XDR command, REST API, scan restore, ...). The XDR/FM-DX
       // command handlers set it themselves, but REST/internal retunes go only

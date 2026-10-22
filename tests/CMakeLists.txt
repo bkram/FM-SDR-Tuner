@@ -316,6 +316,18 @@ target_link_libraries(test_auto_gain PRIVATE
     ${FM_TUNER_CATCH2_TARGET}
 )
 
+# Header-only retune policy: no extra source needed.
+add_executable(test_retune_policy test_retune_policy.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+)
+target_include_directories(test_retune_policy PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_retune_policy PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+)
+
 add_executable(test_sdrplay_stub test_sdrplay_stub.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/sdrplay_device.cpp
@@ -382,6 +394,7 @@ add_test(NAME app_options COMMAND test_app_options)
 add_test(NAME dsp_chain COMMAND test_dsp_chain)
 add_test(NAME adaptive_bandwidth COMMAND test_adaptive_bandwidth)
 add_test(NAME auto_gain COMMAND test_auto_gain)
+add_test(NAME retune_policy COMMAND test_retune_policy)
 add_test(NAME runtime COMMAND test_runtime)
 add_test(NAME audio_output COMMAND test_audio_output)
 add_test(NAME wav_writer COMMAND test_wav_writer)

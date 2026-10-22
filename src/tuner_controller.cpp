@@ -70,6 +70,8 @@ bool TunerController::connect() {
 }
 
 void TunerController::disconnect() {
+  // The source is gone: its frequency is no longer known.
+  m_currentFrequencyHz.store(0, std::memory_order_relaxed);
   switch (m_kind) {
   case SourceKind::SdrPlay:
     m_sdrplayDevice.disconnect();
@@ -85,15 +87,21 @@ void TunerController::disconnect() {
 }
 
 bool TunerController::setFrequency(uint32_t freqHz) {
-  switch (m_kind) {
-  case SourceKind::SdrPlay:
-    return m_sdrplayDevice.setFrequency(freqHz);
-  case SourceKind::RtlTcp:
-    return m_rtlTcpClient.setFrequency(freqHz);
-  case SourceKind::RtlSdr:
-  default:
-    return m_rtlSdrDevice.setFrequency(freqHz);
+  const bool ok = [&]() {
+    switch (m_kind) {
+    case SourceKind::SdrPlay:
+      return m_sdrplayDevice.setFrequency(freqHz);
+    case SourceKind::RtlTcp:
+      return m_rtlTcpClient.setFrequency(freqHz);
+    case SourceKind::RtlSdr:
+    default:
+      return m_rtlSdrDevice.setFrequency(freqHz);
+    }
+  }();
+  if (ok) {
+    m_currentFrequencyHz.store(freqHz, std::memory_order_relaxed);
   }
+  return ok;
 }
 
 bool TunerController::setSampleRate(uint32_t sampleRate) {
