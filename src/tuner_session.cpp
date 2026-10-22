@@ -62,10 +62,13 @@ void TunerSession::connect() {
               << "...\n";
   }
   m_rtlConnected = true;
-  m_applyRtlGainAndAgc("connect/apply");
+  // The device is connected but nothing is applied yet: the app arms its
+  // settling window first, and the gain/AGC apply below may engage the front
+  // end's own AGC, which needs that window.
   if (m_params.onConnected) {
     m_params.onConnected();
   }
+  m_applyRtlGainAndAgc("connect/apply");
 }
 
 void TunerSession::disconnect() {
