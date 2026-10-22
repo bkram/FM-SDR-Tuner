@@ -81,6 +81,7 @@ bool IqSpectrum::analyse(const uint8_t *iq, size_t samples,
       m_nfft = 0;
       return false;
     }
+    m_planCreations++;
   }
 
   m_sampleRateHz = sampleRateHz;

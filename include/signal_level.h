@@ -68,6 +68,11 @@ public:
   // carries.
   double halfSpanHz() const;
 
+  // How many FFT plans this object has created. The scan re-uses one
+  // spectrum object for every block, so this only grows when the block size
+  // changes; it is here to make that visible.
+  uint32_t planCreations() const { return m_planCreations; }
+
   // Total power of the band [refHz +- bandwidthHz/2]. A band wider than the
   // analysed spectrum reads the whole spectrum; the band never wraps around
   // Nyquist. The block's mean is removed before the transform, so the
@@ -97,6 +102,7 @@ private:
   std::vector<std::complex<float>> m_fftOut;
   std::vector<float> m_window;
   fftplan m_plan = nullptr;
+  uint32_t m_planCreations = 0;
 };
 
 SignalLevelResult computeSignalLevel(const uint8_t *iq, size_t samples,

@@ -1,12 +1,22 @@
 #include "catch_compat.h"
-#include "signal_level.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <complex>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <vector>
+
+#include "dsp/liquid_primitives.h"
+
+// The scan keeps one spectrum object for the whole thread and re-uses it
+// across retunes, so the test has to see the plan and the buffers.
+#define private public
+#include "signal_level.h"
+#undef private
 
 namespace {
 
@@ -404,4 +414,67 @@ TEST_CASE("overload ghosting is only suspected on a clipping strong channel",
   SignalLevelResult quiet = strong;
   quiet.dbfs = -45.0;
   REQUIRE_FALSE(suspectOverloadGhosting(quiet, 0.05));
+}
+
+TEST_CASE("the scan spectrum re-uses its FFT plan and buffers across retunes",
+          "[signal_level][spectrum]") {
+    // The scan engine holds one spectrum object for the whole thread and
+    // re-uses it for every retune: the plan and the buffers have to survive
+    // (re-creating the plan per block is what the scan's CPU budget cannot
+    // afford) and the result must not carry the previous block over.
+    constexpr uint32_t kRate = 256000;
+    constexpr size_t kSamples = 8192;
+    constexpr int kWindowHz = 30000;
+
+    const std::vector<uint8_t> highTone =
+        makeIqBuffer(kSamples, kRate, {{50000.0f, 0.5f}});
+    const std::vector<uint8_t> lowTone =
+        makeIqBuffer(kSamples, kRate, {{-50000.0f, 0.5f}});
+    const std::vector<uint8_t> highToneLong =
+        makeIqBuffer(kSamples * 2, kRate, {{50000.0f, 0.5f}});
+    const std::vector<uint8_t> lowToneLong =
+        makeIqBuffer(kSamples * 2, kRate, {{-50000.0f, 0.5f}});
+
+    IqSpectrum spectrum;
+    REQUIRE(spectrum.analyse(highTone.data(), kSamples, kRate));
+    REQUIRE(spectrum.valid());
+    const std::complex<float> *fftIn = spectrum.m_fftIn.data();
+    const std::complex<float> *fftOut = spectrum.m_fftOut.data();
+    const size_t nfft = spectrum.nfft();
+    REQUIRE(spectrum.planCreations() == 1);
+    REQUIRE(nfft == kSamples);
+    REQUIRE(spectrum.channelDbfs(50000, kWindowHz) >
+            spectrum.channelDbfs(-50000, kWindowHz) + 20.0);
+
+    // A retune: the same block size, new content.
+    REQUIRE(spectrum.analyse(lowTone.data(), kSamples, kRate));
+    REQUIRE(spectrum.planCreations() == 1);     // the plan is re-used
+    REQUIRE(spectrum.m_fftIn.data() == fftIn);  // ... and so are the buffers
+    REQUIRE(spectrum.m_fftOut.data() == fftOut);
+    REQUIRE(spectrum.nfft() == nfft);
+
+    // The new block's spectrum is the new block's: the tone moved.
+    REQUIRE(spectrum.channelDbfs(-50000, kWindowHz) >
+            spectrum.channelDbfs(50000, kWindowHz) + 20.0);
+
+    // Re-analysing the same block gives the same numbers (the buffers are
+    // filled completely every time, not appended to).
+    const double first = spectrum.channelDbfs(-50000, kWindowHz);
+    REQUIRE(spectrum.analyse(lowTone.data(), kSamples, kRate));
+    REQUIRE(std::abs(spectrum.channelDbfs(-50000, kWindowHz) - first) < 1e-9);
+
+    // A different block size re-creates the plan, and the result is still
+    // the new block's.
+    REQUIRE(spectrum.analyse(highToneLong.data(), kSamples * 2, kRate));
+    REQUIRE(spectrum.planCreations() == 2);  // a new size needs a new plan
+    REQUIRE(spectrum.nfft() == kSamples * 2);
+    REQUIRE(spectrum.channelDbfs(50000, kWindowHz) >
+            spectrum.channelDbfs(-50000, kWindowHz) + 20.0);
+
+    // ... and back to the smaller block, which needs a new plan again.
+    REQUIRE(spectrum.analyse(lowTone.data(), kSamples, kRate));
+    REQUIRE(spectrum.planCreations() == 3);
+    REQUIRE(spectrum.nfft() == kSamples);
+    REQUIRE(spectrum.channelDbfs(-50000, kWindowHz) >
+            spectrum.channelDbfs(50000, kWindowHz) + 20.0);
 }
