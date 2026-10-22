@@ -1753,3 +1753,224 @@ TEST_CASE("FIRFilter L1 normalization survives reset", "[dsp][firfilter]") {
   const float peakPlain = maxAbsImpulseResponse(plain, length + 32);
   REQUIRE(peakPlain > peakAfter + 0.1f);
 }
+
+namespace {
+
+// An FM carrier with a single modulating tone, as uint8 IQ. The modulating
+// signal is the same at every capture rate, so the demodulated audio has to
+// come out the same whether the IQ was captured at 256 kHz or decimated down
+// from 1.024 / 2.048 MHz.
+std::vector<uint8_t> makeFmIq(uint32_t sampleRate, size_t samples,
+                               double carrierHz, double toneHz,
+                               double deviationHz, double amplitude) {
+  std::vector<uint8_t> iq(samples * 2, 0);
+  const double beta = deviationHz / toneHz;
+  for (size_t i = 0; i < samples; i++) {
+    const double t = static_cast<double>(i) / static_cast<double>(sampleRate);
+    const double phase = 2.0 * M_PI * carrierHz * t +
+                         beta * std::sin(2.0 * M_PI * toneHz * t);
+    const long bi = std::lround(amplitude * std::cos(phase) * 127.5 + 127.0);
+    const long bq = std::lround(amplitude * std::sin(phase) * 127.5 + 127.0);
+    iq[i * 2] = static_cast<uint8_t>(std::clamp<long>(bi, 0, 255));
+    iq[i * 2 + 1] = static_cast<uint8_t>(std::clamp<long>(bq, 0, 255));
+  }
+  return iq;
+}
+
+// Magnitude of one frequency in a block of samples (a plain DFT bin).
+double toneMagnitude(const std::vector<float> &samples, size_t count,
+                     double sampleRate, double toneHz) {
+  double re = 0.0;
+  double im = 0.0;
+  for (size_t i = 0; i < count; i++) {
+    const double phase =
+        2.0 * M_PI * toneHz * static_cast<double>(i) /
+        static_cast<double>(sampleRate);
+    re += static_cast<double>(samples[i]) * std::cos(phase);
+    im -= static_cast<double>(samples[i]) * std::sin(phase);
+  }
+  return 2.0 * std::sqrt(re * re + im * im) / static_cast<double>(count);
+}
+
+} // namespace
+
+TEST_CASE("DspPipeline high-IQ-rate decimation recovers the audio the base rate gets",
+          "[dsp][pipeline][decimation][iq_rate]") {
+  // The tuner runs the DSP at 256 kHz. An RTL-SDR can deliver 1.024 or
+  // 2.048 MHz, and the pipeline then decimates by 4 or 8 before the
+  // demodulator. The decimated path has to produce the same audio as the
+  // base rate: the same modulating signal in, the same audio out.
+  Config::ProcessingSection processing;
+  processing.stereo = false;
+  processing.w0_bandwidth_hz = 194000;
+
+  constexpr int kInputRate = 256000;
+  constexpr int kOutputRate = 48000;
+  constexpr size_t kBlockSamples = 4096;
+  constexpr size_t kBlocks = 6;
+  constexpr double kCarrierHz = 20000.0;
+  constexpr double kToneHz = 1000.0;
+  constexpr double kDeviationHz = 10000.0;
+
+  struct Capture {
+    std::vector<float> audio;
+    // Mean filtered channel power over the blocks, in dBFS. The demodulator
+    // recovers the modulation from the phase, so the audio level says nothing
+    // about the gain of the decimation path; the channel power does.
+    double channelPowerDbfs = 0.0;
+  };
+
+  // Runs the pipeline over one capture and returns the demodulated audio
+  // (the first block is dropped: it carries the filter start-up transient).
+  auto runCapture = [&](uint32_t iqRate, size_t decimation) {
+    DspPipeline pipeline(kInputRate, kOutputRate, processing, false,
+                         kBlockSamples, decimation);
+    REQUIRE(pipeline.sdrBlockSamples() == kBlockSamples * decimation);
+
+    const size_t sdrBlock = pipeline.sdrBlockSamples();
+    const std::vector<uint8_t> iq =
+        makeFmIq(iqRate, sdrBlock * kBlocks, kCarrierHz, kToneHz, kDeviationHz,
+                 0.6);
+
+    Capture capture;
+    double powerSum = 0.0;
+    size_t powerCount = 0;
+    size_t produced = 0;
+    size_t offset = 0;
+    while (offset < sdrBlock * kBlocks) {
+      DspPipeline::Result out;
+      const bool have = pipeline.process(
+          iq.data() + (offset * 2), sdrBlock, [](const float *, size_t) {}, out);
+      if (have) {
+        REQUIRE(out.demodSamples == kBlockSamples);
+        if (produced > 0) {
+          capture.audio.insert(capture.audio.end(), out.left,
+                               out.left + out.outSamples);
+          powerSum += out.channelPowerDbfs;
+          powerCount++;
+        }
+        produced++;
+      }
+      offset += sdrBlock;
+    }
+    REQUIRE(produced == kBlocks);
+    capture.channelPowerDbfs = powerSum / static_cast<double>(powerCount);
+    return capture;
+  };
+
+  const Capture base = runCapture(kInputRate, 1);
+  const Capture mid = runCapture(1024000, 4);
+  const Capture high = runCapture(2048000, 8);
+  const std::vector<float> &baseAudio = base.audio;
+  const std::vector<float> &midAudio = mid.audio;
+  const std::vector<float> &highAudio = high.audio;
+
+  // The same duration of IQ in, the same amount of audio out.
+  REQUIRE(midAudio.size() == baseAudio.size());
+  REQUIRE(highAudio.size() == baseAudio.size());
+
+  const size_t measure = baseAudio.size() / 2;
+  const float baseRms = rms(baseAudio.data() + baseAudio.size() - measure, measure);
+  const float midRms = rms(midAudio.data() + midAudio.size() - measure, measure);
+  const float highRms = rms(highAudio.data() + highAudio.size() - measure, measure);
+  REQUIRE(baseRms > 0.02f);
+
+  // The decimated paths must not change the level (0.3 dB).
+  REQUIRE(std::abs(20.0f * std::log10(midRms / baseRms)) < 0.3f);
+  REQUIRE(std::abs(20.0f * std::log10(highRms / baseRms)) < 0.3f);
+
+  // ... and they must not change the gain of the IQ either: the decimator
+  // has to hand the demodulator the same signal level the base rate does.
+  REQUIRE(std::abs(mid.channelPowerDbfs - base.channelPowerDbfs) < 0.5);
+  REQUIRE(std::abs(high.channelPowerDbfs - base.channelPowerDbfs) < 0.5);
+
+  // The modulating tone has to survive the decimation.
+  const double baseTone =
+      toneMagnitude(baseAudio, baseAudio.size(), kOutputRate, kToneHz);
+  const double midTone =
+      toneMagnitude(midAudio, midAudio.size(), kOutputRate, kToneHz);
+  const double highTone =
+      toneMagnitude(highAudio, highAudio.size(), kOutputRate, kToneHz);
+  REQUIRE(midTone > 0.9 * baseTone);
+  REQUIRE(highTone > 0.9 * baseTone);
+
+  // ... and nothing else has to appear in its place: the tone dominates an
+  // off-frequency bin in every run.
+  const double baseOff = toneMagnitude(baseAudio, baseAudio.size(), kOutputRate, 2500.0);
+  const double midOff = toneMagnitude(midAudio, midAudio.size(), kOutputRate, 2500.0);
+  const double highOff = toneMagnitude(highAudio, highAudio.size(), kOutputRate, 2500.0);
+  REQUIRE(baseTone > 10.0 * baseOff);
+  REQUIRE(midTone > 10.0 * midOff);
+  REQUIRE(highTone > 10.0 * highOff);
+}
+
+TEST_CASE("the analog de-emphasis matches its reference response",
+          "[dsp][af_post][deemphasis]") {
+  // The de-emphasis is a one-pole lowpass with the corner at 1/(2*pi*tau),
+  // realised as a bilinear transform of the analog RC. The bilinear maps the
+  // analog frequency axis non-linearly, so the implemented response is the
+  // analog response read on the warped axis:
+  //
+  //   |H(f)| = 1 / sqrt(1 + (tau * 2 * fs * tan(pi * f / fs))^2)
+  //
+  // The measurement isolates the filter: the same tone is played with and
+  // without the de-emphasis, so the resampler and the DC blocker (which are
+  // in front of and behind it) cancel out.
+  constexpr int kRate = 48000;
+  constexpr size_t kSamples = 48000; // 1 s
+  constexpr float kTwoPi = 6.28318530717958647692f;
+
+  auto responseDb = [&](float toneHz, int tauUs) {
+    auto run = [&](int tau) {
+      AFPostProcessor af(kRate, kRate);
+      af.setDeemphasis(tau);
+      std::vector<float> inL(kSamples, 0.0f);
+      std::vector<float> inR(kSamples, 0.0f);
+      for (size_t i = 0; i < kSamples; i++) {
+        const float t = static_cast<float>(i) / static_cast<float>(kRate);
+        const float v = 0.5f * std::sin(kTwoPi * toneHz * t);
+        inL[i] = v;
+        inR[i] = v;
+      }
+      std::vector<float> outL(kSamples + 64, 0.0f);
+      std::vector<float> outR(kSamples + 64, 0.0f);
+      const size_t out = af.process(inL.data(), inR.data(), kSamples,
+                                     outL.data(), outR.data(), outL.size());
+      REQUIRE(out > kSamples / 2);
+      return toneMagnitude(outL, out, kRate, toneHz);
+    };
+    const double withDeemph = run(tauUs);
+    const double without = run(0);
+    REQUIRE(without > 1e-6);
+    return 20.0 * std::log10(withDeemph / without);
+  };
+
+  // The analog reference, read on the axis the bilinear transform maps.
+  auto referenceDb = [&](float toneHz, double tauSec) {
+    const double omega = 2.0 * M_PI * static_cast<double>(toneHz) / kRate;
+    const double warped =
+        2.0 * static_cast<double>(kRate) * std::tan(omega / 2.0);
+    return 20.0 * std::log10(
+        1.0 / std::sqrt(1.0 + (warped * tauSec) * (warped * tauSec)));
+  };
+
+  // The plain analog reference: the RC curve itself, read at the tone's
+  // own frequency (rad/s, not rad/sample).
+  auto analogDb = [&](float toneHz, double tauSec) {
+    const double omega = 2.0 * M_PI * static_cast<double>(toneHz);
+    return 20.0 * std::log10(1.0 / std::sqrt(1.0 + (omega * tauSec) * (omega * tauSec)));
+  };
+
+  // In the audio band the two references are the same to within a
+  // thousandth of a decibel, so the implemented filter has to track the
+  // analog curve there.
+  REQUIRE(std::abs(responseDb(400.0f, 50) - analogDb(400.0f, 50e-6)) < 0.05);
+  REQUIRE(std::abs(responseDb(1000.0f, 50) - analogDb(1000.0f, 50e-6)) < 0.05);
+  REQUIRE(std::abs(responseDb(1000.0f, 50) - referenceDb(1000.0f, 50e-6)) < 0.05);
+  REQUIRE(std::abs(responseDb(1000.0f, 75) - referenceDb(1000.0f, 75e-6)) < 0.05);
+
+  // Higher up the warping matters: the implemented response follows the
+  // warped reference, and rolls off faster than the plain analog curve.
+  REQUIRE(std::abs(responseDb(8000.0f, 50) - referenceDb(8000.0f, 50e-6)) < 0.2);
+  REQUIRE(responseDb(8000.0f, 50) < analogDb(8000.0f, 50e-6) - 0.4);
+}
