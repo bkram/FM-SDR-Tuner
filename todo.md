@@ -1,6 +1,6 @@
 # FM-SDR-Tuner Issues and Improvements
 
-Last verified against current source: 2026-06-17 (post v1.6.2, on v1.6.3)
+Last verified against current source: 2026-10-22 (on v1.8.0, branch `v1.8`)
 
 This file is a short-form punch list of open work — see `plan.md` for the
 fuller analysis with rationale and validation strategy. Closed tickets are
@@ -16,9 +16,13 @@ not retained; consult `git log` and merged PR descriptions for history.
   that owns connect/tune/gain/capabilities — see `src/tuner_session.cpp`
   and `src/tuner_controller.cpp`. Blocks any future Soapy / HackRF / Airspy
   work.
-- **Drop the pilot bandpass FIR (P18)**: today `StereoDecoder` runs a 243-tap
-  complex bandpass on every IQ sample at 256 kHz — the biggest remaining
-  hotspot in the post-v1.6.0 profile (`dotprod_crcf_execute_neon4`). Reference
+- **Drop the pilot bandpass FIR (P18)**: `StereoDecoder` runs a 243-tap
+  complex bandpass per sample (fed the **demodulated MPX**, not the raw IQ as
+  an earlier revision of this list said; a 163-tap RDS band FIR was added on
+  top of it since, so the cost is if anything larger than when this item was
+  written) — the biggest remaining
+  hotspot in the post-v1.6.0 profile (`dotprod_crcf_execute_neon4`).
+  Reference
   implementation in `research/sdr-j-fm/src/fm/pilot-recover.cpp` uses a bare
   product-detector PLL on the raw MPX float and relies on the loop bandwidth
   itself to provide the bandpass behavior. Estimated **5-10 pp of one core
@@ -51,8 +55,6 @@ not retained; consult `git log` and merged PR descriptions for history.
   reference and adds a small integrator + LPF + error-witness path.
 - **`m_demodScratch` growth check on every call** (`src/fm_demod.cpp`):
   reserve-and-reuse strategy can be tightened. Cheap, mechanical, isolated.
-- **Mixed newline style** between `std::endl` and `"\n"` across
-  `src/audio_output.cpp`, `src/application.cpp`. Logging consistency only.
 - **`#if defined(...)` vs `#ifdef` style** in `src/audio_output.cpp`.
   Cosmetic.
 
@@ -80,12 +82,14 @@ floor exceeded the expected gain:
 - **Block-batched FIR convolution**: replace per-sample push+execute with
   64-sample blocks so liquid's NEON kernel stays hot. Estimated ~3-5 pp
   on M1. Significant code change.
-- **Custom phase accumulator for the pilot PLL**: skip liquid's NCO step +
-  `nco_crcf_constrain` and use a tiny `uint32_t` modulo accumulator.
-  Estimated ~1-2 pp.
 - **Fixed-rate polyphase 256→48 resampler**: liquid's `resamp_rrrf` has
   per-call ratio handling that a fixed-ratio design can skip. Estimated
   ~1-2 pp.
+
+(The third idea here, a custom phase accumulator that skips liquid's NCO
+step, is obsolete: the pilot PLL no longer uses liquid's NCO at all — it is
+hand-rolled over a 1024-entry interpolated sin/cos LUT. The per-sample trig
+cost it wanted to remove is already gone.)
 
 Worth revisiting only if a real CPU-bound deployment (e.g. Raspberry Pi 4)
 needs the headroom — see the README "Running On Low-CPU Devices" section.
@@ -101,23 +105,25 @@ These would catch regressions that current CI can't:
 - Scan FFT plan / buffer reuse across retunes (the fallback retune-count
   bound and the post-retune buffer flush are already covered in
   `test_scan_engine`).
-- `recvLine()` overflow + auth truncation directly.
 - `WavWriter` / `AudioOutput::writeWAVData` 4 GiB boundary saturation
   + fatal-error propagation.
 - Analog-de-emphasis response-reference regression.
 - IF-AGC refusal path under chronic clip (depends on P17b).
 
+(`recvLine()` overflow and auth truncation are covered end to end in
+`test_protocol` — oversized XDR and FM-DX lines, oversized handshakes and
+oversized auth lines are all exercised. A direct unit test of the static
+helper would need it exported, which is why it is not listed here.)
+
 ## Future Milestones
 
-- **1.6.x** further patch releases for the remaining gain-policy refusal
-  work (P17b) if it comes up before the SoapySDR work.
 - **1.7** — Broad SDR backend support. Backend capability interface (P6)
   → `SoapySDR` implementation → contract tests → CLI/config/XDR
   integration cleanup. Stretch goals if time allows: the pilot-FIR
   removal (P18) and adaptive L-R alignment (P19), since both are
   architectural-shape changes that pair naturally with the backend
-  refactor.
+  refactor. **Shipped as v1.7.0 with the SDRplay backend only — the
+  capability interface (P6) was not done, so it is still open.**
 - **1.8** — Runtime structural cleanup. Decompose `Application::run`
-  (P5) into smaller responsibilities now that the backend layer is
-  abstracted. Pick up the mixed-newline / preprocessor-style sweep
-  alongside the affected subsystems.
+  (P5) into smaller responsibilities. **In progress: the backend layer is
+  not abstracted yet (P6 still open), and P5 is still open.**

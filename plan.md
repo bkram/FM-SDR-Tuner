@@ -1,6 +1,6 @@
 # FM-SDR-Tuner Code Review Plan
 
-Last reviewed against current source: 2026-06-17 (post v1.6.2, on v1.6.3)
+Last reviewed against current source: 2026-10-22 (on v1.8.0, branch `v1.8`)
 
 ## Scope
 
@@ -42,7 +42,7 @@ This plan focuses on:
 | P5 | Medium | `src/application.cpp` | `Application::run()` still owns session bootstrap, tuner lifecycle, XDR lifecycle, scan restore, mute windows, reconnection flow, and the main processing loop. Makes backend work and future runtime fixes harder than they need to be. | Split into smaller responsibilities: session bootstrap, command/control state application, scan coordinator, main DSP/audio loop. Keep `Application` as the assembly layer. | Behavior-preserving tests around start/stop, reconnect, scan restore, and retune mute. |
 | P6 | High | `src/tuner_controller.cpp`, `src/tuner_session.cpp` | Tuner backend selection is a `SourceKind` switch over `rtl_sdr` / `rtl_tcp` / `sdrplay`. Not a sufficient abstraction for `SoapySDR`. Control surface is scattered between `TunerController`, `TunerSession`, and gain policy. | Backend interface that owns connect/disconnect, tuning, gain/AGC capabilities, sample-rate constraints, and capability queries. Policy in one layer, transport/device specifics in another. | Backend contract tests using a fake backend before adding `SoapySDR`. |
 | P17b | Medium | `src/runtime_loop.cpp` (gain policy) | The IQ FIR L1 normalization landed in v1.6.2 (`processing.iq_fir_l1_normalize`, default off), so post-filter envelope can be hard-bounded. Still open: the gain policy accepts `G01` / `G11` requests that would push the front end into chronic ADC saturation. | Gain policy refuses to enable IF AGC (`G01`/`G11`) when recent `clip` ratio exceeds threshold; log `[GAIN] refusing G01: clip=...` and report the chronic-clip ratio back through the XDR meter rather than silently mis-representing the level. | Gain-policy unit test for the IF-AGC refusal path under a synthetic chronic-clip ratio. |
-| P18 | High | `src/stereo_decoder.cpp` (`m_liquidPilotBandFilter`, `m_delayLine`) | The 243-tap complex bandpass FIR for pilot recovery dominates the post-v1.6.0 profile (`dotprod_crcf_execute_neon4`, ~525 samples = ~10% of one core). `research/sdr-j-fm/src/fm/pilot-recover.cpp` removes the bandpass entirely and relies on the PLL loop bandwidth itself for filtering: `PhaseError = pilot * sin(oscillatorPhase); oscillatorPhase += PhaseError * gain + omega`. The L-R recovery delay line also shortens because there's no FIR group delay to compensate. | Replace `m_liquidPilotBandFilter.push/execute` with a product-detector PLL on the raw MPX float. Reuse `m_liquidPilotPll` for the NCO. Adjust `m_delaySamples` to whatever residual phase compensation the new path needs (likely zero). Keep the lock-detection (`m_pilotConfidence`) path. | Verify lock acquisition time on a clean strong station is within 2× of current. Verify lock holds on the captured `mpx_88600_60s.wav` fixture. Re-baseline real-RF CPU on the same M1 hardware A/B protocol — expect 5-10 pp savings on one core. Listening test for adjacent-channel splatter scenarios (where the bandpass was earning its keep). |
+| P18 | High | `src/stereo_decoder.cpp` (`m_liquidPilotBandFilter`, `m_delayLine`) | The 243-tap complex bandpass FIR for pilot recovery dominates the post-v1.6.0 profile (`dotprod_crcf_execute_neon4`, ~525 samples = ~10% of one core). It is fed the **demodulated MPX**, not the raw IQ, and a 163-tap RDS band FIR was added alongside it since, so the cost is if anything larger than measured then. `research/sdr-j-fm/src/fm/pilot-recover.cpp` removes the bandpass entirely and relies on the PLL loop bandwidth itself for filtering: `PhaseError = pilot * sin(oscillatorPhase); oscillatorPhase += PhaseError * gain + omega`. The L-R recovery delay line also shortens because there's no FIR group delay to compensate. | Replace `m_liquidPilotBandFilter.push/execute` with a product-detector PLL on the raw MPX float. Reuse `m_liquidPilotPll` for the NCO. Adjust `m_delaySamples` to whatever residual phase compensation the new path needs (likely zero). Keep the lock-detection (`m_pilotConfidence`) path. | Verify lock acquisition time on a clean strong station is within 2× of current. Verify lock holds on the captured `mpx_88600_60s.wav` fixture. Re-baseline real-RF CPU on the same M1 hardware A/B protocol — expect 5-10 pp savings on one core. Listening test for adjacent-channel splatter scenarios (where the bandpass was earning its keep). |
 | P19 | Medium | `src/stereo_decoder.cpp` (L-R recovery block) | Today's L-R recovery `2·Re(MPX·conj(PLL_38k)²)` is sensitive to pilot phase error: a 5° error in the pilot reference rotates the L-R subcarrier by ~10° before demodulation, producing ~3% measurable crosstalk. `research/sdr-j-fm/src/fm/stereo-separation.cpp` (Thomas Neder, 2023) implements `PerfectStereoSeparation`: a Costas-style adaptive separator that drives the cos/sin cross-coupling on the L-R complex baseband to zero. | Add an adaptive phase-shift integrator that sits between the pilot PLL output and the L-R demix multiply: `sinCosPath = sincos(pilotPhase + accPhaseShift) * mux; LPF(sinCosPath); error = real * imag; accPhaseShift += alpha * error`. Lock detector reuses `mean_error < threshold` over a stability window. Bypassed when `m_forceMono` or `m_stereoBlend < threshold`. | Synthetic test feeds MPX with a deliberately-rotated pilot reference and asserts post-convergence crosstalk is ≤ 1/10 of the pre-convergence value. Listening regression against the captured WAV fixture confirms no degradation on clean signals. |
 
 ## DSP Chain Alignment Review
@@ -82,13 +82,12 @@ These would catch regressions that current CI can't:
 4. Scan FFT plan / buffer reuse across retunes (the fallback retune-count
    bound and the post-retune buffer flush are already covered in
    `test_scan_engine`).
-5. Handshake/auth truncation directly exercising `recvLine()` overflow.
-6. `WavWriter` / `AudioOutput::writeWAVData` 4 GiB boundary +
+5. `WavWriter` / `AudioOutput::writeWAVData` 4 GiB boundary +
    fatal-error propagation.
-7. Analog-de-emphasis response-reference regression test (post the
+6. Analog-de-emphasis response-reference regression test (post the
    bilinear switch in v1.5.0).
-8. IF-AGC refusal path under chronic clip (depends on P17b landing).
-9. DSP / feature gaps:
+7. IF-AGC refusal path under chronic clip (depends on P17b landing).
+8. DSP / feature gaps:
    - Multipath equalizer behaviour on a multi-ray channel that's
      also moving (Doppler-like). Currently only the static
      2-ray test exists in `test_dsp_chain`.
@@ -97,6 +96,11 @@ These would catch regressions that current CI can't:
      transitions over hysteresis windows.
    - MPX-audio output reconnect-after-device-disappearance behaviour
      (e.g., USB DAC unplugged mid-stream).
+
+`recvLine()` overflow and auth truncation are **not** a gap: `test_protocol`
+exercises oversized XDR lines, oversized FM-DX lines, oversized handshakes and
+oversized auth lines end to end. A direct unit test of the file-static helper
+would only require exporting it.
 
 ## Cross-Cutting Conclusions
 
@@ -138,6 +142,11 @@ single-digit-pp gains.
 3. Backend contract tests with a fake backend.
 4. CLI / config / XDR integration cleanup for source selection.
 
+**Status: v1.7.0 shipped the SDRplay backend but not the capability
+interface.** The `SourceKind` switch in `src/tuner_controller.cpp` is still
+how the sources are selected, so P6 is still open and `SoapySDR` still
+cannot be added cleanly on top of it.
+
 **Stretch candidates that pair naturally with 1.7's architectural work:**
 
 - Drop the pilot bandpass FIR (P18) — the biggest remaining CPU win, but
@@ -150,10 +159,13 @@ single-digit-pp gains.
 
 ### Milestone (1.8) — Runtime Structural Cleanup
 
-1. Decompose `Application::run()` (P5) into smaller responsibilities
-   now that the backend layer is abstracted.
+1. Decompose `Application::run()` (P5) into smaller responsibilities.
 2. Pick off the missing-test-coverage items above as the affected
    subsystems are touched.
+
+**Status: in progress on branch `v1.8`.** `Application::run()` is still one
+~1050-line function (P5 open), and step 1's premise — "now that the backend
+layer is abstracted" — is not true yet: P6 is still open.
 
 ## References
 
