@@ -1,4 +1,5 @@
 #include "audio_output.h"
+#include "wav_limits.h"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -1165,10 +1166,8 @@ bool AudioOutput::writeWAVData(const int16_t *samples, size_t sampleCount) {
   if (m_wavFatalError.load())
     return false;
 
-  const size_t maxBytes =
-      static_cast<size_t>(UINT32_MAX) - 36u - m_wavDataSize;
   const size_t wantBytes = sampleCount * sizeof(int16_t);
-  if (wantBytes > maxBytes) {
+  if (!wavDataFits(m_wavDataSize, wantBytes)) {
     if (m_verboseLogging) {
       std::cerr << "[AUDIO] reached 4 GiB WAV limit, stopping capture\n";
     }

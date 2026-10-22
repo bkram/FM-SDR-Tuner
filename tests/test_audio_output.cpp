@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "wav_limits.h"
+
 #define private public
 #include "audio_output.h"
 #undef private
@@ -116,4 +118,33 @@ TEST_CASE("AudioOutput speaker ring keeps newest samples and clears cleanly",
     REQUIRE(out.m_speakerReadPos == 0);
     REQUIRE(out.m_speakerWritePos == 0);
   }
+}
+
+TEST_CASE("AudioOutput WAV path refuses a write that would cross the 4 GiB limit",
+          "[audio_output]") {
+  const std::string path = "test_audio_output_limit.wav";
+  std::remove(path.c_str());
+
+  AudioOutput out;
+  REQUIRE(out.init(false, path, "", false));
+
+  const int16_t samples[5] = {1, 2, 3, 4, 5};
+  // Pretend the file already holds everything but the last 10 bytes: five
+  // samples still fit, a sixth does not.
+  out.m_wavDataSize = static_cast<uint32_t>(kWavMaxDataBytes - 10);
+  REQUIRE(out.writeWAVData(samples, 5));
+  REQUIRE(out.m_wavDataSize == kWavMaxDataBytes);
+  REQUIRE_FALSE(out.m_wavFatalError.load());
+
+  // One sample too many: the write is refused and the capture stops.
+  REQUIRE_FALSE(out.writeWAVData(samples, 1));
+  REQUIRE(out.m_wavFatalError.load());
+
+  // The latched error is what refuses the write, not the size: with room
+  // again, a later write is still refused.
+  out.m_wavDataSize = 0;
+  REQUIRE_FALSE(out.writeWAVData(samples, 1));
+
+  out.shutdown();
+  std::remove(path.c_str());
 }
