@@ -206,7 +206,18 @@ w0_bandwidth_hz = 194000
 dsp_agc = off
 
 # Stereo blend profile: soft, normal, aggressive
-stereo_blend = aggressive
+#
+# Measured on this site (2026-10-22, the local station on 96.2): the station's
+# stereo quality estimate dips regularly, and the "aggressive" profile follows
+# every dip. Two back-to-back captures of the same station, 52 s each, measured
+# as the RMS of the L-R difference over the RMS of L+R:
+#   aggressive -> -25.2 dB, swinging over 22 dB, 6% of the seconds fully muted
+#   normal    -> -16.9 dB, swinging over  6 dB, no muted seconds at all
+# So the aggressive profile leaves the image 8 dB weaker and makes it collapse
+# and come back - that is the "bad sound" on a clean local station. "normal"
+# is the default. "aggressive" is still worth it on a station whose stereo is
+# noisy rather than clean.
+stereo_blend = normal
 
 # Enable stereo decoder
 stereo = true

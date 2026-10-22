@@ -96,7 +96,11 @@ struct Config {
     int dsp_block_samples = 8192;
     int w0_bandwidth_hz = 194000;
     std::string dsp_agc = "off"; // off|fast|slow
-    std::string stereo_blend = "aggressive";
+    // soft|normal|aggressive. "normal" holds the stereo image steady on a
+    // station whose quality estimate dips: measured here on two back-to-back
+    // captures of the same station, "aggressive" left the image 8 dB weaker
+    // and swinging over 22 dB, while "normal" held it steady.
+    std::string stereo_blend = "normal";
     bool stereo = true;
     bool pilot_canceller = true;
     std::string hicut = "off"; // off|gentle|strong

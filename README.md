@@ -715,7 +715,7 @@ A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; no
   is only the starting point, unless the profile sets
   `client_gain_allowed = false`.
 - De-emphasis default is 50 µs (EU/ITU). For US/Korea set `[tuner].deemphasis = 1` in the config (75 µs).
-- Default stereo blend profile is `aggressive` (fast mute on marginal pilot); select `normal` or `soft` via `-b` or the config.
+- Default stereo blend profile is `normal`: it holds the stereo image steady on a station whose quality estimate dips. Measured here on two back-to-back captures of the same station, `aggressive` left the image 8 dB weaker and swinging over 22 dB, while `normal` held it steady. Select `soft` or `aggressive` via `-b` or the config.
 
 ## Config-Driven Usage (optional)
 
@@ -877,7 +877,7 @@ signal_bias_db = 0.0
 agc_mode = 2
 w0_bandwidth_hz = 194000
 dsp_agc = off
-stereo_blend = aggressive
+stereo_blend = normal
 stereo = true
 pilot_canceller = true
 # Optional adaptive features — leave off until you have a stable baseline.
@@ -899,7 +899,7 @@ Why this baseline:
   by itself, so the ladder has to stand down
 - `agc_mode = 2` is a stable middle ground for the ladder
 - `w0_bandwidth_hz = 194000` is the correct starting point for normal WFM stereo
-- `stereo_blend = aggressive` pairs well with the adaptive Hi-Blend post-filter — the HF of stereo fades cleanly on marginal signals without audible pops
+- `stereo_blend = normal` holds the stereo image steady on a station whose quality estimate dips — measured here on two back-to-back captures of the same station, `aggressive` left the image 8 dB weaker and swinging over 22 dB, while `normal` held it steady. Use `aggressive` only on a station whose stereo is noisy rather than clean
 - `client_gain_allowed = false` prevents clients from changing gain while you tune the site profile — set it to `true` when the plugin's gain control should work
 
 ### 2. Validate Basic Hardware First
@@ -1523,6 +1523,10 @@ pilot_canceller = false
 
 # Stereo blend "aggressive" mutes stereo on weak signals quickly, avoiding
 # work in the L-R recovery loop when there's no real stereo to recover.
+# This is a CPU trade, not a quality trade: on a strong local station the
+# stereo image then collapses and comes back (measured here: 8 dB weaker and
+# swinging over 22 dB, with 6 % of the seconds fully muted). Keep the default
+# "normal" unless the CPU is the problem.
 stereo_blend = aggressive
 
 [debug]
