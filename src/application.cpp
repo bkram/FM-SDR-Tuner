@@ -18,6 +18,7 @@
 #include "cpu_features.h"
 #include "dsp/runtime.h"
 #include "dsp_pipeline.h"
+#include "gain_model.h"
 #include "mpx_audio_output.h"
 #include "processing_runner.h"
 #include "rds_worker.h"
@@ -274,7 +275,6 @@ int Application::run() {
   std::string tunerSource = m_options.tunerSource;
   uint32_t rtlDeviceIndex = m_options.rtlDeviceIndex;
   uint32_t freqKHz = m_options.freqKHz;
-  int gain = m_options.gain;
   const int freqCorrectionPpm =
       std::clamp(config.sdr.freq_correction_ppm, -250, 250);
   const bool useSdrppGainStrategy = (config.sdr.gain_strategy == "sdrpp");
@@ -328,6 +328,12 @@ int Application::run() {
   auto &requestedFrequencyHz = xdrState.requestedFrequencyHz;
   auto &requestedCustomGain = xdrState.requestedCustomGain;
   auto &requestedAGCMode = xdrState.requestedAGCMode;
+  // The manual gain in effect, in dB (-1 = the ladder decides). It starts at
+  // the profile's / command line's value and is changed at runtime by a
+  // client (the fm-dx-webserver plugin over REST), so the setting survives a
+  // retune and the periodic gain re-assert.
+  xdrState.requestedGainDb.store(m_options.gain, std::memory_order_relaxed);
+  auto &requestedGainDb = xdrState.requestedGainDb;
   auto &requestedBandwidthHz = xdrState.requestedBandwidthHz;
   auto &requestedVolume = xdrState.requestedVolume;
   auto &requestedDeemphasis = xdrState.requestedDeemphasis;
@@ -367,42 +373,20 @@ int Application::run() {
   };
 
   auto isImsAgcEnabled = [&]() -> bool {
-    if (gain >= 0) {
-      return false;
-    }
-    const int custom = requestedCustomGain.load();
-    const bool ims = (custom % 10) != 0;
-    return ims;
+    return fm_tuner::hardwareIfAgcActive(requestedCustomGain.load(),
+                                         requestedGainDb.load());
   };
 
   auto calculateAppliedGainDb = [&]() -> int {
-    const int agcMode = std::clamp(requestedAGCMode.load(), 0, 3);
-    auto agcModeToGainDb = [&](int mode) -> int {
-      const int clippedMode = std::clamp(mode, 0, 3);
-      if (useDirectRtlSdr && !useSdrppGainStrategy) {
-        static constexpr int kDirectRtlAutoGainDb[4] = {18, 12, 7, 0};
-        return kDirectRtlAutoGainDb[clippedMode];
-      }
-      static constexpr int kTefGainDb[4] = {44, 36, 30, 24};
-      return kTefGainDb[clippedMode];
-    };
-    int custom = requestedCustomGain.load();
-    const bool ceq = ((custom / 10) % 10) != 0;
-    int gainDb = agcModeToGainDb(agcMode) + (ceq ? 4 : 0);
-    if (gain >= 0) {
-      gainDb = gain;
-    }
-    return std::clamp(gainDb, 0, 49);
+    return fm_tuner::appliedGainDb(requestedAGCMode.load(),
+                                    requestedCustomGain.load(),
+                                    requestedGainDb.load(),
+                                    useDirectRtlSdr && !useSdrppGainStrategy);
   };
 
   auto agcModeToGainDb = [&](int agcMode) -> int {
-    const int clippedMode = std::clamp(agcMode, 0, 3);
-    if (useDirectRtlSdr && !useSdrppGainStrategy) {
-      static constexpr int kDirectRtlAutoGainDb[4] = {18, 12, 7, 0};
-      return kDirectRtlAutoGainDb[clippedMode];
-    }
-    static constexpr int kTefGainDb[4] = {44, 36, 30, 24};
-    return kTefGainDb[clippedMode];
+    return fm_tuner::ladderGainDb(
+        agcMode, useDirectRtlSdr && !useSdrppGainStrategy);
   };
 
   auto effectiveAppliedGainDb = [&]() -> int {
@@ -413,20 +397,78 @@ int Application::run() {
   };
   constexpr double kSignalGainCompFactor = 0.5;
 
+  // May a client change the gain? The command line wins over everything: -g
+  // is a per-run override. The profile's gain is only the starting point, so
+  // a control client (the fm-dx-webserver plugin) may move it unless the
+  // profile closes the door with client_gain_allowed = false.
+  auto clientGainAllowed = [&]() -> bool {
+    if (m_options.gainPinned) {
+      return false;
+    }
+    return config.processing.client_gain_allowed;
+  };
+
   // Name the knob that sets the gain on this path. The auto-gain ladder can
   // only act when the gain is strategy-managed; on the paths where the gain is
   // pinned, this is what the clip-protect advisory points the user at.
   auto fixedGainAdvice = [&]() -> const char * {
     if (useSdrppGainStrategy) {
-      return (gain >= 0) ? "-g (RTL gain)" : "sdrpp_rtl_agc_gain_db";
+      return (requestedGainDb.load() >= 0) ? "-g (RTL gain)"
+                                           : "sdrpp_rtl_agc_gain_db";
     }
-    if (gain >= 0) {
-      return "rtl_gain_db / -g";
+    if (m_options.gainPinned) {
+      return "-g (RTL gain)";
+    }
+    if (requestedGainDb.load() >= 0) {
+      return "the manual gain (the plugin's gain control)";
     }
     if (isImsAgcEnabled()) {
       return "rtl_agc (the tuner's own AGC)";
     }
     return "agc_mode";
+  };
+
+  // The front end's settling window. Samples inside it are not programme and
+  // are dropped before they reach the demodulator, the signal statistics, the
+  // MPX tap or the overload warnings.
+  //
+  //  - After a connect the tuner delivers a loud narrowband transient at the
+  //    LO centre for the first ~150 ms, hot enough to clip the ADC.
+  //  - When the front end's own AGC is engaged its analog auto-gain
+  //    overshoots into the ADC rail for the first ~250-600 ms (measured on an
+  //    R820T here: 55-90% of the samples at the rail, then the level settles
+  //    ~7 dB below it). That overshoot mixes the station with itself - it is
+  //    heard as a duplicate - and it trips the overload/duplicate warning for
+  //    a front end that is not actually overloaded.
+  //
+  // Dropping the samples costs a short silence instead of a burst of noise
+  // and a false alarm.
+  constexpr size_t kConnectSettleMs = 250;
+  constexpr size_t kAgcSettleMs = 600;
+  size_t frontEndSettleSamplesRemaining = 0;
+  constexpr size_t kRetuneMuteSamples =
+      static_cast<size_t>(OUTPUT_RATE / 25);
+  // Cold-start settle takes longer than a retune (RF AGC converging from
+  // scratch; glitches observed out to ~70 ms) and there is nothing to hear
+  // yet, so the start mute can afford a longer window: 120 ms.
+  constexpr size_t kStartMuteSamples =
+      static_cast<size_t>((OUTPUT_RATE * 3) / 25);
+  size_t retuneMuteSamplesRemaining = kStartMuteSamples;
+  size_t retuneMuteTotalSamples = kStartMuteSamples;
+  // Is the front end's own AGC engaged? A re-assert must not restart its
+  // attack, so the engagement sequence runs only on a real transition.
+  bool hwAgcEngaged = false;
+
+  auto armFrontEndSettle = [&](bool agcEngaged) {
+    const size_t settleMs = agcEngaged ? kAgcSettleMs : kConnectSettleMs;
+    frontEndSettleSamplesRemaining =
+        (static_cast<size_t>(iqSampleRate) * settleMs) / 1000;
+    if (agcEngaged) {
+      // The IQ gap leaves a hole in the audio: fade it back in instead of
+      // clicking.
+      retuneMuteSamplesRemaining = kStartMuteSamples;
+      retuneMuteTotalSamples = kStartMuteSamples;
+    }
   };
 
   auto applyRtlGainAndAgc = [&](const char *reason) {
@@ -449,10 +491,11 @@ int Application::run() {
       bool okGainMode = false;
       bool okAgc = false;
       bool okGain = true;
-      if (gain >= 0) {
+      const int manualGainDb = requestedGainDb.load();
+      if (manualGainDb >= 0) {
         okGainMode = tunerSetGainMode(true);
-        okGain =
-            tunerSetGain(static_cast<uint32_t>(std::clamp(gain, 0, 49) * 10));
+        okGain = tunerSetGain(
+            static_cast<uint32_t>(std::clamp(manualGainDb, 0, 49) * 10));
       } else {
         okGainMode = tunerSetGainMode(true);
         okGain = tunerSetGain(
@@ -461,11 +504,11 @@ int Application::run() {
       okAgc = tunerSetAgc(config.sdr.sdrpp_rtl_agc);
       if (verboseLogging) {
         std::cout << "[SDR] " << reason << " strategy=sdrpp"
-                  << " tuner_agc=" << ((gain < 0) ? 1 : 0)
+                  << " tuner_agc=" << ((manualGainDb < 0) ? 1 : 0)
                   << " rtl_agc=" << (config.sdr.sdrpp_rtl_agc ? 1 : 0)
                   << " if_gain="
-                  << ((gain >= 0) ? std::clamp(gain, 0, 49)
-                                  : config.sdr.sdrpp_rtl_agc_gain_db)
+                  << ((manualGainDb >= 0) ? std::clamp(manualGainDb, 0, 49)
+                                         : config.sdr.sdrpp_rtl_agc_gain_db)
                   << " dB\n";
       }
       if (!okGainMode || !okAgc || !okGain) {
@@ -488,18 +531,39 @@ int Application::run() {
     bool okGain = true;
 
     if (imsAgc) {
-      okGainMode = tunerSetGainMode(false);
-      okAgc = tunerSetAgc(true);
+      if (!hwAgcEngaged) {
+        // Engage the front end's own AGC from the bottom of its range. The
+        // AGC has a slow attack, so starting it on top of a manual gain
+        // overshoots into the clipper (measured on an R820T: 55-90% of the
+        // samples clipped right after the switch). Starting at 0 dB lets it
+        // climb instead, and the settle window drops the overshoot.
+        okGain = tunerSetGain(0);
+        okGainMode = tunerSetGainMode(false);
+        okAgc = tunerSetAgc(true);
+        hwAgcEngaged = true;
+        armFrontEndSettle(true);
+      } else {
+        // The AGC is already running: leave its gain alone. Rewriting the
+        // gain registers restarts its attack and clips the front end again.
+        okGainMode = tunerSetGainMode(false);
+        okAgc = tunerSetAgc(true);
+      }
     } else {
       okGainMode = tunerSetGainMode(true);
       okAgc = tunerSetAgc(false);
       okGain = tunerSetGain(static_cast<uint32_t>(gainDb * 10));
+      if (hwAgcEngaged) {
+        // The AGC is released and the manual gain takes over: let the level
+        // settle before it is measured and played.
+        hwAgcEngaged = false;
+        armFrontEndSettle(false);
+      }
     }
 
     if (verboseLogging) {
       std::cout << "[SDR] " << reason;
-      if (gain >= 0) {
-        std::cout << " fixed_gain=" << gain << " dB";
+      if (requestedGainDb.load() >= 0) {
+        std::cout << " fixed_gain=" << requestedGainDb.load() << " dB";
       } else {
         std::cout << " A" << agcMode << "(table=" << agcModeToGainDb(agcMode)
                   << " dB) G" << formatCustomGain(custom)
@@ -519,16 +583,6 @@ int Application::run() {
     }
   };
 
-  // The first samples after a connect are the tuner's settling burst, not
-  // programme: on an RTL-SDR the front end delivers a loud narrowband
-  // transient at the LO centre for the first ~150 ms, hot enough to clip the
-  // ADC. It is dropped here so it never reaches the audio, the signal
-  // statistics or the front-end overload warnings.
-  constexpr size_t kConnectSettleMs = 250;
-  size_t connectSettleSamplesRemaining = 0;
-  const size_t connectSettleSamples =
-      (static_cast<size_t>(iqSampleRate) * kConnectSettleMs) / 1000;
-
   TunerSession tunerSession(
       tuner, rtlConnected,
       {.useDirectRtlSdr = useDirectRtlSdr,
@@ -540,8 +594,13 @@ int Application::run() {
        .iqSampleRate = iqSampleRate,
        .freqCorrectionPpm = freqCorrectionPpm,
        .autoReconnect = autoReconnect,
-       .onConnected = [&]() { connectSettleSamplesRemaining =
-           connectSettleSamples; }},
+       .onConnected = [&]() {
+        // A (re)connect starts with a fresh device: the AGC is not engaged
+        // yet, whatever we did before, and the samples that follow are the
+        // tuner's settling burst.
+        hwAgcEngaged = false;
+        armFrontEndSettle(isImsAgcEnabled());
+      }},
       [&]() { return requestedFrequencyHz.load(); },
       [&]() { return requestedAGCMode.load(); },
       [&]() { return requestedCustomGain.load(); },
@@ -578,13 +637,6 @@ int Application::run() {
   int appliedDeemphasis = requestedDeemphasis.load();
   bool appliedForceMono = requestedForceMono.load();
   bool appliedEffectiveForceMono = appliedForceMono;
-  constexpr size_t kRetuneMuteSamples =
-      static_cast<size_t>(OUTPUT_RATE / 25);
-  // Cold-start settle takes longer than a retune (RF AGC converging from
-  // scratch; glitches observed out to ~70 ms) and there is nothing to hear
-  // yet, so the start mute can afford a longer window: 120 ms.
-  constexpr size_t kStartMuteSamples =
-      static_cast<size_t>((OUTPUT_RATE * 3) / 25);
   SignalLevelSmoother rfLevelSmoother;
   dspPipeline.setDeemphasisMode(appliedDeemphasis);
   dspPipeline.setForceMono(appliedEffectiveForceMono);
@@ -629,7 +681,7 @@ int Application::run() {
                        .useSdrppGainStrategy = useSdrppGainStrategy,
                        .allowClientGainOverride =
                            config.processing.client_gain_allowed,
-                       .fixedLocalGain = (gain >= 0)});
+                       .fixedLocalGain = m_options.gainPinned});
   xdrFacade.configureServer(xdrPassword, xdrGuestMode);
   xdrFacade.installCallbacks(
       [&](int volumePercent) { audioOut.setVolumePercent(volumePercent); },
@@ -715,6 +767,31 @@ int Application::run() {
                            freqCorrectionPpm,
                            config.sdr.sdrpp_rtl_agc};
 
+  // The gain state reported to /api/status comes from the tuner's own state,
+  // not from the snapshot taken at startup: a client that moved the gain
+  // must see its own change reflected, and a client that asks before anything
+  // was changed must see the level the tuner is actually running at.
+  auto gainDbForPanel = [&]() -> int {
+    const int manual = requestedGainDb.load();
+    if (manual >= 0) {
+      return manual;
+    }
+    return calculateAppliedGainDb();
+  };
+  // True when the tuner manages the gain by itself: no manual gain is pinned,
+  // so the auto-gain ladder (or the front end's own AGC) is in charge.
+  auto autoGainForPanel = [&]() -> bool {
+    return requestedGainDb.load() < 0;
+  };
+  // The front end's own IF AGC: the IF flag of the custom-gain flags. The RSP
+  // has an AGC of its own, which the plugin shows on the SDRplay panel.
+  auto rtlAgcForPanel = [&]() -> bool {
+    if (tuner.isSdrPlay()) {
+      return config.sdrplay.agc;
+    }
+    return fm_tuner::customGainIfFlag(requestedCustomGain.load()) != 0;
+  };
+
   // Blend mode reported by /api/status when no live override is set yet
   // (requestedBlendMode == -1): map the INI stereo_blend string to 0/1/2.
   int defaultBlendMode = 1; // normal
@@ -748,25 +825,44 @@ int Application::run() {
     // call succeeds. Writing the panel first meant a rejected change (a
     // disconnected SDRplay, a refused gain step) still left /api/status
     // reporting a value the hardware never accepted.
+    //
+    // The gain controls write the tuner's own gain state, not the hardware
+    // registers: the tuner re-asserts the gain on every retune and every
+    // periodic re-assert, so a value written straight into the hardware was
+    // undone within seconds, and the software auto-gain ladder then fought
+    // the front end's own AGC over the same register.
     controls.setGainDb = [&](double db) {
-      const double clamped = std::clamp(db, 0.0, 50.0);
-      if (!tuner.setGainMode(true)) {
+      if (!clientGainAllowed()) {
         return false;
       }
-      if (!tuner.setGain(static_cast<uint32_t>(std::lround(clamped * 10.0)))) {
-        return false;
-      }
+      const int clamped = static_cast<int>(std::lround(std::clamp(db, 0.0, 49.0)));
+      requestedGainDb.store(clamped, std::memory_order_relaxed);
+      // A manual gain and the front end's own AGC contradict each other: the
+      // hardware would win and the manual gain would silently not apply.
+      requestedCustomGain.store(fm_tuner::customGainRfFlag(
+                                    requestedCustomGain.load()) * 10,
+                                std::memory_order_relaxed);
+      pendingGain.store(true, std::memory_order_release);
       restPanel.gainDb = clamped;
       restPanel.autoGain = false;
       return true;
     };
     controls.setAutoGain = [&](bool on) {
-      if (!tuner.setGainMode(!on)) {
+      if (!clientGainAllowed()) {
         return false;
       }
-      if (!tuner.setAGC(on)) {
-        return false;
+      if (on) {
+        // Hand the gain back to the tuner's own auto-gain ladder.
+        requestedGainDb.store(-1, std::memory_order_relaxed);
+      } else {
+        // Manual: hold the level the panel is showing.
+        const int manual = static_cast<int>(std::lround(restPanel.gainDb));
+        requestedGainDb.store(std::clamp(manual, 0, 49), std::memory_order_relaxed);
+        requestedCustomGain.store(fm_tuner::customGainRfFlag(
+                                      requestedCustomGain.load()) * 10,
+                                  std::memory_order_relaxed);
       }
+      pendingGain.store(true, std::memory_order_release);
       restPanel.autoGain = on;
       return true;
     };
@@ -804,9 +900,26 @@ int Application::run() {
       return true;
     };
     controls.setRtlAgc = [&](bool e) {
-      if (!tuner.setAGC(e)) {
+      if (tuner.isSdrPlay()) {
+        // The RSP has its own AGC; it is not the RTL's IF AGC flag.
+        if (!tuner.setAGC(e)) {
+          return false;
+        }
+        restPanel.rtlAgc = e;
+        return true;
+      }
+      if (!clientGainAllowed()) {
         return false;
       }
+      // The front end's own IF AGC: the IF flag of the custom-gain flags. It
+      // sets the level by itself, so a pinned manual gain has to go.
+      const int flags = requestedCustomGain.load();
+      requestedCustomGain.store(e ? (flags | 1) : (flags & ~1),
+                                std::memory_order_relaxed);
+      if (e) {
+        requestedGainDb.store(-1, std::memory_order_relaxed);
+      }
+      pendingGain.store(true, std::memory_order_release);
       restPanel.rtlAgc = e;
       return true;
     };
@@ -856,12 +969,12 @@ int Application::run() {
           << ",\"running\":" << (tunerActive.load() ? "true" : "false")
           << ",\"frequency_hz\":" << requestedFrequencyHz.load()
           << ",\"bandwidth_hz\":" << appliedBandwidthHz.load()
-          << ",\"gain_db\":" << restPanel.gainDb
-          << ",\"auto_gain\":" << (restPanel.autoGain ? "true" : "false")
+          << ",\"gain_db\":" << gainDbForPanel()
+          << ",\"auto_gain\":" << (autoGainForPanel() ? "true" : "false")
           << ",\"lna\":" << restPanel.lna << ",\"antenna\":" << restPanel.antenna
           << ",\"bias_tee\":" << (restPanel.biasTee ? "true" : "false")
           << ",\"ppm\":" << restPanel.ppm
-          << ",\"rtl_agc\":" << (restPanel.rtlAgc ? "true" : "false")
+          << ",\"rtl_agc\":" << (rtlAgcForPanel() ? "true" : "false")
           << ",\"deemphasis\":" << requestedDeemphasis.load()
           << ",\"blend\":"
           << (requestedBlendMode.load() >= 0 ? requestedBlendMode.load()
@@ -955,11 +1068,10 @@ int Application::run() {
     iqComplexStorage.assign(SDR_BUF_SAMPLES, std::complex<float>(0.0f, 0.0f));
   }
 
-  // Pre-armed so the very first processed samples after startup (including
-  // the --auto-start path, which connects before this loop) get the same
-  // settle mute as a retune. The counter only decrements while samples flow.
-  size_t retuneMuteSamplesRemaining = kStartMuteSamples;
-  size_t retuneMuteTotalSamples = kStartMuteSamples;
+  // The settle mute is pre-armed (see the front end settle window above) so
+  // the very first processed samples after startup (including the
+  // --auto-start path, which connects before this loop) get the same settle
+  // mute as a retune. The counter only decrements while samples flow.
 
   // SDRplay wide-bandwidth scan mode edge state (see runtime_loop scan logic).
   bool scanWideActive = false;
@@ -1124,11 +1236,13 @@ int Application::run() {
       continue;
     }
 
-    if (connectSettleSamplesRemaining > 0) {
-      // Drop the tuner's settling burst (see kConnectSettleMs). The IQ
-      // capture keeps the raw samples; only the DSP path skips them.
-      const size_t drop = std::min(connectSettleSamplesRemaining, samples);
-      connectSettleSamplesRemaining -= drop;
+    if (frontEndSettleSamplesRemaining > 0) {
+      // Drop the front end's settling burst (see kConnectSettleMs and
+      // kAgcSettleMs). The IQ capture keeps the raw samples; only the DSP
+      // path skips them.
+      const size_t drop =
+          std::min(frontEndSettleSamplesRemaining, samples);
+      frontEndSettleSamplesRemaining -= drop;
       if (drop >= samples) {
         continue;
       }
@@ -1157,9 +1271,9 @@ int Application::run() {
           liveGhostRisk.store(suspectOverloadGhosting(signal, clipRatio),
                               std::memory_order_relaxed);
           runtime_loop::maybeAdjustAutoGain(
-              useSdrppGainStrategy, gain, isImsAgcEnabled(), requestedAGCMode,
-              pendingAGC, lastGainDown, lastGainUp, signal, clipRatio,
-              rfLevelFiltered, verboseLogging, agcModeToGainDb,
+              useSdrppGainStrategy, requestedGainDb.load(), isImsAgcEnabled(),
+              requestedAGCMode, pendingAGC, lastGainDown, lastGainUp, signal,
+              clipRatio, rfLevelFiltered, verboseLogging, agcModeToGainDb,
               fixedGainAdvice());
           runtime_loop::maybeAdjustAdaptiveBandwidth(
               adaptiveBwMode, adaptiveBwState, requestedBandwidthHz,

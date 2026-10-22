@@ -22,6 +22,11 @@ struct XdrCommandState {
   std::atomic<uint32_t> requestedFrequencyHz;
   std::atomic<int> requestedCustomGain;
   std::atomic<int> requestedAGCMode;
+  // The runtime manual gain in dB (-1 = no manual gain, the ladder decides).
+  // A client (the fm-dx-webserver plugin over REST, an XDR client over the
+  // XDR protocol) that sets the gain writes it here, so the setting survives
+  // a retune and the periodic gain re-assert.
+  std::atomic<int> requestedGainDb{-1};
   std::atomic<int> requestedBandwidthHz;
   std::atomic<int> requestedVolume;
   std::atomic<int> requestedDeemphasis;

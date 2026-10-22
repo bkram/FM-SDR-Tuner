@@ -353,6 +353,7 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
         result.outcome = AppParseOutcome::ExitFailure;
         return result;
       }
+      opts.gainPinned = true;
       continue;
     }
     if (arg == "-w" || arg == "--wav" || arg.rfind("--wav=", 0) == 0) {

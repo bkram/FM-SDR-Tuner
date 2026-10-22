@@ -57,6 +57,10 @@ void XdrFacade::installCallbacks(
     const int rf = ((newGain / 10) % 10) ? 1 : 0;
     const int ifv = (newGain % 10) ? 1 : 0;
     m_state.requestedCustomGain = rf * 10 + ifv;
+    // A client that sets the gain takes it over: a manual gain pinned by
+    // another client (the fm-dx-webserver plugin over REST) would win over
+    // the flags this command sets.
+    m_state.requestedGainDb = -1;
     if (m_options.verboseLogging) {
       std::cout << "[XDR] G" << formatCustomGainCb(newGain)
                 << " received -> rf=" << rf << " if=" << ifv << "\n";
@@ -86,6 +90,8 @@ void XdrFacade::installCallbacks(
     }
     const int clipped = std::clamp(agcMode, 0, 3);
     m_state.requestedAGCMode = clipped;
+    // The ladder takes over from a pinned manual gain (see the gain command).
+    m_state.requestedGainDb = -1;
     if (m_options.verboseLogging) {
       std::cout << "[XDR] A" << clipped << " received\n";
     }
