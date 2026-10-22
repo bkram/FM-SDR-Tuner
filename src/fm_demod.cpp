@@ -270,6 +270,18 @@ void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
           : -120.0;
 }
 
+float *FMDemod::ensureScratch(size_t numSamples) {
+  if (m_demodScratch.size() < numSamples) {
+    // Grow with headroom: a caller whose block size rises a little must not
+    // reallocate (and copy) the whole buffer on every call. Reserving before
+    // resizing also keeps the vector from moving its data twice.
+    const size_t wanted = std::max(m_demodScratch.capacity() * 2, numSamples);
+    m_demodScratch.reserve(wanted);
+    m_demodScratch.resize(numSamples);
+  }
+  return m_demodScratch.data();
+}
+
 size_t FMDemod::downsampleAudio(const float *demod, float *audio,
                                 size_t numSamples) {
   size_t outCount = 0;
@@ -289,51 +301,43 @@ size_t FMDemod::downsampleAudio(const float *demod, float *audio,
 }
 
 void FMDemod::process(const uint8_t *iq, float *audio, size_t numSamples) {
-  if (m_demodScratch.size() < numSamples) {
-    m_demodScratch.resize(numSamples);
-  }
-  demodulate(iq, m_demodScratch.data(), numSamples);
-  downsampleAudio(m_demodScratch.data(), audio, numSamples);
+  float *scratch = ensureScratch(numSamples);
+  demodulate(iq, scratch, numSamples);
+  downsampleAudio(scratch, audio, numSamples);
 }
 
 void FMDemod::processComplex(const std::complex<float> *iq, float *audio,
                              size_t numSamples) {
-  if (m_demodScratch.size() < numSamples) {
-    m_demodScratch.resize(numSamples);
-  }
-  demodulateComplex(iq, m_demodScratch.data(), numSamples);
-  downsampleAudio(m_demodScratch.data(), audio, numSamples);
+  float *scratch = ensureScratch(numSamples);
+  demodulateComplex(iq, scratch, numSamples);
+  downsampleAudio(scratch, audio, numSamples);
 }
 
 size_t FMDemod::processSplit(const uint8_t *iq, float *mpxOut, float *monoOut,
                              size_t numSamples) {
-  if (m_demodScratch.size() < numSamples) {
-    m_demodScratch.resize(numSamples);
-  }
-  demodulate(iq, m_demodScratch.data(), numSamples);
+  float *scratch = ensureScratch(numSamples);
+  demodulate(iq, scratch, numSamples);
   if (mpxOut) {
-    std::memcpy(mpxOut, m_demodScratch.data(), numSamples * sizeof(float));
+    std::memcpy(mpxOut, scratch, numSamples * sizeof(float));
   }
   if (!monoOut) {
     return 0;
   }
-  return downsampleAudio(m_demodScratch.data(), monoOut, numSamples);
+  return downsampleAudio(scratch, monoOut, numSamples);
 }
 
 size_t FMDemod::processSplitComplex(const std::complex<float> *iq,
                                     float *mpxOut, float *monoOut,
                                     size_t numSamples) {
-  if (m_demodScratch.size() < numSamples) {
-    m_demodScratch.resize(numSamples);
-  }
-  demodulateComplex(iq, m_demodScratch.data(), numSamples);
+  float *scratch = ensureScratch(numSamples);
+  demodulateComplex(iq, scratch, numSamples);
   if (mpxOut) {
-    std::memcpy(mpxOut, m_demodScratch.data(), numSamples * sizeof(float));
+    std::memcpy(mpxOut, scratch, numSamples * sizeof(float));
   }
   if (!monoOut) {
     return 0;
   }
-  return downsampleAudio(m_demodScratch.data(), monoOut, numSamples);
+  return downsampleAudio(scratch, monoOut, numSamples);
 }
 
 void FMDemod::processNoDownsample(const uint8_t *iq, float *audio,

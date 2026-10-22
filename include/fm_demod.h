@@ -50,6 +50,8 @@ private:
   void demodulate(const uint8_t *iq, float *audio, size_t len);
   void demodulateComplex(const std::complex<float> *iq, float *audio,
                          size_t len);
+  // Returns the demodulator's scratch buffer, grown to numSamples if needed.
+  float *ensureScratch(size_t numSamples);
 
   int m_inputRate;
   int m_outputRate;

@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <string>
 
+#include "socket_compat.h"
+
 class RTLTCPClient {
 public:
   RTLTCPClient(const std::string &host, uint16_t port);
@@ -42,7 +44,7 @@ private:
 
   std::string m_host;
   uint16_t m_port;
-  int m_socket;
+  SocketHandle m_socket;
   std::atomic<bool> m_connected;
   std::atomic<uint32_t> m_frequency;
   std::atomic<uint32_t> m_sampleRate;

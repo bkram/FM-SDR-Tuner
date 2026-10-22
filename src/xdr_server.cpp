@@ -1,4 +1,5 @@
 #include "xdr_server.h"
+
 #include "tuning_limits.h"
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -14,6 +15,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 #endif
+#include "socket_subsystem.h"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -74,51 +76,54 @@ uint64_t steadyNowMs() {
           .count());
 }
 
-void setRecvTimeoutMs(int clientSocket, int timeoutMs) {
+void setRecvTimeoutMs(SocketHandle clientSocket, int timeoutMs) {
 #if defined(_WIN32)
   const DWORD timeout = timeoutMs > 0 ? static_cast<DWORD>(timeoutMs) : 0;
-  setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO,
+  setsockopt(static_cast<SOCKET>(clientSocket), SOL_SOCKET, SO_RCVTIMEO,
              reinterpret_cast<const char *>(&timeout), sizeof(timeout));
 #else
   struct timeval tv;
   tv.tv_sec = timeoutMs / 1000;
   tv.tv_usec = (timeoutMs % 1000) * 1000;
-  setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(static_cast<int>(clientSocket), SOL_SOCKET, SO_RCVTIMEO, &tv,
+             sizeof(tv));
 #endif
 }
 
-void configureSendNoSigPipe(int sock) {
+void configureSendNoSigPipe(SocketHandle sock) {
 #if defined(SO_NOSIGPIPE)
   const int opt = 1;
-  setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+  setsockopt(static_cast<int>(sock), SOL_SOCKET, SO_NOSIGPIPE, &opt,
+             sizeof(opt));
 #else
   (void)sock;
 #endif
 }
 
-int sendSocket(int sock, const char *data, size_t len) {
+int sendSocket(SocketHandle sock, const char *data, size_t len) {
 #if defined(_WIN32)
-  return send(sock, data, static_cast<int>(len), 0);
+  return send(static_cast<SOCKET>(sock), data, static_cast<int>(len), 0);
 #elif defined(MSG_NOSIGNAL)
-  return static_cast<int>(send(sock, data, len, MSG_NOSIGNAL));
+  return static_cast<int>(
+      send(static_cast<int>(sock), data, len, MSG_NOSIGNAL));
 #else
-  return static_cast<int>(send(sock, data, len, 0));
+  return static_cast<int>(send(static_cast<int>(sock), data, len, 0));
 #endif
 }
 
-void closeSocket(int sock) {
+void closeSocket(SocketHandle sock) {
 #if defined(_WIN32)
   closesocket(static_cast<SOCKET>(sock));
 #else
-  close(sock);
+  close(static_cast<int>(sock));
 #endif
 }
 
-void shutdownSocket(int sock) {
+void shutdownSocket(SocketHandle sock) {
 #if defined(_WIN32)
   shutdown(static_cast<SOCKET>(sock), SD_BOTH);
 #else
-  shutdown(sock, SHUT_RDWR);
+  shutdown(static_cast<int>(sock), SHUT_RDWR);
 #endif
 }
 
@@ -126,7 +131,7 @@ void shutdownSocket(int sock) {
 // blocking in accept(): shutdown() on a listening socket does not reliably
 // wake a blocked accept() on macOS/BSD, so a poll-based wait is what lets
 // the accept loop notice the shutdown request.
-bool waitForReadable(int sock, int timeoutMs) {
+bool waitForReadable(SocketHandle sock, int timeoutMs) {
 #if defined(_WIN32)
   fd_set readSet;
   FD_ZERO(&readSet);
@@ -139,13 +144,24 @@ bool waitForReadable(int sock, int timeoutMs) {
   return ready > 0;
 #else
   struct pollfd pfd;
-  pfd.fd = sock;
+  pfd.fd = static_cast<int>(sock);
   pfd.events = POLLIN;
   pfd.revents = 0;
   const int ready = poll(&pfd, 1, timeoutMs);
   return ready > 0;
 #endif
 }
+
+// The platform's socket type: SOCKET on Windows, an int descriptor on POSIX.
+#if defined(_WIN32)
+inline SOCKET nativeSocket(SocketHandle handle) {
+  return static_cast<SOCKET>(handle);
+}
+#else
+inline int nativeSocket(SocketHandle handle) {
+  return static_cast<int>(handle);
+}
+#endif
 
 int lastSocketError() {
 #if defined(_WIN32)
@@ -171,12 +187,12 @@ bool socketWouldBlock(int err) {
 #endif
 }
 
-bool recvLine(int clientSocket, std::string &line, size_t maxLen) {
+bool recvLine(SocketHandle clientSocket, std::string &line, size_t maxLen) {
   line.clear();
 
   while (line.length() < maxLen) {
     char ch = '\0';
-    const auto n = recv(clientSocket, &ch, 1, 0);
+    const auto n = recv(nativeSocket(clientSocket), &ch, 1, 0);
     if (n <= 0) {
       return false;
     }
@@ -303,26 +319,22 @@ uint8_t evaluatePiState(const std::array<uint16_t, 64> &piBuffer,
 
 bool ensureSocketSubsystem() {
 #if defined(_WIN32)
-  static bool initialized = false;
-  static bool success = false;
-  if (!initialized) {
-    WSADATA wsaData;
-    success = (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0);
-    initialized = true;
-  }
-  return success;
+  // One reference for the lifetime of the process; the subsystem is shut
+  // down when the static lease is destroyed at exit.
+  static SocketSubsystemLease lease;
+  return lease.ok();
 #else
   return true;
 #endif
 }
 } // namespace
 
-void XDRServer::addClientSocket(int clientSocket) {
+void XDRServer::addClientSocket(SocketHandle clientSocket) {
   std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
   m_clientSockets.push_back(clientSocket);
 }
 
-void XDRServer::removeClientSocket(int clientSocket) {
+void XDRServer::removeClientSocket(SocketHandle clientSocket) {
   std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
   auto it =
       std::find(m_clientSockets.begin(), m_clientSockets.end(), clientSocket);
@@ -345,7 +357,7 @@ void XDRServer::joinClientThreads() {
 }
 
 XDRServer::XDRServer(uint16_t port)
-    : m_port(port), m_serverSocket(-1), m_running(false),
+    : m_port(port), m_serverSocket(kInvalidSocket), m_running(false),
       m_guestMode(false), m_verboseLogging(true), m_mode(0),
       m_frequency(88500000), m_volume(100), m_deemphasis(0), m_filter(-1),
       m_bandwidth(0), m_antenna(0), m_gain(0), m_agcMode(2), m_daa(0),
@@ -607,12 +619,12 @@ void XDRServer::broadcastOnlineLine() {
   // that only reads the line on connect would otherwise never learn that
   // somebody else joined or left.
   std::string line = onlineLine() + "\n";
-  std::vector<int> sockets;
+  std::vector<SocketHandle> sockets;
   {
     std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
     sockets = m_clientSockets;
   }
-  for (int sock : sockets) {
+  for (SocketHandle sock : sockets) {
     sendSocket(sock, line.c_str(), line.length());
   }
 }
@@ -677,8 +689,9 @@ bool XDRServer::start() {
     return false;
   }
 
-  const int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-  if (serverSocket < 0) {
+  const SocketHandle serverSocket =
+      static_cast<SocketHandle>(socket(AF_INET, SOCK_STREAM, 0));
+  if (serverSocket == kInvalidSocket) {
     std::cerr << "[XDR] failed to create server socket (err=" << lastSocketError()
               << ")" << "\n";
     return false;
@@ -687,11 +700,12 @@ bool XDRServer::start() {
 
   int opt = 1;
 #if defined(_WIN32)
-  setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR,
+  setsockopt(static_cast<SOCKET>(serverSocket), SOL_SOCKET, SO_REUSEADDR,
              reinterpret_cast<const char *>(&opt),
              static_cast<int>(sizeof(opt)));
 #else
-  setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(static_cast<int>(serverSocket), SOL_SOCKET, SO_REUSEADDR, &opt,
+             sizeof(opt));
 #endif
 
   struct sockaddr_in serverAddr;
@@ -700,28 +714,28 @@ bool XDRServer::start() {
   serverAddr.sin_addr.s_addr = INADDR_ANY;
   serverAddr.sin_port = htons(m_port);
 
-  if (bind(serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) <
-      0) {
+  if (bind(nativeSocket(serverSocket), (struct sockaddr *)&serverAddr,
+           sizeof(serverAddr)) < 0) {
     std::cerr << "[XDR] failed to bind to port " << m_port
               << " (err=" << lastSocketError() << ")" << "\n";
     closeSocket(serverSocket);
-    m_serverSocket = -1;
+    m_serverSocket = kInvalidSocket;
     return false;
   }
 
-  if (listen(serverSocket, 5) < 0) {
+  if (listen(nativeSocket(serverSocket), 5) < 0) {
     std::cerr << "[XDR] failed to listen on port " << m_port
               << " (err=" << lastSocketError() << ")" << "\n";
     closeSocket(serverSocket);
-    m_serverSocket = -1;
+    m_serverSocket = kInvalidSocket;
     return false;
   }
 
   m_running = true;
   m_acceptThread = std::thread([this]() {
     while (m_running) {
-      const int serverSocket = m_serverSocket.load();
-      if (serverSocket < 0) {
+      const SocketHandle serverSocket = m_serverSocket.load();
+      if (serverSocket == kInvalidSocket) {
         break;
       }
       // Wait for a connection with poll() rather than blocking in accept():
@@ -735,10 +749,11 @@ bool XDRServer::start() {
 
       struct sockaddr_in clientAddr;
       SocketLen clientLen = sizeof(clientAddr);
-      int clientSocket =
-          accept(serverSocket, (struct sockaddr *)&clientAddr, &clientLen);
+      const SocketHandle clientSocket = static_cast<SocketHandle>(
+          accept(nativeSocket(serverSocket), (struct sockaddr *)&clientAddr,
+                 &clientLen));
 
-      if (clientSocket >= 0) {
+      if (clientSocket != kInvalidSocket) {
         addClientSocket(clientSocket);
         auto entry = std::make_shared<ClientThread>();
         std::thread worker([this, clientSocket, entry]() {
@@ -764,8 +779,8 @@ bool XDRServer::start() {
     // The accept thread owns the listening socket's close: stop() only
     // shutdown()s it, so the fd can never be closed and reused underneath a
     // concurrent accept() call.
-    const int listeningSocket = m_serverSocket.exchange(-1);
-    if (listeningSocket >= 0) {
+    const SocketHandle listeningSocket = m_serverSocket.exchange(kInvalidSocket);
+    if (listeningSocket != kInvalidSocket) {
       closeSocket(listeningSocket);
     }
   });
@@ -810,17 +825,17 @@ void XDRServer::stop() {
   // never closed (and potentially reused) while accept() is in flight. The
   // accept loop waits with poll(), so it notices m_running going false and
   // returns within one poll interval.
-  const int serverSocket = m_serverSocket.load();
-  if (serverSocket >= 0) {
+  const SocketHandle serverSocket = m_serverSocket.load();
+  if (serverSocket != kInvalidSocket) {
     shutdownSocket(serverSocket);
   }
 
-  std::vector<int> clients;
+  std::vector<SocketHandle> clients;
   {
     std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
     clients = m_clientSockets;
   }
-  for (int sock : clients) {
+  for (SocketHandle sock : clients) {
     shutdownSocket(sock);
   }
 
@@ -830,12 +845,13 @@ void XDRServer::stop() {
   joinClientThreads();
 }
 
-void XDRServer::handleClient(int clientSocket) {
+void XDRServer::handleClient(SocketHandle clientSocket) {
   configureSendNoSigPipe(clientSocket);
   char clientIP[INET_ADDRSTRLEN];
   struct sockaddr_in clientAddr;
   SocketLen clientLen = sizeof(clientAddr);
-  getpeername(clientSocket, (struct sockaddr *)&clientAddr, &clientLen);
+  getpeername(nativeSocket(clientSocket), (struct sockaddr *)&clientAddr,
+               &clientLen);
   inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
 
   std::cout << "[XDR] client connected from " << clientIP << "\n";
@@ -853,7 +869,7 @@ void XDRServer::handleClient(int clientSocket) {
   char firstByte = '\0';
   ssize_t n = 0;
   while (m_running) {
-    n = recv(clientSocket, &firstByte, 1, MSG_PEEK);
+    n = recv(nativeSocket(clientSocket), &firstByte, 1, MSG_PEEK);
     if (n > 0) {
       break;
     }
@@ -897,7 +913,8 @@ void XDRServer::handleClient(int clientSocket) {
   std::cout << "[XDR] client disconnected from " << clientIP << "\n";
 }
 
-void XDRServer::handleFmdxClient(int clientSocket, const char *clientIP) {
+void XDRServer::handleFmdxClient(SocketHandle clientSocket,
+                               const char *clientIP) {
   bool tunerStarted = false;
   bool disconnectRequested = false;
   char cmdBuffer[256];
@@ -944,7 +961,8 @@ void XDRServer::handleFmdxClient(int clientSocket, const char *clientIP) {
       std::chrono::steady_clock::time_point::max();
 
   while (m_running && !disconnectRequested) {
-    const auto n = recv(clientSocket, cmdBuffer, sizeof(cmdBuffer) - 1, 0);
+    const auto n =
+        recv(nativeSocket(clientSocket), cmdBuffer, sizeof(cmdBuffer) - 1, 0);
     if (n < 0) {
       if (socketWouldBlock(lastSocketError())) {
         // A client that stalls during the auth exchange is dropped once the
@@ -1107,7 +1125,8 @@ void XDRServer::handleFmdxClient(int clientSocket, const char *clientIP) {
   }
 }
 
-void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
+void XDRServer::handleXdrClient(SocketHandle clientSocket,
+                               const char *clientIP) {
   if (m_verboseLogging.load()) {
     std::cout << "[XDR] client authenticating from " << clientIP << "\n";
   }
@@ -1215,7 +1234,8 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
   auto lastSignal = std::chrono::steady_clock::now();
 
   while (m_running) {
-    const auto n = recv(clientSocket, cmdBuffer, sizeof(cmdBuffer) - 1, 0);
+    const auto n =
+        recv(nativeSocket(clientSocket), cmdBuffer, sizeof(cmdBuffer) - 1, 0);
     if (n < 0) {
       if (socketWouldBlock(lastSocketError())) {
         bool sendFailed = false;
@@ -1351,11 +1371,12 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
   // A disconnect cancels the scan only when this client was the one that
   // armed it. Unconditionally cancelling meant that any second client
   // connecting and hanging up aborted a sweep that belonged to somebody else.
-  const int scanOwner = m_scanOwnerSocket.load(std::memory_order_relaxed);
-  if (scanOwner < 0 || scanOwner == clientSocket) {
+  const SocketHandle scanOwner =
+      m_scanOwnerSocket.load(std::memory_order_relaxed);
+  if (scanOwner == kInvalidSocket || scanOwner == clientSocket) {
     m_scanCancelPending = true;
     if (scanOwner == clientSocket) {
-      m_scanOwnerSocket.store(-1, std::memory_order_relaxed);
+      m_scanOwnerSocket.store(kInvalidSocket, std::memory_order_relaxed);
     }
   }
 
@@ -1367,7 +1388,7 @@ void XDRServer::handleXdrClient(int clientSocket, const char *clientIP) {
 
 std::string XDRServer::processCommand(const std::string &cmd,
                                       bool authenticated, bool guestSession,
-                                      int clientSocket) {
+                                      SocketHandle clientSocket) {
   // guestSession is no longer consulted: privilege is decided solely by
   // `authenticated` (H1 made guests read-only). The parameter is kept so the
   // session role stays visible at the call site and in the tests that cover

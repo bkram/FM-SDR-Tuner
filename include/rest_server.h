@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "socket_compat.h"
+
 // Anonymous HTTP control API on a dedicated port, intended for an
 // fm-dx-webserver client plugin. It exposes the SDR-specific settings the XDR
 // protocol has no vocabulary for (manual dB gain, SDRplay LNA state, antenna
@@ -57,7 +59,7 @@ public:
 
 private:
   void acceptLoop();
-  void handleConnection(int clientSocket);
+  void handleConnection(SocketHandle clientSocket);
   // Joins the client threads that have already finished. Called from the
   // accept loop so finished connections do not accumulate for the lifetime
   // of the process.
@@ -69,7 +71,7 @@ private:
   std::string m_bindAddress;
   uint16_t m_port;
   Controls m_controls;
-  int m_serverSocket = -1;
+  SocketHandle m_serverSocket = kInvalidSocket;
   std::atomic<bool> m_running{false};
   std::atomic<bool> m_verboseLogging{false};
   std::thread m_acceptThread;
@@ -94,7 +96,7 @@ private:
   // down so a worker blocked in recv() returns immediately instead of
   // waiting out the whole receive timeout.
   std::mutex m_clientSocketsMutex;
-  std::vector<int> m_clientSockets;
+  std::vector<SocketHandle> m_clientSockets;
 };
 
 #endif // REST_SERVER_H

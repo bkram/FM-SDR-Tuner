@@ -20,6 +20,8 @@ using SocketLen = socklen_t;
 #define CLOSESOCKET ::close
 #endif
 
+#include "socket_subsystem.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -187,22 +189,34 @@ bool toDouble(const std::string &v, double &out) {
 // A peer that disconnects mid-response raises SIGPIPE, whose default
 // disposition is to terminate the process. MSG_NOSIGNAL (POSIX) keeps the
 // error local to the send() call, which returns EPIPE instead.
-int sendNoSigPipe(int sock, const char *data, size_t len) {
+// The platform's socket type: SOCKET on Windows, an int descriptor on POSIX.
 #if defined(_WIN32)
-  return ::send(sock, data, static_cast<int>(len), 0);
-#elif defined(MSG_NOSIGNAL)
-  return static_cast<int>(::send(sock, data, len, MSG_NOSIGNAL));
+inline SOCKET nativeSocket(SocketHandle handle) {
+  return static_cast<SOCKET>(handle);
+}
 #else
-  return static_cast<int>(::send(sock, data, len, 0));
+inline int nativeSocket(SocketHandle handle) {
+  return static_cast<int>(handle);
+}
+#endif
+
+int sendNoSigPipe(SocketHandle sock, const char *data, size_t len) {
+#if defined(_WIN32)
+  return ::send(nativeSocket(sock), data, static_cast<int>(len), 0);
+#elif defined(MSG_NOSIGNAL)
+  return static_cast<int>(
+      ::send(nativeSocket(sock), data, len, MSG_NOSIGNAL));
+#else
+  return static_cast<int>(::send(nativeSocket(sock), data, len, 0));
 #endif
 }
 
 // SO_NOSIGPIPE is the BSD/macOS equivalent of MSG_NOSIGNAL: it suppresses
 // SIGPIPE for the socket rather than for the individual call.
-void configureSendNoSigPipe(int sock) {
+void configureSendNoSigPipe(SocketHandle sock) {
 #if defined(SO_NOSIGPIPE)
   const int opt = 1;
-  setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE,
+  setsockopt(nativeSocket(sock), SOL_SOCKET, SO_NOSIGPIPE,
              reinterpret_cast<const char *>(&opt), sizeof(opt));
 #else
   (void)sock;
@@ -211,21 +225,21 @@ void configureSendNoSigPipe(int sock) {
 
 // Bound how long a single client may hold the server up while it dribbles in
 // a request. Without this, one idle connection stalls every other client.
-void setRecvTimeoutMs(int sock, int timeoutMs) {
+void setRecvTimeoutMs(SocketHandle sock, int timeoutMs) {
 #if defined(_WIN32)
   const DWORD timeout = timeoutMs > 0 ? static_cast<DWORD>(timeoutMs) : 0;
-  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+  setsockopt(nativeSocket(sock), SOL_SOCKET, SO_RCVTIMEO,
              reinterpret_cast<const char *>(&timeout), sizeof(timeout));
 #else
   struct timeval tv;
   tv.tv_sec = timeoutMs / 1000;
   tv.tv_usec = (timeoutMs % 1000) * 1000;
-  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(nativeSocket(sock), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 }
 
-void sendResponse(int sock, int status, const std::string &statusText,
-                  const std::string &body) {
+void sendResponse(SocketHandle sock, int status,
+                  const std::string &statusText, const std::string &body) {
   std::ostringstream oss;
   oss << "HTTP/1.1 " << status << " " << statusText << "\r\n"
       << "Content-Type: application/json\r\n"
@@ -256,23 +270,24 @@ bool RestServer::start() {
   if (m_running.load()) return true;
 #if defined(_WIN32)
   // Initialize Winsock so the REST server is self-sufficient and doesn't rely
-  // on the XDR server (or anyone else) having called WSAStartup first.
-  // Refcounted, so a redundant call alongside XDRServer's is harmless.
+  // on the XDR server (or anyone else) having started the socket subsystem
+  // first. The start is reference-counted and shared with the other socket
+  // users, and it is released when the process exits.
   {
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+    static SocketSubsystemLease lease;
+    if (!lease.ok()) {
       std::cerr << "[REST] WSAStartup failed\n";
       return false;
     }
   }
 #endif
-  m_serverSocket = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
-  if (m_serverSocket < 0) {
+  m_serverSocket = static_cast<SocketHandle>(::socket(AF_INET, SOCK_STREAM, 0));
+  if (m_serverSocket == kInvalidSocket) {
     std::cerr << "[REST] failed to create socket\n";
     return false;
   }
   int opt = 1;
-  setsockopt(m_serverSocket, SOL_SOCKET, SO_REUSEADDR,
+  setsockopt(nativeSocket(m_serverSocket), SOL_SOCKET, SO_REUSEADDR,
              reinterpret_cast<const char *>(&opt), sizeof(opt));
 
   sockaddr_in addr{};
@@ -282,16 +297,17 @@ bool RestServer::start() {
       ::inet_pton(AF_INET, m_bindAddress.c_str(), &addr.sin_addr) != 1) {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   }
-  if (::bind(m_serverSocket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+  if (::bind(nativeSocket(m_serverSocket), reinterpret_cast<sockaddr *>(&addr),
+             sizeof(addr)) < 0) {
     std::cerr << "[REST] failed to bind " << m_bindAddress << ":" << m_port << "\n";
-    CLOSESOCKET(m_serverSocket);
-    m_serverSocket = -1;
+    CLOSESOCKET(nativeSocket(m_serverSocket));
+    m_serverSocket = kInvalidSocket;
     return false;
   }
-  if (::listen(m_serverSocket, 8) < 0) {
+  if (::listen(nativeSocket(m_serverSocket), 8) < 0) {
     std::cerr << "[REST] failed to listen on port " << m_port << "\n";
-    CLOSESOCKET(m_serverSocket);
-    m_serverSocket = -1;
+    CLOSESOCKET(nativeSocket(m_serverSocket));
+    m_serverSocket = kInvalidSocket;
     return false;
   }
   m_running.store(true);
@@ -303,25 +319,25 @@ bool RestServer::start() {
 
 void RestServer::stop() {
   if (!m_running.exchange(false)) return;
-  if (m_serverSocket >= 0) {
+  if (m_serverSocket != kInvalidSocket) {
 #if defined(_WIN32)
-    shutdown(m_serverSocket, SD_BOTH);
+    shutdown(nativeSocket(m_serverSocket), SD_BOTH);
 #else
-    ::shutdown(m_serverSocket, SHUT_RDWR);
+    ::shutdown(nativeSocket(m_serverSocket), SHUT_RDWR);
 #endif
-    CLOSESOCKET(m_serverSocket);
-    m_serverSocket = -1;
+    CLOSESOCKET(nativeSocket(m_serverSocket));
+    m_serverSocket = kInvalidSocket;
   }
   if (m_acceptThread.joinable()) m_acceptThread.join();
   // Shut the live connections down so a worker blocked in recv() returns
   // immediately, rather than making shutdown wait out the receive timeout.
   {
     std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
-    for (int sock : m_clientSockets) {
+    for (SocketHandle sock : m_clientSockets) {
 #if defined(_WIN32)
-      shutdown(sock, SD_BOTH);
+      shutdown(nativeSocket(sock), SD_BOTH);
 #else
-      ::shutdown(sock, SHUT_RDWR);
+      ::shutdown(nativeSocket(sock), SHUT_RDWR);
 #endif
     }
   }
@@ -340,9 +356,10 @@ void RestServer::acceptLoop() {
   while (m_running.load()) {
     sockaddr_in clientAddr{};
     SocketLen len = sizeof(clientAddr);
-    const int client = static_cast<int>(
-        ::accept(m_serverSocket, reinterpret_cast<sockaddr *>(&clientAddr), &len));
-    if (client < 0) {
+    const SocketHandle client = static_cast<SocketHandle>(
+        ::accept(nativeSocket(m_serverSocket),
+                 reinterpret_cast<sockaddr *>(&clientAddr), &len));
+    if (client == kInvalidSocket) {
       if (!m_running.load()) break;
       continue;
     }
@@ -371,7 +388,7 @@ void RestServer::acceptLoop() {
         m_clientSockets.erase(
             std::remove(m_clientSockets.begin(), m_clientSockets.end(), client),
             m_clientSockets.end());
-        CLOSESOCKET(client);
+        CLOSESOCKET(nativeSocket(client));
       }
       entry->done.store(true, std::memory_order_release);
     });
@@ -405,13 +422,13 @@ void RestServer::reapFinishedClientThreads() {
   }
 }
 
-void RestServer::handleConnection(int clientSocket) {
+void RestServer::handleConnection(SocketHandle clientSocket) {
   std::string request;
   char buf[2048];
   size_t headerEnd = std::string::npos;
   // Read until end of headers.
   while (request.size() < 64 * 1024) {
-    const auto n = ::recv(clientSocket, buf, sizeof(buf), 0);
+    const auto n = ::recv(nativeSocket(clientSocket), buf, sizeof(buf), 0);
     if (n <= 0) break;
     request.append(buf, static_cast<size_t>(n));
     headerEnd = request.find("\r\n\r\n");
@@ -456,7 +473,7 @@ void RestServer::handleConnection(int clientSocket) {
   }
   std::string body = request.substr(headerEnd + 4);
   while (body.size() < contentLength && body.size() < 64 * 1024) {
-    const auto n = ::recv(clientSocket, buf, sizeof(buf), 0);
+    const auto n = ::recv(nativeSocket(clientSocket), buf, sizeof(buf), 0);
     if (n <= 0) break;
     body.append(buf, static_cast<size_t>(n));
   }

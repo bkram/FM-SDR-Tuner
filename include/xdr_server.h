@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include "socket_compat.h"
+
 class XDRServer {
 public:
   static constexpr uint16_t DEFAULT_PORT = 7373;
@@ -106,15 +108,16 @@ public:
   void pushScanLine(const std::string &line);
 
 private:
-  void addClientSocket(int clientSocket);
-  void removeClientSocket(int clientSocket);
+  void addClientSocket(SocketHandle clientSocket);
+  void removeClientSocket(SocketHandle clientSocket);
   void joinClientThreads();
   void reapFinishedClientThreads();
-  void handleClient(int clientSocket);
-  void handleFmdxClient(int clientSocket, const char *clientIP);
-  void handleXdrClient(int clientSocket, const char *clientIP);
+  void handleClient(SocketHandle clientSocket);
+  void handleFmdxClient(SocketHandle clientSocket, const char *clientIP);
+  void handleXdrClient(SocketHandle clientSocket, const char *clientIP);
   std::string processCommand(const std::string &cmd, bool authenticated,
-                             bool guestSession, int clientSocket = -1);
+                             bool guestSession,
+                             SocketHandle clientSocket = kInvalidSocket);
   std::string processFmdxCommand(const std::string &cmd);
   std::string generateSalt();
   std::string computeSHA1(const std::string &salt, const std::string &password);
@@ -136,11 +139,11 @@ private:
   // the accept thread reads it (to accept and, on exit, to close). Only the
   // accept thread ever closes it, so the fd can never be closed and reused
   // underneath a concurrent accept() call.
-  std::atomic<int> m_serverSocket;
+  std::atomic<SocketHandle> m_serverSocket;
   std::atomic<bool> m_running;
   std::thread m_acceptThread;
   std::mutex m_clientSocketsMutex;
-  std::vector<int> m_clientSockets;
+  std::vector<SocketHandle> m_clientSockets;
   std::mutex m_clientThreadsMutex;
   // Each accepted client gets a worker thread. The entry carries a `done` flag
   // so the accept loop can join and drop the threads of clients that have
@@ -206,7 +209,7 @@ private:
   // The socket that armed the running scan. A scan is cancelled on disconnect
   // only when the client that started it goes away — otherwise any other
   // client hanging up would abort someone else's sweep.
-  std::atomic<int> m_scanOwnerSocket{-1};
+  std::atomic<SocketHandle> m_scanOwnerSocket{kInvalidSocket};
   std::deque<std::pair<uint64_t, std::string>> m_scanQueue;
   uint64_t m_scanNextSeq = 1;
   std::mutex m_scanMutex;
