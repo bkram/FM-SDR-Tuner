@@ -12,15 +12,6 @@ namespace processing_runner {
 
 namespace {
 
-bool suspectGhostingFromOverload(const SignalLevelResult &signal,
-                                 double clipRatio) {
-  // The overload image only shows up when the front end is driven into
-  // saturation by a strong signal, so the level has to be a genuinely
-  // strong one. The threshold is on the uncompensated band power of the
-  // tuned channel, which is the same figure the scan engine reports.
-  return clipRatio >= 0.01 && signal.level120 >= 70.0f && signal.dbfs >= -20.0;
-}
-
 std::string formatMaybeDouble(double value, int precision) {
   if (!std::isfinite(value)) {
     return "n/a";
@@ -176,19 +167,30 @@ bool processAudioBlock(
       std::cout << "\n";
     }
 
+  }
+
+  // Overload diagnosis for the receive path. A front end driven into
+  // saturation by a strong station mixes that station with itself and with
+  // its neighbours; the IMD products land at other frequencies and are heard
+  // (and plotted) as a duplicate of the station. This hint is NOT verbose-only:
+  // it is the one diagnostic that explains a duplicate the user is hearing
+  // while tuned, so it has to be visible at the default log level. The rate
+  // limit keeps it quiet when the condition persists.
+  {
     static bool overloadGhostHintActive = false;
     static uint32_t overloadGhostHintCount = 0;
     const bool overloadGhostSuspected =
-        suspectGhostingFromOverload(displaySignal, clipRatio);
+        suspectOverloadGhosting(displaySignal, clipRatio);
     if (overloadGhostSuspected) {
       const uint32_t hintCount = ++overloadGhostHintCount;
       if (!overloadGhostHintActive || hintCount <= 3 || (hintCount % 50) == 0) {
-        std::cerr << "[RF] overload/image ghosting suspected: clip="
-                  << std::fixed << std::setprecision(4) << clipRatio
-                  << " level=" << std::setprecision(1) << displaySignal.level120
-                  << " dbfs=" << std::setprecision(2) << displaySignal.dbfs
-                  << ". Lower gain first; if all stations remain shifted equally,"
-                     " then check freq_correction_ppm.\n";
+        std::cerr
+            << "[RF] overload/image ghosting suspected: clip=" << std::fixed
+            << std::setprecision(4) << clipRatio
+            << " level=" << std::setprecision(1) << displaySignal.level120
+            << " dbfs=" << std::setprecision(2) << displaySignal.dbfs
+            << ". Lower gain first; if all stations remain shifted equally,"
+               " then check freq_correction_ppm.\n";
       }
     }
     overloadGhostHintActive = overloadGhostSuspected;

@@ -374,3 +374,12 @@ float smoothSignalLevel(float input, SignalLevelSmoother &state) {
   state.value += (input - state.value) * alpha;
   return state.value;
 }
+
+bool suspectOverloadGhosting(const SignalLevelResult &signal,
+                             double clipRatio) {
+  // The overload image only shows up when the front end is driven into
+  // saturation by a strong signal, so the level has to be a genuinely strong
+  // one. The threshold is on the uncompensated band power of the tuned
+  // channel, which is the same figure the scan engine reports.
+  return clipRatio >= 0.01 && signal.level120 >= 70.0f && signal.dbfs >= -20.0;
+}

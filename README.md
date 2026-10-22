@@ -415,7 +415,9 @@ Endpoints:
   plus live telemetry:
   - `signal` (0–120 meter level), `dbfs` (tuned-channel power), `clip` (0–1 IQ
     clip ratio), `overload` (bool — front-end/ADC overloading; reduce gain or
-    LNA when true).
+    LNA when true), `ghost_risk` (bool — the front end is clipping *while the
+    tuned station is strong*, so its intermodulation products are heard as a
+    duplicate of a station; lower the gain).
   - `stereo` (bool, decoder locked), `stereo_quality` (0–1), `pilot_khz` (19 kHz
     pilot deviation), `blend` (applied stereo blend).
   - `snr` (dB) — demod-domain SNR from the noise-triangle band above the
@@ -663,6 +665,13 @@ A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; no
 - XDR server listens on port `7373`. If `xdr.password` is empty and no `-P` is passed, the server automatically enters guest mode (no auth). The password guards **both** wire protocols on that port: a guest may read the tuner state but not change it.
 - The `o<auth>,<guest>` line reports how many clients are actually connected, and is re-sent to every client whenever one joins or leaves.
 - The tuner does not auto-start by default; an XDR client start command activates it. Use `--auto-start` to begin playback without a client.
+- A tune request for the frequency that is **already** tuned does not retune:
+  the tuner only re-asserts the gain/AGC registers. A retune flushes the audio
+  queue, resets the DSP and mutes the output while the demodulator settles, and
+  the listener hears that as the programme restarting. Clients re-send the
+  current frequency routinely (xdr-gtk on every click of the tuned entry, the
+  REST panel on every poll that carries a frequency), so this is the common
+  case.
 - De-emphasis default is 50 µs (EU/ITU). For US/Korea set `[tuner].deemphasis = 1` in the config (75 µs).
 - Default stereo blend profile is `aggressive` (fast mute on marginal pilot); select `normal` or `soft` via `-b` or the config.
 
@@ -1186,6 +1195,28 @@ What to do:
 3. if the duplicate weakens or disappears when gain is reduced, treat it as overload / image behavior
 
 If duplicates remain only at high gain, the fix is RF front-end discipline, not meter calibration.
+
+The tuner reports this condition itself, so you do not have to hunt for it:
+
+- the console prints `[RF] overload/image ghosting suspected: clip=… level=… dbfs=…`
+  as soon as the front end is clipping while the tuned station is strong. The
+  hint is not verbose-only, because it is the one diagnostic that explains a
+  duplicate *while you listen*; it is rate-limited so a persistent condition
+  does not flood the log.
+- `GET /api/status` carries `ghost_risk` (bool) next to `clip` and `overload`.
+- the fm-dx-webserver control plugin shows it as the **Duplicate** cell
+  (`RISK` when set), with the clip ratio next to the **Overload** cell.
+
+On the paths where the gain is pinned (the sdrpp gain strategy, a fixed
+`-g`/`rtl_gain_db`, or the tuner's own AGC) the auto-gain ladder cannot pull
+it down, so the tuner prints `[GAIN] clip-protect inactive (…): …` naming the
+knob to turn instead.
+
+Note that a duplicate of a station is *not* the same thing as the station
+repeating itself: a retune to the frequency that is already tuned no longer
+restarts the programme (the tuner skips the redundant retune and only
+re-asserts the gain/AGC registers), so what you hear is a genuine second
+copy, not the DSP restarting.
 
 #### 3. Nearby strong station leaking into adjacent channels: suspect adjacent-channel leakage
 

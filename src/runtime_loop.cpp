@@ -140,8 +140,27 @@ void maybeAdjustAutoGain(
     std::chrono::steady_clock::time_point &lastGainDown,
     std::chrono::steady_clock::time_point &lastGainUp,
     const SignalLevelResult &signal, double clipRatio, float rfLevelFiltered,
-    bool verboseLogging, const std::function<int(int)> &agcModeToGainDb) {
+    bool verboseLogging, const std::function<int(int)> &agcModeToGainDb,
+    const char *fixedGainAdvice) {
   if (useSdrppGainStrategy || cliGain >= 0 || imsAgcEnabled) {
+    // The ladder cannot act on these paths: the gain is pinned by the
+    // strategy, by the command line, or by the tuner AGC. When the front end
+    // is clipping, say so and name the knob, because a clipped front end
+    // mixes a strong station with itself and the IMD product is heard as a
+    // duplicate of that station.
+    if (fixedGainAdvice != nullptr &&
+        (clipRatio > 0.0200 || signal.dbfs > -5.0)) {
+      static uint32_t fixedGainClipWarnCount = 0;
+      const uint32_t warnCount = ++fixedGainClipWarnCount;
+      if (warnCount <= 3 || (warnCount % 50) == 0) {
+        std::cerr << "[GAIN] clip-protect inactive (" << fixedGainAdvice
+                  << "): clip=" << std::fixed << std::setprecision(4)
+                  << clipRatio << " dbfs=" << std::setprecision(2)
+                  << signal.dbfs
+                  << ". The front end is clipping, so a strong station is mixed"
+                     " with itself and heard as a duplicate. Lower the gain.\n";
+      }
+    }
     return;
   }
   // Recovery keys off raw-dbfs headroom (see auto_gain_policy.h), not the

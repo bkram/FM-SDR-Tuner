@@ -378,3 +378,30 @@ TEST_CASE("clip ratio counts bytes, not samples", "[signal_level]") {
       computeSignalLevel(iq.data(), kSamples, 0, 0.5, 0.0, -65.0, -5.0);
   REQUIRE(r2.hardClipRatio > 0.99);
 }
+
+TEST_CASE("overload ghosting is only suspected on a clipping strong channel",
+          "[signal_level]") {
+  SignalLevelResult strong;
+  strong.level120 = 95.0f;
+  strong.dbfs = -8.0;
+  strong.hardClipRatio = 0.05;
+  strong.nearClipRatio = 0.0;
+
+  // All three conditions hold: clipping, a strong channel, a loud station.
+  REQUIRE(suspectOverloadGhosting(strong, 0.05));
+
+  // No clipping: a loud but clean station cannot produce an overload image.
+  REQUIRE_FALSE(suspectOverloadGhosting(strong, 0.0));
+
+  // Clipping, but a weak channel: the front end is not being driven by a
+  // strong station, so this is not the overload image.
+  SignalLevelResult weak = strong;
+  weak.level120 = 20.0f;
+  weak.dbfs = -50.0;
+  REQUIRE_FALSE(suspectOverloadGhosting(weak, 0.05));
+
+  // Clipping and a strong channel, but the channel is not actually loud.
+  SignalLevelResult quiet = strong;
+  quiet.dbfs = -45.0;
+  REQUIRE_FALSE(suspectOverloadGhosting(quiet, 0.05));
+}

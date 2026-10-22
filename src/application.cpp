@@ -412,6 +412,22 @@ int Application::run() {
   };
   constexpr double kSignalGainCompFactor = 0.5;
 
+  // Name the knob that sets the gain on this path. The auto-gain ladder can
+  // only act when the gain is strategy-managed; on the paths where the gain is
+  // pinned, this is what the clip-protect advisory points the user at.
+  auto fixedGainAdvice = [&]() -> const char * {
+    if (useSdrppGainStrategy) {
+      return (gain >= 0) ? "-g (RTL gain)" : "sdrpp_rtl_agc_gain_db";
+    }
+    if (gain >= 0) {
+      return "rtl_gain_db / -g";
+    }
+    if (isImsAgcEnabled()) {
+      return "rtl_agc (the tuner's own AGC)";
+    }
+    return "agc_mode";
+  };
+
   auto applyRtlGainAndAgc = [&](const char *reason) {
     if (!rtlConnected) {
       return;
@@ -628,6 +644,10 @@ int Application::run() {
   std::atomic<double> liveSignalDbfs{-120.0};
   std::atomic<double> liveClipRatio{0.0};
   std::atomic<bool> liveOverload{false};
+  // True when the front end is clipping while the tuned station is strong:
+  // the intermodulation products of a saturated front end are heard (and
+  // plotted) as a duplicate of a station.
+  std::atomic<bool> liveGhostRisk{false};
   // Pilot / stereo / MPX telemetry (updated on the processing thread).
   std::atomic<float> livePilotKHz{0.0f};
   std::atomic<float> liveRdsDevKHz{0.0f};
@@ -832,6 +852,8 @@ int Application::run() {
           << liveClipRatio.load(std::memory_order_relaxed) << std::setprecision(1)
           << ",\"overload\":"
           << (liveOverload.load(std::memory_order_relaxed) ? "true" : "false")
+          << ",\"ghost_risk\":"
+          << (liveGhostRisk.load(std::memory_order_relaxed) ? "true" : "false")
           << ",\"stereo\":"
           << (liveStereo.load(std::memory_order_relaxed) ? "true" : "false")
           << ",\"pilot_khz\":"
@@ -1094,10 +1116,17 @@ int Application::run() {
           liveClipRatio.store(clipRatio, std::memory_order_relaxed);
           liveOverload.store((clipRatio > 0.0200) || (signal.dbfs > -5.0),
                              std::memory_order_relaxed);
+          // A saturated front end mixes a strong station with itself and its
+          // neighbours, and the intermodulation products are heard as a
+          // duplicate of a station. The client shows this as the "ghost"
+          // indication next to the overload one.
+          liveGhostRisk.store(suspectOverloadGhosting(signal, clipRatio),
+                              std::memory_order_relaxed);
           runtime_loop::maybeAdjustAutoGain(
               useSdrppGainStrategy, gain, isImsAgcEnabled(), requestedAGCMode,
               pendingAGC, lastGainDown, lastGainUp, signal, clipRatio,
-              rfLevelFiltered, verboseLogging, agcModeToGainDb);
+              rfLevelFiltered, verboseLogging, agcModeToGainDb,
+              fixedGainAdvice());
           runtime_loop::maybeAdjustAdaptiveBandwidth(
               adaptiveBwMode, adaptiveBwState, requestedBandwidthHz,
               pendingBandwidth, appliedBandwidthHz.load(), signal,

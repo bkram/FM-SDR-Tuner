@@ -117,4 +117,16 @@ float snrLevel120FromSnrDb(double snrDb);
 
 float smoothSignalLevel(float input, SignalLevelSmoother &state);
 
+// True when the front end is probably being driven into saturation by the
+// station that is tuned: the ADC is clipping while the channel is strong.
+//
+// A saturated front end mixes the strong station with itself and with its
+// neighbours. The intermodulation products land at other frequencies, where
+// they are heard (and plotted) as a duplicate of a station -- the classic
+// "I hear the same station twice" symptom. The condition needs all three
+// parts: clipping (the front end is saturated), a strong channel (there is
+// something strong enough to saturate it with) and a high meter reading (the
+// station really is loud).
+bool suspectOverloadGhosting(const SignalLevelResult &signal, double clipRatio);
+
 #endif
