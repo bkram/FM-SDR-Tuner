@@ -931,6 +931,12 @@ void XDRServer::handleFmdxClient(int clientSocket, const char *clientIP) {
   // line that is some other payload is not a valid FM-DX client, and a
   // first line that is oversized is rejected outright.
   bool sawStartupLine = false;
+  // True when this client is the one that put the tuner into play. A client
+  // that connects to a tuner that is already running (--auto-start, or a
+  // client that is already connected) does not own the tuner, so its
+  // disconnect must not stop it: the programme would cut out in the middle
+  // of the listener's music because a browser tab was closed.
+  bool clientOwnsTuner = false;
   // The salt sent with the startup reply, and the deadline by which the
   // client must answer with the matching hash.
   std::string fmdxSalt;
@@ -1006,6 +1012,11 @@ void XDRServer::handleFmdxClient(int clientSocket, const char *clientIP) {
           continue;
         }
         tunerStarted = true;
+        // The tuner is only "owned" by this client when it was not already
+        // running: the stop-on-disconnect below must not cut a tuner that
+        // somebody else (--auto-start, another client) is using.
+        clientOwnsTuner =
+            !(m_tunerActiveCallback && m_tunerActiveCallback());
         if (m_startCallback) {
           m_startCallback();
         }
@@ -1091,7 +1102,7 @@ void XDRServer::handleFmdxClient(int clientSocket, const char *clientIP) {
   }
   setRecvTimeoutMs(clientSocket, 0);
 
-  if (tunerStarted && m_stopCallback) {
+  if (tunerStarted && clientOwnsTuner && m_stopCallback) {
     m_stopCallback();
   }
 }
@@ -1760,6 +1771,10 @@ void XDRServer::setStartCallback(StartCallback cb) {
 }
 void XDRServer::setStopCallback(StopCallback cb) {
   assignCallback(m_stopCallback, std::move(cb));
+}
+
+void XDRServer::setTunerActiveCallback(TunerActiveCallback cb) {
+  assignCallback(m_tunerActiveCallback, std::move(cb));
 }
 
 std::string XDRServer::processFmdxCommand(const std::string &cmd) {

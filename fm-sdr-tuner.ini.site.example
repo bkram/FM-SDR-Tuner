@@ -16,10 +16,27 @@ default_freq = 96200
 deemphasis = 0
 
 [sdr]
-# TEF-like gain behaviour with the auto clip-protect loop. This is the
-# stable default for an indoor telescopic antenna.
+# A fixed manual gain, NOT the dongle's own AGC.
+#
+# The RTL's AGC targets the average level of the signal, but an FM station's
+# modulation peaks sit ~10 dB above its average, so an AGC that parks the
+# average at -15 dBFS drives the peaks into the ADC's clipper. Measured on
+# this site with the R820T: with the dongle's AGC the local station reads
+# -14 dBFS and clips 4-11% of the samples; at 10 dB manual it reads
+# -19 dBFS and never clips.
+#
+# A clipped front end mixes the strong station with itself, and the
+# intermodulation product is heard as a duplicate of that station. That is
+# the "I hear every station twice" symptom, and it is a front-end problem,
+# not a DSP one.
+#
+# Re-measure after a change of antenna or cable: run the tuner with
+# --verbose, read the [SIG] "clip=" column, and lower rtl_gain_db until it
+# stays at 0.0000 while the station still reads well above the noise floor.
+# 10 dB is the highest manual gain that keeps this site's strongest station
+# out of the clipper; a weaker site can use more.
 gain_strategy = tef
-rtl_gain_db = -1
+rtl_gain_db = 10
 default_custom_gain_flags = 1
 
 # RTL dongles are typically off by a few hundred Hz to a few kHz. If the
@@ -31,17 +48,17 @@ freq_correction_ppm = 0
 
 # Meter calibration window: maps compensated dBFS to the 0..120 level.
 #
-# These are the values measured on this site with a real RTL-SDR and the
-# indoor antenna: the local noise floor sits between -48 and -55 dBFS and
-# the local stations between -33 and -12 dBFS, so the window below spans
-# exactly the range this site has. Everything weaker than the floor reads
-# as "no signal" and the strongest local station reaches the top of the
-# meter.
+# These are the values measured on this site with a real RTL-SDR, the
+# indoor antenna and the fixed 10 dB gain above: the local station sits
+# between -22 and -25 dBFS (compensated) and the empty band reads -43
+# dBFS, so the window below spans exactly the range this site has.
+# Everything weaker than the floor reads as "no signal" and the strongest
+# local station reaches the top of the meter.
 #
 # Re-measure after a change of antenna or cable: run
 # `./build/fm-sdr-tuner --calibrate` and paste its recommendation here.
-signal_floor_dbfs = -55.0
-signal_ceil_dbfs = -12.0
+signal_floor_dbfs = -43.0
+signal_ceil_dbfs = -19.0
 signal_bias_db = 0.0
 
 # Spectral-scan plot scale. The scan line is the spectrum of the band: every
@@ -72,7 +89,8 @@ startup_volume = 100
 
 [processing]
 # Stable middle ground. Verify the gain is not clipping before judging
-# the stereo behaviour.
+# the stereo behaviour. agc_mode only applies to the TEF gain ladder, which
+# the fixed rtl_gain_db above bypasses.
 agc_mode = 2
 
 # 194 kHz is the correct starting point for normal WFM stereo. Narrow it

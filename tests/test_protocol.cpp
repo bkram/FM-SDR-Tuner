@@ -1268,3 +1268,54 @@ TEST_CASE("XDRServer: a bystander disconnect does not cancel a scan",
   closeSock(owner);
   server.stop();
 }
+
+TEST_CASE("FM-DX client disconnect stops only a tuner it started",
+          "[protocol][xdr][fmdx]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  // The FM-DX path stops the tuner when the client that started it goes
+  // away. A client that attaches to a tuner that is already running
+  // (--auto-start, or a tuner another client is using) must not cut the
+  // programme when it disconnects: the listener would hear the station
+  // restart, which reads as the station repeating itself.
+  auto runScenario = [](uint16_t scenarioPort, bool tunerAlreadyRunning) {
+    XDRServer server(scenarioPort);
+    server.setVerboseLogging(false);
+    std::atomic<int> startCalls{0};
+    std::atomic<int> stopCalls{0};
+    server.setStartCallback(
+        [&]() { startCalls.fetch_add(1, std::memory_order_relaxed); });
+    server.setStopCallback(
+        [&]() { stopCalls.fetch_add(1, std::memory_order_relaxed); });
+    server.setTunerActiveCallback([&]() { return tunerAlreadyRunning; });
+    REQUIRE(server.start());
+
+    int sock = connectLoopback(scenarioPort);
+    setRecvTimeoutMs(sock, 2500);
+    const std::string startup = "x\n";
+    REQUIRE(sendAll(sock, reinterpret_cast<const uint8_t *>(startup.data()),
+                    startup.size()));
+    REQUIRE(waitForExactLine(sock, "OK", std::chrono::milliseconds(1000)));
+    REQUIRE(startCalls.load() == 1);
+
+    closeSock(sock);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    server.stop();
+    return stopCalls.load();
+  };
+
+  const uint16_t ownerPort = reserveLoopbackPort();
+  const uint16_t guestPort = reserveLoopbackPort();
+  if (ownerPort == 0 || guestPort == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+
+  // The client started the tuner: its disconnect stops it, as the reference
+  // protocol expects.
+  REQUIRE(runScenario(ownerPort, false) == 1);
+
+  // The tuner was already running: the client does not own it, so its
+  // disconnect leaves the tuner alone.
+  REQUIRE(runScenario(guestPort, true) == 0);
+}

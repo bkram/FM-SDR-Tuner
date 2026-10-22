@@ -30,6 +30,11 @@ public:
   using ForceMonoCallback = std::function<void(bool forceMono)>;
   using StartCallback = std::function<void()>;
   using StopCallback = std::function<void()>;
+  // Reports whether the tuner is already running. The FM-DX path stops the
+  // tuner when a client disconnects, but only when that client is the one
+  // that started it: a client that connects to a tuner somebody else is
+  // already using must not cut the programme when it goes away.
+  using TunerActiveCallback = std::function<bool()>;
 
   XDRServer(uint16_t port = DEFAULT_PORT);
   ~XDRServer();
@@ -67,6 +72,7 @@ public:
   void setBlendModeCallback(IntCallback cb);
   void setStartCallback(StartCallback cb);
   void setStopCallback(StopCallback cb);
+  void setTunerActiveCallback(TunerActiveCallback cb);
 
   uint32_t getFrequency() const { return m_frequency; }
   int getMode() const { return m_mode; }
@@ -222,6 +228,7 @@ private:
   IntCallback m_blendModeCallback;
   StartCallback m_startCallback;
   StopCallback m_stopCallback;
+  TunerActiveCallback m_tunerActiveCallback;
 
   std::mutex m_callbackMutex;
 

@@ -63,6 +63,9 @@ void TunerSession::connect() {
   }
   m_rtlConnected = true;
   m_applyRtlGainAndAgc("connect/apply");
+  if (m_params.onConnected) {
+    m_params.onConnected();
+  }
 }
 
 void TunerSession::disconnect() {

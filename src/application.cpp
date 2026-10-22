@@ -6,6 +6,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -518,6 +519,16 @@ int Application::run() {
     }
   };
 
+  // The first samples after a connect are the tuner's settling burst, not
+  // programme: on an RTL-SDR the front end delivers a loud narrowband
+  // transient at the LO centre for the first ~150 ms, hot enough to clip the
+  // ADC. It is dropped here so it never reaches the audio, the signal
+  // statistics or the front-end overload warnings.
+  constexpr size_t kConnectSettleMs = 250;
+  size_t connectSettleSamplesRemaining = 0;
+  const size_t connectSettleSamples =
+      (static_cast<size_t>(iqSampleRate) * kConnectSettleMs) / 1000;
+
   TunerSession tunerSession(
       tuner, rtlConnected,
       {.useDirectRtlSdr = useDirectRtlSdr,
@@ -528,7 +539,9 @@ int Application::run() {
        .initialFreqKHz = freqKHz,
        .iqSampleRate = iqSampleRate,
        .freqCorrectionPpm = freqCorrectionPpm,
-       .autoReconnect = autoReconnect},
+       .autoReconnect = autoReconnect,
+       .onConnected = [&]() { connectSettleSamplesRemaining =
+           connectSettleSamples; }},
       [&]() { return requestedFrequencyHz.load(); },
       [&]() { return requestedAGCMode.load(); },
       [&]() { return requestedCustomGain.load(); },
@@ -627,6 +640,15 @@ int Application::run() {
         pendingStopRequest.store(true, std::memory_order_release);
       },
       formatCustomGain);
+  // A client that connects to a tuner that is already running does not own
+  // it, so its disconnect must not stop the tuner. The FM-DX path stops the
+  // tuner when the client that started it goes away; without this the
+  // programme cuts out whenever a control client reconnects.
+  xdrFacade.setTunerActiveCallback([&]() {
+    return tunerActive.load(std::memory_order_acquire) ||
+           pendingStartRequest.load(std::memory_order_acquire) ||
+           autoStartTuner;
+  });
 
   if (!xdrServer.start()) {
     std::cerr << "[XDR] failed to start XDR server\n";
@@ -1100,6 +1122,18 @@ int Application::run() {
                               SDR_BUF_SAMPLES, noDataSleep, tunerSession,
                               verboseLogging, samples)) {
       continue;
+    }
+
+    if (connectSettleSamplesRemaining > 0) {
+      // Drop the tuner's settling burst (see kConnectSettleMs). The IQ
+      // capture keeps the raw samples; only the DSP path skips them.
+      const size_t drop = std::min(connectSettleSamplesRemaining, samples);
+      connectSettleSamplesRemaining -= drop;
+      if (drop >= samples) {
+        continue;
+      }
+      std::memmove(iqBuffer, iqBuffer + (drop * 2), (samples - drop) * 2);
+      samples -= drop;
     }
 
     (void)processing_runner::processAudioBlock(

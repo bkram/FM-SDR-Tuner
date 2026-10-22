@@ -134,3 +134,7 @@ void XdrFacade::installCallbacks(
     onStopCb();
   });
 }
+
+void XdrFacade::setTunerActiveCallback(std::function<bool()> isTunerActive) {
+  m_server.setTunerActiveCallback(std::move(isTunerActive));
+}

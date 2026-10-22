@@ -672,6 +672,20 @@ A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; no
   current frequency routinely (xdr-gtk on every click of the tuned entry, the
   REST panel on every poll that carries a frequency), so this is the common
   case.
+- A control client that disconnects does **not** stop a tuner it did not start.
+  On the FM-DX path the tuner is stopped when the client that started it goes
+  away; a client that attaches to an already-running tuner (`--auto-start`, or
+  a tuner another client is using) no longer cuts the programme when it
+  disconnects. Without this, a reconnecting control client restarted the
+  tuner — and the listener heard the station start over.
+- The first ~250 ms of IQ after a **connect** is dropped before it reaches the
+  DSP. An RTL-SDR delivers a loud, narrowband settling burst at the LO centre
+  in that window (measured: 12 dB above the settled level, clipping ~8% of
+  the samples). It is not programme: left in, it reached the audio as a burst
+  of noise, polluted the signal statistics and the meter calibration, and
+  triggered the front-end overload warnings on a perfectly healthy front end.
+  The raw IQ capture (`-i`) still contains it, because the capture is the
+  tuner's raw output.
 - De-emphasis default is 50 µs (EU/ITU). For US/Korea set `[tuner].deemphasis = 1` in the config (75 µs).
 - Default stereo blend profile is `aggressive` (fast mute on marginal pilot); select `normal` or `soft` via `-b` or the config.
 
@@ -921,6 +935,13 @@ Practical manual range:
 
 Do not chase the highest signal number. The correct gain is the highest gain
 that does not produce sustained clipping on strong stations.
+
+The clip column is the one to watch on FM specifically: the modulation peaks
+of an FM station sit about 10 dB above its average, so a gain that looks
+comfortable on the level readout can still clip the ADC on the peaks. If
+`clip` is not `0.0000` on your strongest station while using the dongle's own
+AGC (`rtl_gain_db = -1`), switch to a fixed manual gain (see "Duplicates of
+strong stations" for the measured numbers).
 
 ### 5. How To Read The Console Output
 
@@ -1218,6 +1239,23 @@ restarts the programme (the tuner skips the redundant retune and only
 re-asserts the gain/AGC registers), so what you hear is a genuine second
 copy, not the DSP restarting.
 
+**Why the dongle's own AGC causes this on FM.** An AGC targets the *average*
+level of the signal, but an FM station's modulation peaks sit roughly 10 dB
+above its average. An AGC that parks the average at −15 dBFS therefore drives
+the peaks into the ADC's clipper, and a saturated front end mixes the strong
+station with itself — the intermodulation product is heard as a second copy of
+that station. Measured on an R820T with the local station at 96.2 MHz:
+
+| Gain setting | Station level | Clip ratio | SNR |
+|---|---|---|---|
+| dongle AGC (`rtl_gain_db = -1`) | −14 dBFS | 0.04 – 0.11 | 11 – 20 dB |
+| manual 10 dB | −19 dBFS | 0.0000 | 7 – 14 dB |
+| manual 0 dB | −34 dBFS | 0.0000 | 7 – 11 dB |
+
+The AGC path clips intermittently; a manual gain that leaves ~10 dB of
+headroom for the peaks does not. That is why the shipped site profile uses a
+fixed 10 dB instead of the dongle's AGC.
+
 #### 3. Nearby strong station leaking into adjacent channels: suspect adjacent-channel leakage
 
 Symptom:
@@ -1311,13 +1349,20 @@ Use fixed `rtl_gain_db` when:
 - antenna and site are stable
 - you want repeatable comparisons
 - you are benchmarking meter or scan behavior
+- a strong local station makes the dongle's own AGC clip the ADC (see
+  "Duplicates of strong stations" above: the AGC targets the average level,
+  the FM peaks clip)
 
 Avoid fixed manual gain when:
 - moving between locations
 - changing antennas often
 - local RF density varies a lot over time
 
-For general listening, strategy-managed gain is usually easier to keep sane.
+For general listening, strategy-managed gain is usually easier to keep sane —
+but on a site with a strong local station, a fixed gain that leaves headroom
+for the modulation peaks is the safer choice. The `[SIG] clip=` column tells
+you when the front end is overdriven: lower `rtl_gain_db` until it reads
+`0.0000` while the station still sits clearly above the noise floor.
 
 ### 13. Optional Adaptive Features
 

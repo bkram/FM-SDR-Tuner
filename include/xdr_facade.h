@@ -55,6 +55,10 @@ public:
       const std::function<void()> &onStart, const std::function<void()> &onStop,
       const std::function<std::string(int)> &formatCustomGain);
 
+  // Reports whether the tuner is already running, so the server can tell a
+  // client that started the tuner from one that merely attached to it.
+  void setTunerActiveCallback(std::function<bool()> isTunerActive);
+
 private:
   XDRServer &m_server;
   XdrCommandState &m_state;
