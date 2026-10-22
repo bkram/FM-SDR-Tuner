@@ -310,6 +310,18 @@ shrink as the sweep advances. The trailing comma is mandatory: the client's
 parser sizes its array from the comma count and drops the last entry without
 it.
 
+**The plot is a spectrum, not a list of stations.** Every grid point reports
+the level of the band at that frequency, measured with the same estimator and
+the same 30 kHz window the signal meter uses — so the plot and the meter read
+the same number for the same signal. A signal that is not a station stays a
+bump in the noise floor, the way a spectrum display shows it, instead of
+turning into a station of its own. That is the difference between this plot
+and a sparse "stations only" scan, where a single noise maximum is drawn like
+a station on a frequency nobody broadcasts on — the "ghost stations" a
+spectrum display does not have. A grid point that holds a station reports the
+station's peak instead, so the station is drawn exactly on its own grid point
+and shows its real strength.
+
 **The step is widened when the grid would not fit.** The whole spectrum travels
 in a single line, and the reference client reads into a 10000-byte buffer and
 silently drops whatever exceeds it — a truncated line loses its trailing comma
@@ -347,6 +359,11 @@ does not divide the 200 kHz raster is reported in the log:
 raster, so some stations are reported at the nearest grid point instead of
 their own frequency
 ```
+
+The station's own frequency is measured, not assumed: a station that sits
+between two grid points is reported on the one it belongs to. A station
+measured on 96.188 MHz — 12 kHz off the 96.2 grid point — is reported on
+96.2, and the meter shows the same number for it.
 
 **Levels are on the client's plot scale.** The reference client draws the scan
 in a fixed 3..84 window and clips everything outside it, so the scan line is
@@ -705,16 +722,15 @@ Important sections:
 - `[xdr]`: server port/password/guest mode
 
 Signal meter related keys (`[sdr]`):
-- `signal_floor_dbfs` (default `-65.0`)
-- `signal_ceil_dbfs` (default `-5.0`)
+- `signal_floor_dbfs` (default `-55.0`)
+- `signal_ceil_dbfs` (default `-10.0`)
 - `signal_bias_db` (default `0.0`)
 
 ### Getting reasonable signal-strength readings
 
 The displayed signal level (the `0..120` value XDR/FM-DX clients show as dBf) is
-not an absolute measurement — it is the **lower of two terms**: a linear mapping
-of the tuned-channel power (compensated dBFS) onto a `0..120` scale, capped by a
-noise-referenced SNR term so an empty channel can never peg the meter:
+a **linear mapping of the tuned-channel power** (compensated dBFS) onto a
+`0..120` scale:
 
 - `signal_floor_dbfs` is the power that reads as **0** (your noise floor / empty
   channel).
@@ -722,24 +738,14 @@ noise-referenced SNR term so an empty channel can never peg the meter:
 - `signal_bias_db` shifts the whole scale up/down to line up with a reference
   receiver, if you have one (otherwise leave it at `0`).
 
-**The SNR cap.** RTL front ends saturate: with auto-gain the tuner climbs to
-high gain on a weak/empty channel and the amplified noise pushes the raw channel
-power near full scale — so the *absolute* term alone would read ~maximum on
-empty spectrum just as it does on a strong station. To prevent that, the
-displayed level is also capped by the demod-domain SNR (the gain-invariant
-noise-triangle metric shown as `snr` in the REST API): below ~3 dB SNR the cap
-is 0, and it rises to full scale near ~30 dB. In practice this means an empty
-frequency reads near **0**, a fringe station reads low-to-mid, and only a clean,
-genuinely strong signal approaches the top — regardless of where auto-gain has
-parked the front-end gain. (This is why tuning a dead frequency no longer shows
-a pegged meter.)
+The measured power is the **band power of a 30 kHz window** around the tuned
+carrier — the same window, the same estimator and the same calibration the
+spectral scan integrates, so the plot and the meter report the same number for
+the same signal. Half of the applied gain is taken out of the reading, so a
+station keeps its level when the gain strategy changes.
 
-So a "reasonable" reading depends on the floor/ceil window matching the signal
-range your antenna delivers **and**, wherever it binds, on the SNR cap. The
-shipped default (`-65` / `-5`, a wide 60 dB window) is deliberately conservative
-so nothing saturates out of the box, but on most sites it compresses everything
-into the middle of the scale. To get the *absolute term* to track real signal
-differences:
+The shipped default (`-55` / `-10`) puts the noise floor of an empty band at 0
+and a strong local station near 115. To make the reading track your own site:
 
 1. **Fix RF gain first.** A meter calibrated over a clipping or starved front
    end is meaningless. Get `[SIG] clip` near zero on strong locals (see
@@ -749,15 +755,9 @@ differences:
    `./fm-sdr-tuner --calibrate` (prints copy-paste `signal_floor_dbfs` /
    `signal_ceil_dbfs` / `signal_bias_db` for your antenna), or just watch the
    `[METER] session observed` log line, which continuously suggests a floor/ceil
-   from the running min/max it sees. Both calibrate the **absolute term only** —
-   they don't model the SNR cap.
+   from the running min/max it sees.
 3. **Apply the suggested window** to `[sdr]` and restart. Strong locals should
-   then settle near the top. Note that **fringe-station readings are bounded by
-   the SNR cap, not the window**: a station at ~10 dB demod SNR is capped near
-   `30` no matter how you set floor/ceil, so widening the window can't raise it.
-   The window mainly positions strong/mid stations; the live meter can read lower
-   than the absolute mapping wherever the SNR cap binds (expected, not a
-   mis-calibration).
+   then settle near the top and an empty frequency at zero.
 
 The full step-by-step procedure, the `[METER]` output format, and the symptoms
 of a mis-set window are in
@@ -798,7 +798,7 @@ clipping.
 
 ### 1. Start From A Known-Good Baseline
 
-The binary ships with wide, safe defaults (`gain_strategy = tef`, `agc_mode = 2`, `w0_bandwidth_hz = 194000`, `stereo_blend = aggressive`, `signal_floor_dbfs = -65`, `signal_ceil_dbfs = -5`, `signal_bias_db = 0`, deemph 50 µs, `pilot_canceller = true`). The optional adaptive features (`hicut`, `adaptive_bandwidth`, `multipath_eq`) default to off so the audio is identical to a passive demod chain until you opt in.
+The binary ships with measured, site-independent defaults (`gain_strategy = tef`, `agc_mode = 2`, `w0_bandwidth_hz = 194000`, `stereo_blend = aggressive`, `signal_floor_dbfs = -55`, `signal_ceil_dbfs = -10`, `signal_bias_db = 0`, deemph 50 µs, `pilot_canceller = true`). The meter window puts the noise floor of an empty band at 0 and a strong local station near 115; widen or narrow it for your own site (see below). The optional adaptive features (`hicut`, `adaptive_bandwidth`, `multipath_eq`) default to off so the audio is identical to a passive demod chain until you opt in.
 
 For a dedicated site profile, put overrides in `fm-sdr-tuner.ini`:
 
@@ -809,8 +809,8 @@ rtl_gain_db = -1
 default_custom_gain_flags = 1
 freq_correction_ppm = 0
 # Wide default; watch [METER] log and narrow once you know the local range.
-signal_floor_dbfs = -65.0
-signal_ceil_dbfs = -5.0
+signal_floor_dbfs = -55.0
+signal_ceil_dbfs = -10.0
 signal_bias_db = 0.0
 
 [processing]
@@ -958,6 +958,7 @@ Field meaning:
   - What to do next: a strong stereo station should show a clearly stronger pilot than a weak or mono station
 - `stereo`: decoder lock state
   - What to do next: `stereo=1` means the decoder is actually locked; `stereo=0` means do not expect stable stereo output
+  - A lock on a signal *below* the noise floor is meaningless: the PLL locks onto noise and reports `stereo=1` with a quality of 0 and a blend of 0. Read `quality` and `blend`, not `stereo` on its own
 - `quality`: stereo-path confidence
   - What to do next: compare this across stations; low quality on a strong local means recheck gain, bandwidth, and RF cleanliness
 - `blend`: actual stereo separation currently applied
@@ -1007,18 +1008,19 @@ Weak or noisy station:
 
 Empty or quiet frequency:
 - `dbfs` may still be high under auto-gain (the front end amplifies noise), but
-  `level` reads ~0 because the demod-SNR cap collapses it
+  `level` reads ~0 when the empty band is below `signal_floor_dbfs`
 - no meaningful stereo lock
-- if `level` itself still looks strong on a truly empty channel, the SNR cap
-  isn't engaging — check that stereo/SNR telemetry is valid (see REST `snr`)
+- if `level` itself still looks strong on a truly empty channel, the floor is
+  too low for your site — raise `signal_floor_dbfs` (the `[METER]` suggester
+  does this for you)
 
 #### What Bad Looks Like
 
 - high `clip`:
   - too much gain; reduce gain first
 - high `level` on empty frequencies:
-  - the SNR cap should prevent this by design (empty ≈ 0); if it persists the
-    demod-SNR telemetry is suspect, not floor/gain calibration
+  - the floor is below your site's noise floor; raise `signal_floor_dbfs`
+    (the `[METER]` suggester does this for you)
 - `stereo=1` but low `blend` on a strong station:
   - gain may still be wrong, or the stereo-quality/blend policy is too conservative
 - repeated `[DSP] reset reason=retune` while tuning:
@@ -1100,10 +1102,10 @@ These keys are display calibration only:
 
 They do not fix RF overload, wrong tuning, or ghosting.
 
-The default 60 dB window (`-65` floor, `-5` ceil) is intentionally wide so it works on most sites without saturating either end. The `[METER]` log line shipped in every run does the legwork for you (it calibrates the **absolute term** of the meter; the SNR cap is separate and needs no calibration):
+The default 45 dB window (`-55` floor, `-10` ceil) puts the noise floor of an empty band at 0 and a strong local station near 115. The `[METER]` log line shipped in every run does the legwork for you (it tracks the running min/max of your site and suggests the window that spans it):
 
 ```text
-[METER] mapping window: floor=-65.0 dBFS, ceil=-5.0 dBFS (range 60.0 dB), bias=0.0 dB
+[METER] mapping window: floor=-55.0 dBFS, ceil=-10.0 dBFS (range 45.0 dB), bias=0.0 dB
 [METER] session observed: min=-53.5 dBFS, max=-26.9 dBFS — for full-scale meter consider floor≈-57, ceil≈-24
 ```
 
@@ -1116,20 +1118,20 @@ Two procedures, both work end-to-end:
 ```
 
 The output includes:
-- a per-frequency table (dBFS + meter level at every 100 kHz step). Note the
-  "meter level" column uses the FFT channel-SNR path, so it won't in general
-  equal the live client meter, which caps by the demod-domain SNR
+- a per-frequency table (dBFS + meter level at every 100 kHz step). The level
+  column is the same absolute mapping the live meter uses, so the two agree
+  for the same signal
 - a sorted list of detected stations (level120 > 30)
-- a recommendation block with `signal_floor_dbfs`, `signal_ceil_dbfs`, and `signal_bias_db` chosen so the absolute term spans the signal envelope at your site (the SNR cap still governs the low end live)
+- a recommendation block with `signal_floor_dbfs`, `signal_ceil_dbfs`, and `signal_bias_db` chosen so the window spans the signal envelope at your site
 
 Paste the recommendation block into the `[sdr]` section of your INI and restart. Takes ~45 seconds, no XDR client or audio backend needed. Re-run any time the antenna or location changes.
 
 **Procedure B — Live auto-suggester (for tweaking while listening).**
 1. Start the tuner with the default wide window.
 2. Tune through your representative stations (strong local, mid, fringe, empty) over ~1 minute.
-3. Read the `[METER] session observed` line. It tracks the running min/max of compensated dBFS and recommends `floor ≈ min − 3 dB`, `ceil ≈ max + 3 dB` so the absolute term spans your real signal range (it is blind to the SNR cap).
+3. Read the `[METER] session observed` line. It tracks the running min/max of compensated dBFS and recommends `floor ≈ min − 3 dB`, `ceil ≈ max + 3 dB` so the window spans your real signal range.
 4. Apply those values to `[sdr]` in your INI.
-5. Restart and confirm: strong locals now settle near the top. Fringe-station readings are set by the SNR cap, not this window, so they won't rise past their SNR-derived level however you set floor/ceil.
+5. Restart and confirm: strong locals now settle near the top and an empty frequency at zero.
 
 Manual fallback (if you prefer the by-hand approach):
 1. Tune an empty or very weak frequency and note typical `dbfs`/`compensated`.
@@ -1137,7 +1139,7 @@ Manual fallback (if you prefer the by-hand approach):
 3. Set `signal_floor_dbfs` ≈ empty-frequency compensated − 3 dB; `signal_ceil_dbfs` ≈ strong-station compensated + 3 dB.
 
 Symptoms of bad meter calibration:
-- empty channels always look too strong: the SNR cap should force these to ~0, so if they read high the demod-SNR telemetry is suspect (not floor/gain)
+- empty channels always look too strong: the floor is below your site's noise floor, so raise `signal_floor_dbfs` (the `[METER]` suggester catches this automatically)
 - every strong station saturates at 120: ceil is too low
 - everything looks compressed into the middle: floor/ceil window is too wide
 - weak stations clamp to 0: floor is too high (raise the window's bottom; the `[METER]` suggester catches this automatically)
@@ -1333,9 +1335,14 @@ A station is drawn on the wrong frequency:
 - if one strong station has a weaker copy next to it, that is an overload image — reduce the gain first
 
 The scan levels and the signal meter disagree:
-- they are measured on the same scale but through different paths (FFT integration versus the meter's demodulator SNR), so a few units of difference on a marginal station is normal
+- the scan and the meter measure the same spectrum through the same estimator and the same 30 kHz window, so they report the same number for the same signal
 - if the scan is uniformly much lower, check that the channel bandwidth matches what the meter is using (`Sw` / `w0_bandwidth_hz`)
 - the scan line is remapped onto the client's fixed 3..84 plot window; the `S` line and the REST status keep the 0..120 scale, so the two are not directly comparable as numbers
+
+A phantom station appears in the plot:
+- the plot is a spectrum: a signal that is not a station is a bump in the noise floor, not a spike
+- a spike that is much higher than the floor is a real signal — check the gain, an overloaded front end answers with an image next to the station
+- a bump that only shows up on one sweep is a noise maximum; a second sweep tells the two apart
 
 Stereo image is too narrow on clearly strong locals:
 - gain may still be wrong

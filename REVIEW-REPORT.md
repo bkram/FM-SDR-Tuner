@@ -575,6 +575,26 @@ now reproduces the reference behaviour exactly (no acks, a command-reader
 thread and an IQ-writer thread, a paced stream, and an NCO that restarts on a
 retune).
 
+### C7 — the sparse plot turned a noise maximum into a "ghost station" **[fixed]**
+
+The scan reported a level only for the cells that held a **detected** station
+and `0.0` for every other cell. The reference client draws the scan as a
+filled area *through* the reported values, so a cell that reads `0.0` is
+drawn as a needle down to the bottom of the plot and the next cell is drawn
+back up: every station stood alone on the bottom of the plot, and a noise
+maximum that passed the prominence test was drawn exactly like a station —
+the "ghost station on a frequency nobody broadcasts on". SDR++ does not show
+them because it draws a continuous spectrum, where the same feature is a
+small bump in the visible noise floor.
+
+**Fix:** every grid point now reports the level of the band at that
+frequency, measured with the same estimator and the same 30 kHz window the
+signal meter uses. The plot is a spectrum: the noise floor is a curve at the
+bottom, a signal that is not a station stays a bump in that curve, and a
+grid point that holds a station reports the **station's peak** instead, so
+the station is still drawn exactly on its own grid point and with its real
+strength.
+
 ### Live verification
 
 Without an SDR attached, the whole path was exercised against
@@ -596,14 +616,42 @@ The client's own scale was confirmed on the wire as well: the `U` line's
 frequency labels carry the station's **own** frequency, and the levels sit on
 the plot window the client draws.
 
+### Verification against real RTL-SDR captures
+
+The synthetic band above proves the protocol, not the physics. The same scan
+engine was therefore replayed over **real captured RTL-SDR IQ** — 31
+captures, 95–98 MHz, 256 kHz — with a fake tuner that serves the capture
+whose centre is nearest to the requested one and mixes it by the difference.
+The capture is **band-limited before** the mix, with the cutoff the tuner's
+own decimation filter uses: a plain digital mix is an undersampling shift,
+and it folds the content that the shift pushed out of the band back in —
+which invents a station that was never there (it produced a 30 dB cliff in
+the assembled curve and a station at 96.43 MHz that does not exist).
+
+| Check | Result |
+|---|---|
+| The local station on 96.188 MHz (12 kHz off the 96.2 grid point) | reported on the **96200 kHz** grid point, level 120.0 |
+| Its neighbours (96100 / 96300) | 83.9 and 34.4 — the spectrum around it, no second station |
+| The whole 95–98 MHz grid | 31 of 31 cells carry a level: a spectrum, not a row of spikes |
+| The cells of an empty part of the band | 22–42 out of 120 — the noise floor as a curve |
+| The two marginal detections of the sparse plot (96.954 / 97.866 MHz) | 53.2 and 47.6 — bumps in that floor instead of two stations |
+| The meter's reading of the same station | the 30 kHz window loses 0.3 dB between the carrier (96.188) and the grid point (96.200), so the plot's value and the meter's value agree |
+| The strongest local stations | −13.7 dBFS, the local noise floor −48…−55 dBFS → the site profile's calibration window is −55 / −12 |
+
+The last row is what the site profile (`fm-sdr-tuner.ini.site.example`) is
+calibrated to; the shipped default window (−60 / −20) is deliberately wider
+so it is safe everywhere.
+
 ### Regression tests added
 
 | Test | Target |
 |---|---|
 | `ScanEngine reports a station on the grid point of its own frequency` | `scan_diag` |
+| `ScanEngine reports a station that sits between two grid points on the nearest one` | `scan_diag` |
 | `ScanEngine keeps the noise floor low and flat across the band` | `scan_diag` |
 | `ScanEngine reports a station on the same scale as the signal meter` | `scan_diag` |
-| `ScanEngine reports levels inside the client's plot window` | `scan_diag` |
+| `ScanEngine reports levels on the meter's own scale` | `scan_diag` |
+| `ScanEngine can remap the levels onto the client's plot window` | `scan_diag` |
 | `ScanEngine aligns the reporting grid with the station raster` | `scan_diag` |
 | `RTLTCPClient flushBuffers drops the stale IQ of the previous centre` | `protocol` |
 | `Config parses the scan plot window` | `config` |

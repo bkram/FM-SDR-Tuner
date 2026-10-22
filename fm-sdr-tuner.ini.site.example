@@ -30,21 +30,36 @@ default_custom_gain_flags = 1
 freq_correction_ppm = 0
 
 # Meter calibration window: maps compensated dBFS to the 0..120 level.
-# The defaults below are the wide, safe window. Run --calibrate and paste
-# its recommendation here for a site-specific scale.
-signal_floor_dbfs = -65.0
-signal_ceil_dbfs = -5.0
+#
+# These are the values measured on this site with a real RTL-SDR and the
+# indoor antenna: the local noise floor sits between -48 and -55 dBFS and
+# the local stations between -33 and -12 dBFS, so the window below spans
+# exactly the range this site has. Everything weaker than the floor reads
+# as "no signal" and the strongest local station reaches the top of the
+# meter.
+#
+# Re-measure after a change of antenna or cable: run
+# `./build/fm-sdr-tuner --calibrate` and paste its recommendation here.
+signal_floor_dbfs = -55.0
+signal_ceil_dbfs = -12.0
 signal_bias_db = 0.0
 
-# Spectral-scan plot scale. The xdr-gtk client draws the scan in a FIXED
-# 3..84 window and clips everything outside it, so the scan line is
-# remapped onto that window. Without this, every station above -23 dBFS
-# is pinned flat against the top of the plot.
+# Spectral-scan plot scale. The scan line is the spectrum of the band: every
+# grid point reports the level of the signal meter at that frequency, so the
+# plot reads like a spectrum display and a signal that is not a station stays
+# a bump in the noise floor.
+#
+# The xdr-gtk client draws the scan in a FIXED 3..84 window and clips
+# everything outside it, so the scan line is remapped onto that window.
+# Without this, every station above -23 dBFS is pinned flat against the top
+# of the plot. The xdr-gtk client's own "Relative scale" button does the
+# same thing on its side, and works on the raw 0..120 scale as well.
 #
 # The "S" line and the REST status keep the 0..120 scale on purpose: the
 # webserver's dBm mode subtracts 120 and the plugin shows the value out
-# of 120, and the client writes the meter's value straight into the scan
-# plot, so the two scales have to stay comparable.
+# of 120. The client writes the meter's value (0..120) straight into the
+# scan plot, so a station that is tuned *exactly* on a grid point is drawn
+# with the meter's number instead of the remapped one.
 scan_use_client_window = true
 scan_client_min_level = 3.0
 scan_client_max_level = 84.0
