@@ -79,9 +79,9 @@ TEST_CASE("ScanEngine emits xdr-gtk-compatible U lines with trailing comma",
   // during the sweep; the last line carries the complete grid.
   REQUIRE(!xdr.m_scanQueue.empty());
   const std::string &line = xdr.m_scanQueue.back().second;
-  // Both channels were measured (an empty spectrum is the floor), so they
-  // carry the bottom of the client's plot window.
-  REQUIRE(line == "U87500=3.0,87600=3.0,");
+  // Both channels were measured and neither of them holds a station, so
+  // they carry the "no signal" value.
+  REQUIRE(line == "U87500=0.0,87600=0.0,");
 }
 
 TEST_CASE("ScanEngine suppresses empty-channel FFT peaks with local floor gating",
@@ -205,10 +205,10 @@ TEST_CASE("ScanEngine batches fallback retunes for contiguous uncovered channels
 
   std::lock_guard<std::mutex> lock(xdr.m_scanMutex);
   REQUIRE(!xdr.m_scanQueue.empty());
-  // Every channel was measured, so every one carries the bottom of the
-  // client's plot window rather than the "not measured" marker.
+  // Every channel was measured and none of them holds a station, so every
+  // one carries the "no signal" value.
   REQUIRE(xdr.m_scanQueue.back().second ==
-          "U87500=3.0,87600=3.0,87700=3.0,87800=3.0,87900=3.0,88000=3.0,");
+          "U87500=0.0,87600=0.0,87700=0.0,87800=0.0,87900=0.0,88000=0.0,");
 }
 
 TEST_CASE("ScanEngine flushes the source buffer after every retune",

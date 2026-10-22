@@ -33,6 +33,7 @@ bool readIqWithRetries(RTLSDRDevice &dev, std::vector<uint8_t> &iq,
 bool measureFrequency(RTLSDRDevice &dev, uint32_t freqKHz, uint32_t sampleRateHz,
                       int appliedGainDb, int channelBandwidthHz,
                       SignalLevelResult &out) {
+  (void)channelBandwidthHz;
   if (!dev.setFrequency(freqKHz * 1000U)) {
     return false;
   }
@@ -62,8 +63,7 @@ bool measureFrequency(RTLSDRDevice &dev, uint32_t freqKHz, uint32_t sampleRateHz
     iq.resize(samples * 2);
 
     const SignalLevelResult signal = computeSignalLevel(
-        iq.data(), samples, appliedGainDb, 0.5, 0.0, -80.0, -12.0, sampleRateHz,
-        channelBandwidthHz);
+        iq.data(), samples, appliedGainDb, 0.5, 0.0, -80.0, -12.0, sampleRateHz);
     if (!std::isfinite(signal.dbfs)) {
       iq.assign(4096 * 2, 0);
       continue;

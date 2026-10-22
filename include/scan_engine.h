@@ -41,52 +41,10 @@ public:
   bool isActive() const { return m_active; }
 
 private:
-  struct FftState {
-    ~FftState() {
-      if (plan != nullptr) {
-        fft_destroy_plan(plan);
-      }
-    }
-
-    bool ensureSize(size_t requestedNfft) {
-      if (nfft == requestedNfft && plan != nullptr) {
-        return true;
-      }
-      if (plan != nullptr) {
-        fft_destroy_plan(plan);
-        plan = nullptr;
-      }
-      nfft = requestedNfft;
-      fftIn.assign(nfft, {});
-      fftOut.assign(nfft, {});
-      window.resize(nfft);
-      if (nfft > 1) {
-        for (size_t i = 0; i < nfft; i++) {
-          window[i] = 0.5f - 0.5f * std::cos(
-                                   static_cast<float>(2.0 * 3.14159265358979323846) *
-                                   static_cast<float>(i) /
-                                   static_cast<float>(nfft - 1));
-        }
-      } else if (nfft == 1) {
-        window[0] = 1.0f;
-      }
-      plan = fft_create_plan(static_cast<unsigned int>(nfft), fftIn.data(),
-                             fftOut.data(), LIQUID_FFT_FORWARD, 0);
-      return plan != nullptr;
-    }
-
-    size_t nfft = 0;
-    std::vector<std::complex<float>> fftIn;
-    std::vector<std::complex<float>> fftOut;
-    std::vector<float> window;
-    fftplan plan = nullptr;
-  };
-
   bool m_active;
   XDRServer::ScanConfig m_config;
   uint32_t m_restoreFreqHz;
   int m_restoreBandwidthHz;
-  FftState m_fftState;
 };
 
 #endif

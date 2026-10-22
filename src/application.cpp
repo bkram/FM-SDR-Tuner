@@ -1080,7 +1080,7 @@ int Application::run() {
     }
 
     (void)processing_runner::processAudioBlock(
-        iqBuffer, samples, OUTPUT_RATE, iqSampleRate, appliedBandwidthHz.load(),
+        iqBuffer, samples, OUTPUT_RATE, iqSampleRate,
         effectiveAppliedGainDb(),
         kSignalGainCompFactor, config, verboseLogging, rfLevelSmoother,
         [&](const SignalLevelResult &signal, double clipRatio,

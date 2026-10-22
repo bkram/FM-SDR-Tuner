@@ -71,9 +71,10 @@ TEST_CASE("Config parses the scan plot window", "[config]") {
     Config config;
     config.loadDefaults();
 
-    // The reference client draws the scan in a fixed 3..84 window, so the
-    // remap onto that window is on by default.
-    REQUIRE(config.sdr.scan_use_client_window == true);
+    // The scan reports the meter's own 0..120 scale by default, so the
+    // meter and the spectrum plot can be read against each other. The remap
+    // onto the reference client's fixed 3..84 window is opt-in.
+    REQUIRE(config.sdr.scan_use_client_window == false);
     REQUIRE(config.sdr.scan_client_min_level == 3.0);
     REQUIRE(config.sdr.scan_client_max_level == 84.0);
 

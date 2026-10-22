@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -14,17 +15,15 @@ constexpr double kWindowFloor = 1e-12;
 constexpr double kPowerFloor = 1e-20;
 constexpr double kSignalLevelSnrGateDb = 3.0;
 constexpr double kSignalLevelSnrCeilDb = 30.0;
-
-// Map a signed FFT bin offset onto the [0, nfft) range. The scan engine uses
-// the same wrapping for its own estimator; keeping the two consistent means
-// an index can never run off the end of the transform output.
-size_t wrapBin(int bin, size_t nfft) {
-  int wrapped = bin % static_cast<int>(nfft);
-  if (wrapped < 0) {
-    wrapped += static_cast<int>(nfft);
-  }
-  return static_cast<size_t>(wrapped);
-}
+// The noise reference is taken from a wide annulus around the measured
+// channel. A station's own skirt reaches out to +-100 kHz, so an annulus
+// right next to the channel would measure the station instead of the noise;
+// the wide annulus only holds the noise where the station is weak.
+constexpr int kNoiseAnnulusInnerHz = 60000;
+constexpr int kNoiseAnnulusOuterHz = 90000;
+// Distance between the edge of the channel and the annulus used when the
+// analysed spectrum is too narrow to hold the wide one.
+constexpr int kNoiseBandGuardHz = 6000;
 
 size_t nearestPow2(size_t n) {
   size_t p = 1;
@@ -34,106 +33,58 @@ size_t nearestPow2(size_t n) {
   return p;
 }
 
-struct ChannelPowerEstimate {
-  bool valid = false;
-  double channelDbfs = -120.0;
-  double noiseFloorDbfs = -120.0;
-};
+} // namespace
 
-struct SignalMeterFftCache {
-  ~SignalMeterFftCache() {
-    if (plan != nullptr) {
-      fft_destroy_plan(plan);
-    }
+// The Hann window is applied to the input, so the mean power of the spectrum
+// is sum(|X|^2)/(N * sum(w^2)), not sum(|X|^2)/N^2: sum(w^2) is 0.375*N for a
+// Hann window. Without the window factor the estimate reads about 4.26 dB too
+// low (measured against the time-domain mean power of the same filtered IQ).
+constexpr double kHannWindowPowerFactor = 0.375;
+
+IqSpectrum::IqSpectrum() = default;
+
+IqSpectrum::~IqSpectrum() {
+  if (m_plan != nullptr) {
+    fft_destroy_plan(m_plan);
+    m_plan = nullptr;
+  }
+}
+
+bool IqSpectrum::analyse(const uint8_t *iq, size_t samples,
+                          uint32_t sampleRateHz) {
+  m_valid = false;
+  if (!iq || samples == 0 || sampleRateHz == 0) {
+    return false;
   }
 
-  bool ensureSize(size_t requestedNfft) {
-    if (nfft == requestedNfft && plan != nullptr) {
-      return true;
-    }
-    if (plan != nullptr) {
-      fft_destroy_plan(plan);
-      plan = nullptr;
-    }
-    nfft = requestedNfft;
-    fftIn.assign(nfft, {});
-    fftOut.assign(nfft, {});
-    plan = fft_create_plan(static_cast<unsigned int>(nfft), fftIn.data(),
-                           fftOut.data(), LIQUID_FFT_FORWARD, 0);
-    return plan != nullptr;
-  }
-
-  size_t nfft = 0;
-  std::vector<std::complex<float>> fftIn{};
-  std::vector<std::complex<float>> fftOut{};
-  fftplan plan = nullptr;
-};
-
-ChannelPowerEstimate estimateCenteredChannelPower(const uint8_t *iq,
-                                                  size_t samples,
-                                                  uint32_t sampleRateHz,
-                                                  int channelBandwidthHz) {
-  ChannelPowerEstimate out{};
-  if (!iq || samples == 0 || sampleRateHz == 0 || channelBandwidthHz <= 0) {
-    return out;
-  }
-
-  const size_t nfft = nearestPow2(std::min<size_t>(samples, 8192));
+  const size_t nfft = nearestPow2(std::min<size_t>(samples, 32768));
   if (nfft < 1024) {
-    return out;
+    return false;
+  }
+  if (m_nfft != nfft || m_plan == nullptr) {
+    if (m_plan != nullptr) {
+      fft_destroy_plan(m_plan);
+      m_plan = nullptr;
+    }
+    m_nfft = nfft;
+    m_fftIn.assign(nfft, {});
+    m_fftOut.assign(nfft, {});
+    m_window.assign(nfft, 0.0f);
+    for (size_t i = 0; i < nfft; i++) {
+      m_window[i] = 0.5f - 0.5f * std::cos((2.0f * kPi *
+                                            static_cast<float>(i)) /
+                                           static_cast<float>(nfft - 1));
+    }
+    m_plan = fft_create_plan(static_cast<unsigned int>(nfft), m_fftIn.data(),
+                              m_fftOut.data(), LIQUID_FFT_FORWARD, 0);
+    if (m_plan == nullptr) {
+      m_nfft = 0;
+      return false;
+    }
   }
 
-  const float binHz =
-      static_cast<float>(sampleRateHz) / static_cast<float>(nfft);
-  if (binHz <= 0.0f) {
-    return out;
-  }
-
-  const int bandHalf = std::max(
-      1, static_cast<int>(std::lround((static_cast<float>(channelBandwidthHz) * 0.5f) / binHz)));
-  const int dcRejectBins =
-      std::max(1, static_cast<int>(std::lround(4000.0f / binHz)));
-  const int guardBins =
-      std::max(1, static_cast<int>(std::lround(4000.0f / binHz)));
-  if (bandHalf <= dcRejectBins) {
-    return out;
-  }
-  const int maxBin = static_cast<int>(nfft) - 1;
-  if (bandHalf > maxBin) {
-    return out;
-  }
-  // The side band measures the noise *away* from the channel. Its window
-  // spans magnitudes [bandHalf + guard, bandHalf + guard + sideSpan]. The
-  // negative-frequency half of that window must stay below the transform's
-  // Nyquist point (nfft/2): once it passes that, it aliases onto the
-  // positive half of the spectrum where the station sits, the "noise"
-  // estimate picks up the signal itself, the noise floor collapses onto the
-  // signal power, the SNR pins to 0 and a strong station reads as no signal
-  // at all.
-  //
-  // The window does not have to be as wide as the channel — it only needs
-  // enough bins for a stable noise estimate — so it is *capped* to whatever
-  // fits below Nyquist rather than being dropped entirely. The mean is over
-  // the same number of bins on both sides, so the noise power is still
-  // estimated per bin and scaled to the channel width.
-  const int nyquistBin = static_cast<int>(nfft) / 2;
-  const int sideSpanBins = std::max(
-      bandHalf, static_cast<int>(std::lround((static_cast<float>(channelBandwidthHz) * 0.5f) / binHz)));
-  const int maxSideSpan = nyquistBin - bandHalf - guardBins;
-  if (maxSideSpan <= 0) {
-    // The channel itself already reaches Nyquist: no side band exists.
-    return out;
-  }
-  const int effectiveSideSpan = std::min(sideSpanBins, maxSideSpan);
-  const int sideOuter = bandHalf + guardBins + effectiveSideSpan;
-  if (sideOuter > maxBin) {
-    return out;
-  }
-
-  thread_local SignalMeterFftCache cache;
-  if (!cache.ensureSize(nfft)) {
-    return out;
-  }
+  m_sampleRateHz = sampleRateHz;
+  m_binHz = static_cast<double>(sampleRateHz) / static_cast<double>(nfft);
 
   double meanI = 0.0;
   double meanQ = 0.0;
@@ -149,65 +100,112 @@ ChannelPowerEstimate estimateCenteredChannelPower(const uint8_t *iq,
         (static_cast<int>(iq[i * 2]) - 127.5) * (1.0 / 127.5) - meanI);
     const float qRaw = static_cast<float>(
         (static_cast<int>(iq[i * 2 + 1]) - 127.5) * (1.0 / 127.5) - meanQ);
-    const float w = 0.5f - 0.5f * std::cos((2.0f * kPi * static_cast<float>(i)) /
-                                           static_cast<float>(nfft - 1));
-    cache.fftIn[i] = {iRaw * w, qRaw * w};
+    m_fftIn[i] = {iRaw * m_window[i], qRaw * m_window[i]};
   }
 
-  fft_execute(cache.plan);
+  fft_execute(m_plan);
 
-  double channelSum = 0.0;
-  int channelBins = 0;
-  for (int b = -bandHalf; b <= bandHalf; b++) {
-    if (std::abs(b) <= dcRejectBins) {
-      continue;
-    }
-    const size_t idx = wrapBin(b, nfft);
-    const float re = cache.fftOut[idx].real();
-    const float im = cache.fftOut[idx].imag();
-    channelSum += static_cast<double>(re) * static_cast<double>(re) +
-                  static_cast<double>(im) * static_cast<double>(im);
-    channelBins++;
+  // The transform output runs from DC up to Nyquist and then wraps to the
+  // negative frequencies. Copy it into an ascending-frequency array so the
+  // band and annulus queries are plain ranges.
+  const size_t half = nfft / 2;
+  m_power.assign(nfft, 0.0);
+  const double norm = 1.0 / (kHannWindowPowerFactor *
+                              static_cast<double>(nfft) *
+                              static_cast<double>(nfft));
+  for (size_t j = 0; j < nfft; j++) {
+    const int64_t offset = (j < half) ? static_cast<int64_t>(j)
+                                       : (static_cast<int64_t>(j) -
+                                          static_cast<int64_t>(nfft));
+    const size_t idx = static_cast<size_t>(offset + static_cast<int64_t>(half));
+    const float re = m_fftOut[j].real();
+    const float im = m_fftOut[j].imag();
+    m_power[idx] = (static_cast<double>(re) * static_cast<double>(re) +
+                     static_cast<double>(im) * static_cast<double>(im)) *
+                    norm;
   }
-
-  double sideSum = 0.0;
-  int sideBins = 0;
-  for (int sign : {-1, 1}) {
-    const int start = sign * (bandHalf + guardBins);
-    const int stop = sign * (bandHalf + guardBins + effectiveSideSpan);
-    const int step = (start <= stop) ? 1 : -1;
-    for (int b = start; b != stop + step; b += step) {
-      const size_t idx = wrapBin(b, nfft);
-      const float re = cache.fftOut[idx].real();
-      const float im = cache.fftOut[idx].imag();
-      sideSum += static_cast<double>(re) * static_cast<double>(re) +
-                 static_cast<double>(im) * static_cast<double>(im);
-      sideBins++;
-    }
+  m_prefix.assign(nfft + 1, 0.0);
+  for (size_t i = 0; i < nfft; i++) {
+    m_prefix[i + 1] = m_prefix[i] + m_power[i];
   }
-
-  if (channelBins <= 0) {
-    return out;
-  }
-
-  const double nfftNorm =
-      static_cast<double>(nfft) * static_cast<double>(nfft);
-  const double channelPower =
-      std::max(kPowerFloor, channelSum / nfftNorm);
-  const double sideMeanPowerPerBin =
-      std::max(kPowerFloor, (sideBins > 0)
-                                ? ((sideSum / static_cast<double>(sideBins)) /
-                                   nfftNorm)
-                                : (channelPower / static_cast<double>(channelBins)));
-  const double sidePower =
-      std::max(kPowerFloor,
-               sideMeanPowerPerBin * static_cast<double>(channelBins));
-
-  out.valid = true;
-  out.channelDbfs = 10.0 * std::log10(channelPower + kWindowFloor);
-  out.noiseFloorDbfs = 10.0 * std::log10(sidePower + kWindowFloor);
-  return out;
+  m_valid = true;
+  return true;
 }
+
+double IqSpectrum::halfSpanHz() const {
+  if (!m_valid) {
+    return 0.0;
+  }
+  return static_cast<double>(m_nfft / 2) * m_binHz;
+}
+
+size_t IqSpectrum::binIndex(int64_t offsetHz) const {
+  const int64_t half = static_cast<int64_t>(m_nfft / 2);
+  int64_t idx = static_cast<int64_t>(std::llround(static_cast<double>(offsetHz) /
+                                                  m_binHz)) +
+                half;
+  if (idx < 0) {
+    idx = 0;
+  }
+  if (idx > static_cast<int64_t>(m_nfft) - 1) {
+    idx = static_cast<int64_t>(m_nfft) - 1;
+  }
+  return static_cast<size_t>(idx);
+}
+
+double IqSpectrum::rangeMeanDbfs(int64_t lowHz, int64_t highHz) const {
+  if (!m_valid || highHz < lowHz) {
+    return -200.0;
+  }
+  const int64_t lo = std::max<int64_t>(
+      0, static_cast<int64_t>(binIndex(lowHz)));
+  const int64_t hi = std::min<int64_t>(static_cast<int64_t>(m_nfft) - 1,
+                                       static_cast<int64_t>(binIndex(highHz)));
+  if (hi < lo) {
+    return -200.0;
+  }
+  const double sum = m_prefix[static_cast<size_t>(hi + 1)] - m_prefix[static_cast<size_t>(lo)];
+  const double count = static_cast<double>(hi - lo + 1);
+  return 10.0 * std::log10(std::max(kPowerFloor, sum / count) + kWindowFloor);
+}
+
+double IqSpectrum::channelPower(int64_t refHz, int bandwidthHz) const {
+  if (!m_valid || bandwidthHz <= 0) {
+    return 0.0;
+  }
+  const int64_t half = static_cast<int64_t>(bandwidthHz) / 2;
+  // The band is clipped to the analysed spectrum: a band wider than the
+  // capture reads the whole capture, and a band that would reach past
+  // Nyquist is cut off instead of wrapping onto the other side of the band.
+  const int64_t lo = binIndex(refHz - half);
+  const int64_t hi = binIndex(refHz + half);
+  if (hi < lo) {
+    return 0.0;
+  }
+  const double sum = m_prefix[static_cast<size_t>(hi + 1)] -
+                     m_prefix[static_cast<size_t>(lo)];
+  return std::max(0.0, sum);
+}
+
+double IqSpectrum::channelDbfs(int64_t refHz, int bandwidthHz) const {
+  return 10.0 * std::log10(channelPower(refHz, bandwidthHz) + kWindowFloor);
+}
+
+double IqSpectrum::localNoiseDbfs(int64_t refHz, int annInnerHz,
+                                  int annOuterHz) const {
+  if (!m_valid || annOuterHz <= annInnerHz) {
+    return -120.0;
+  }
+  // The mean power per bin of the two annulus halves, averaged together.
+  const double low = std::pow(
+      10.0, rangeMeanDbfs(refHz - annOuterHz, refHz - annInnerHz) / 10.0);
+  const double high = std::pow(
+      10.0, rangeMeanDbfs(refHz + annInnerHz, refHz + annOuterHz) / 10.0);
+  return 10.0 * std::log10(std::max(kPowerFloor, (low + high) * 0.5) +
+                           kWindowFloor);
+}
+
+namespace {
 
 SignalLevelResult computeWidebandSignalLevel(const uint8_t *iq, size_t samples) {
   SignalLevelResult out{};
@@ -280,31 +278,57 @@ SignalLevelResult computeWidebandSignalLevel(const uint8_t *iq, size_t samples) 
 SignalLevelResult computeSignalLevel(const uint8_t *iq, size_t samples,
                                      int appliedGainDb, double gainCompFactor,
                                      double signalBiasDb, double floorDbfs,
-                                     double ceilDbfs, uint32_t sampleRateHz,
-                                     int channelBandwidthHz) {
+                                     double ceilDbfs, uint32_t sampleRateHz) {
   SignalLevelResult out = computeWidebandSignalLevel(iq, samples);
   if (!iq || samples == 0) {
     return out;
   }
 
-  const ChannelPowerEstimate channel = estimateCenteredChannelPower(
-      iq, samples, sampleRateHz, channelBandwidthHz);
-  if (channel.valid) {
-    out.dbfs = channel.channelDbfs;
-    out.noiseFloorDbfs = channel.noiseFloorDbfs;
+  // The meter and the scan engine read the spectrum through the same
+  // estimator and integrate the same window, so the number the meter shows
+  // for a station is the number the scan reports for it.
+  thread_local IqSpectrum spectrum;
+  if (sampleRateHz > 0 && spectrum.analyse(iq, samples, sampleRateHz)) {
+    const int windowHz = fm_tuner::kSignalChannelWindowHz;
+    out.dbfs = spectrum.channelDbfs(0, windowHz);
+    // The noise reference sits outside the channel. It has to be local: the
+    // tuner's analogue response ripples by tens of dB across the band, so a
+    // fixed or far-away reference would report a wildly wrong floor
+    // depending on where in the band we are. It also has to be wide: a
+    // station's own skirt reaches +-100 kHz, so an annulus right next to the
+    // channel would measure the station instead of the noise. The reading is
+    // therefore only meaningful next to a weak or empty channel - the
+    // reception quality of a strong station comes from the demodulator
+    // instead (see processing_runner).
+    int annInner = kNoiseAnnulusInnerHz;
+    int annOuter = kNoiseAnnulusOuterHz;
+    if (spectrum.halfSpanHz() < static_cast<double>(annOuter)) {
+      annInner = windowHz / 2 + kNoiseBandGuardHz;
+      annOuter = annInner + windowHz / 2;
+    }
+    const double noisePerBin = spectrum.localNoiseDbfs(0, annInner, annOuter);
+    const double binCount =
+        static_cast<double>(windowHz) / std::max(1.0, spectrum.binHz());
+    out.noiseFloorDbfs =
+        noisePerBin + 10.0 * std::log10(std::max(1.0, binCount));
     const double channelPower = std::pow(10.0, out.dbfs / 10.0);
     const double noisePower = std::pow(10.0, out.noiseFloorDbfs / 10.0);
-    const double signalExcessPower = std::max(kPowerFloor, channelPower - noisePower);
-    out.snrDb = std::max(0.0,
-                         10.0 * std::log10((signalExcessPower + kPowerFloor) /
-                                           (noisePower + kPowerFloor)));
+    const double signalExcessPower =
+        std::max(kPowerFloor, channelPower - noisePower);
+    out.snrDb = std::max(
+        0.0, 10.0 * std::log10((signalExcessPower + kPowerFloor) /
+                               (noisePower + kPowerFloor)));
   }
   out.compensatedDbfs = out.dbfs -
                         (static_cast<double>(appliedGainDb) * gainCompFactor) +
                         signalBiasDb;
+  // The displayed level is the absolute strength of the tuned channel: the
+  // scan reports the same absolute strength for the same station, so the two
+  // surfaces can be read against each other. The reception quality of the
+  // channel is a separate figure and comes from the demodulator.
   out.level120 = computeDisplaySignalLevel120(
       out.dbfs, out.noiseFloorDbfs, appliedGainDb, gainCompFactor, signalBiasDb,
-      floorDbfs, ceilDbfs, channel.valid);
+      floorDbfs, ceilDbfs, false);
   return out;
 }
 

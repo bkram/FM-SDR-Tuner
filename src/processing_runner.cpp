@@ -14,7 +14,11 @@ namespace {
 
 bool suspectGhostingFromOverload(const SignalLevelResult &signal,
                                  double clipRatio) {
-  return clipRatio >= 0.01 && signal.level120 >= 70.0f && signal.dbfs >= -35.0;
+  // The overload image only shows up when the front end is driven into
+  // saturation by a strong signal, so the level has to be a genuinely
+  // strong one. The threshold is on the uncompensated band power of the
+  // tuned channel, which is the same figure the scan engine reports.
+  return clipRatio >= 0.01 && signal.level120 >= 70.0f && signal.dbfs >= -20.0;
 }
 
 std::string formatMaybeDouble(double value, int precision) {
@@ -30,7 +34,7 @@ std::string formatMaybeDouble(double value, int precision) {
 
 bool processAudioBlock(
     const uint8_t *iqBuffer, size_t samples, int outputRate,
-    uint32_t iqSampleRate, int channelBandwidthHz,
+    uint32_t iqSampleRate,
     int effectiveAppliedGainDb, double signalGainCompFactor,
     const Config &config, bool verboseLogging,
     SignalLevelSmoother &rfLevelSmoother,
@@ -46,7 +50,7 @@ bool processAudioBlock(
   SignalLevelResult signal = computeSignalLevel(
       iqBuffer, samples, effectiveAppliedGainDb, signalGainCompFactor,
       config.sdr.signal_bias_db, config.sdr.signal_floor_dbfs,
-      config.sdr.signal_ceil_dbfs, iqSampleRate, channelBandwidthHz);
+      config.sdr.signal_ceil_dbfs, iqSampleRate);
   SignalLevelResult displaySignal = signal;
 
   const bool effectiveForceMono = targetForceMono;
@@ -91,30 +95,13 @@ bool processAudioBlock(
     return false;
   }
 
-  if (std::isfinite(dspOut.channelPowerDbfs)) {
-    displaySignal.dbfs = dspOut.channelPowerDbfs;
-    displaySignal.compensatedDbfs =
-        displaySignal.dbfs - (static_cast<double>(effectiveAppliedGainDb) *
-                              signalGainCompFactor) +
-        config.sdr.signal_bias_db;
-    displaySignal.noiseFloorDbfs = std::numeric_limits<double>::quiet_NaN();
-    displaySignal.snrDb = std::numeric_limits<double>::quiet_NaN();
-    displaySignal.level120 = computeDisplaySignalLevel120(
-        displaySignal.dbfs, displaySignal.noiseFloorDbfs, effectiveAppliedGainDb,
-        signalGainCompFactor, config.sdr.signal_bias_db,
-        config.sdr.signal_floor_dbfs, config.sdr.signal_ceil_dbfs, false);
-    // The demodulator channel-power estimate above is smooth and accurate for
-    // the tuned channel but is an absolute-power term with no noise reference:
-    // at high auto-gain the RTL front-end saturates it near full scale for
-    // empty spectrum and strong stations alike, so an absolute-only mapping
-    // pegs the meter on noise (field reports: "signal reads max even on an
-    // empty frequency"). Cap it by the gain-invariant demod-domain (noise-
-    // triangle) SNR -- always available here, unlike the FFT channel SNR -- so
-    // empty channels read low and only genuine received signal climbs the
-    // scale, restoring the min(absolute, SNR) semantics the channel-aware path
-    // already applies.
-    displaySignal.level120 = std::min(
-        displaySignal.level120, snrLevel120FromSnrDb(dspOut.demodSnrDb));
+  // The demodulator's noise-triangle SNR is the reception quality of the
+  // tuned channel: it is gain-invariant, it is always available, and it is
+  // the only figure that says how clean the audio is. The strength of the
+  // channel stays the spectrum-based one, because that is the same number
+  // the scan engine reports for the same station.
+  if (std::isfinite(dspOut.demodSnrDb)) {
+    displaySignal.snrDb = dspOut.demodSnrDb;
   }
 
   const bool stereoDetected = dspOut.stereoDetected;
@@ -207,7 +194,7 @@ bool processAudioBlock(
     overloadGhostHintActive = overloadGhostSuspected;
   }
 
-  autoGainHook(signal, clipRatio, rfLevelFiltered);
+  autoGainHook(displaySignal, clipRatio, rfLevelFiltered);
 
   const size_t outSamples = dspOut.outSamples;
   float *audioLeft = dspOut.left;

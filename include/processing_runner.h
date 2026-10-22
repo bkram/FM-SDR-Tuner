@@ -19,7 +19,7 @@ namespace processing_runner {
 
 bool processAudioBlock(
     const uint8_t *iqBuffer, size_t samples, int outputRate,
-    uint32_t iqSampleRate, int channelBandwidthHz,
+    uint32_t iqSampleRate,
     int effectiveAppliedGainDb, double signalGainCompFactor,
     const Config &config, bool verboseLogging,
     SignalLevelSmoother &rfLevelSmoother,

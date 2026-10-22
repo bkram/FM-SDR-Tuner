@@ -175,69 +175,75 @@ TEST_CASE("computeSignalLevel prefers in-channel power over strong out-of-channe
           "[signal_level]") {
     constexpr size_t kSamples = 4096;
     constexpr uint32_t kSampleRateHz = 256000;
-    constexpr int kChannelBandwidthHz = 56000;
 
+    // The measurement window is 30 kHz wide, so the in-channel tone has to
+    // sit well inside it and the blocker well outside it.
     const std::vector<uint8_t> inChannel =
-        makeIqBuffer(kSamples, kSampleRateHz, {{15000.0f, 0.18f}});
+        makeIqBuffer(kSamples, kSampleRateHz, {{8000.0f, 0.18f}});
     const std::vector<uint8_t> outOfChannel =
-        makeIqBuffer(kSamples, kSampleRateHz, {{90000.0f, 0.70f}});
+        makeIqBuffer(kSamples, kSampleRateHz, {{120000.0f, 0.70f}});
     const std::vector<uint8_t> mixed =
         makeIqBuffer(kSamples, kSampleRateHz,
-                     {{15000.0f, 0.18f}, {90000.0f, 0.70f}});
+                     {{8000.0f, 0.18f}, {120000.0f, 0.70f}});
 
     const SignalLevelResult inChannelLevel =
         computeSignalLevel(inChannel.data(), kSamples, 0, 0.5, 0.0, -80.0, -12.0,
-                           kSampleRateHz, kChannelBandwidthHz);
+                           kSampleRateHz);
     const SignalLevelResult outOfChannelLevel =
         computeSignalLevel(outOfChannel.data(), kSamples, 0, 0.5, 0.0, -80.0,
-                           -12.0, kSampleRateHz, kChannelBandwidthHz);
+                           -12.0, kSampleRateHz);
     const SignalLevelResult mixedLevel =
         computeSignalLevel(mixed.data(), kSamples, 0, 0.5, 0.0, -80.0, -12.0,
-                           kSampleRateHz, kChannelBandwidthHz);
+                           kSampleRateHz);
 
     REQUIRE(inChannelLevel.dbfs > outOfChannelLevel.dbfs + 8.0);
     REQUIRE(std::abs(mixedLevel.dbfs - inChannelLevel.dbfs) < 2.5);
     REQUIRE(mixedLevel.snrDb > 0.0);
 }
 
-TEST_CASE("computeSignalLevel uses channel bandwidth aware meter when sample rate is known",
+TEST_CASE("computeSignalLevel uses the shared measurement window when the sample rate is known",
           "[signal_level]") {
     constexpr size_t kSamples = 4096;
     constexpr uint32_t kSampleRateHz = 256000;
     const std::vector<uint8_t> iq =
-        makeIqBuffer(kSamples, kSampleRateHz, {{12000.0f, 0.14f}, {85000.0f, 0.55f}});
+        makeIqBuffer(kSamples, kSampleRateHz, {{12000.0f, 0.14f}, {120000.0f, 0.55f}});
 
     const SignalLevelResult wideband =
         computeSignalLevel(iq.data(), kSamples, 0, 0.5, 0.0, -80.0, -12.0);
     const SignalLevelResult channelAware =
         computeSignalLevel(iq.data(), kSamples, 0, 0.5, 0.0, -80.0, -12.0,
-                           kSampleRateHz, 56000);
+                           kSampleRateHz);
 
     REQUIRE(channelAware.dbfs < wideband.dbfs - 4.0);
     REQUIRE(channelAware.noiseFloorDbfs <= channelAware.dbfs);
 }
 
-TEST_CASE("computeSignalLevel suppresses noise-only channels in displayed level",
+TEST_CASE("computeSignalLevel reads a noise-only channel low and a station high",
           "[signal_level]") {
     constexpr size_t kSamples = 4096;
     constexpr uint32_t kSampleRateHz = 256000;
-    constexpr int kChannelBandwidthHz = 56000;
+    // The production calibration window: an empty 30 kHz band reads about
+    // -55 dBFS and a strong local station about -18 dBFS, so the noise has
+    // to read at the bottom of the scale and the station at the top.
+    constexpr double kFloorDbfs = -60.0;
+    constexpr double kCeilDbfs = -20.0;
 
     const std::vector<uint8_t> floorOnly =
-        makeNoiseIqBuffer(kSamples, 0.08f);
+        makeNoiseIqBuffer(kSamples, 0.002f);
     const std::vector<uint8_t> strongStation =
-        makeIqBuffer(kSamples, kSampleRateHz, {{12000.0f, 0.18f}});
+        makeIqBuffer(kSamples, kSampleRateHz, {{8000.0f, 0.18f}});
 
     const SignalLevelResult floorOnlyLevel =
-        computeSignalLevel(floorOnly.data(), kSamples, 0, 0.5, 0.0, -80.0,
-                           -12.0, kSampleRateHz, kChannelBandwidthHz);
+        computeSignalLevel(floorOnly.data(), kSamples, 0, 0.5, 0.0, kFloorDbfs,
+                           kCeilDbfs, kSampleRateHz);
     const SignalLevelResult strongStationLevel =
-        computeSignalLevel(strongStation.data(), kSamples, 0, 0.5, 0.0, -80.0,
-                           -12.0, kSampleRateHz, kChannelBandwidthHz);
+        computeSignalLevel(strongStation.data(), kSamples, 0, 0.5, 0.0,
+                           kFloorDbfs, kCeilDbfs, kSampleRateHz);
 
     REQUIRE(floorOnlyLevel.snrDb < 6.0);
-    REQUIRE(floorOnlyLevel.level120 < 12.0f);
-    REQUIRE(strongStationLevel.level120 > floorOnlyLevel.level120 + 20.0f);
+    REQUIRE(floorOnlyLevel.level120 < 25.0f);
+    REQUIRE(strongStationLevel.level120 > 90.0f);
+    REQUIRE(strongStationLevel.level120 > floorOnlyLevel.level120 + 60.0f);
 }
 
 TEST_CASE("computeDisplaySignalLevel120 absolute receiver path is not gated by unrelated floor",
@@ -273,24 +279,23 @@ TEST_CASE("snrLevel120FromSnrDb suppresses noise, climbs with SNR, uncaps on NaN
 TEST_CASE("computeSignalLevel rejects center DC contamination", "[signal_level]") {
     constexpr size_t kSamples = 4096;
     constexpr uint32_t kSampleRateHz = 256000;
-    constexpr int kChannelBandwidthHz = 56000;
 
     const std::vector<uint8_t> dcOnly =
         makeIqBuffer(kSamples, kSampleRateHz, {}, {0.55f, 0.0f});
     const std::vector<uint8_t> toneWithDc =
-        makeIqBuffer(kSamples, kSampleRateHz, {{15000.0f, 0.12f}}, {0.55f, 0.0f});
+        makeIqBuffer(kSamples, kSampleRateHz, {{8000.0f, 0.12f}}, {0.55f, 0.0f});
     const std::vector<uint8_t> toneOnly =
-        makeIqBuffer(kSamples, kSampleRateHz, {{15000.0f, 0.12f}});
+        makeIqBuffer(kSamples, kSampleRateHz, {{8000.0f, 0.12f}});
 
     const SignalLevelResult dcOnlyLevel =
         computeSignalLevel(dcOnly.data(), kSamples, 0, 0.5, 0.0, -80.0, -12.0,
-                           kSampleRateHz, kChannelBandwidthHz);
+                           kSampleRateHz);
     const SignalLevelResult toneWithDcLevel =
         computeSignalLevel(toneWithDc.data(), kSamples, 0, 0.5, 0.0, -80.0,
-                           -12.0, kSampleRateHz, kChannelBandwidthHz);
+                           -12.0, kSampleRateHz);
     const SignalLevelResult toneOnlyLevel =
         computeSignalLevel(toneOnly.data(), kSamples, 0, 0.5, 0.0, -80.0, -12.0,
-                           kSampleRateHz, kChannelBandwidthHz);
+                           kSampleRateHz);
 
     REQUIRE(dcOnlyLevel.dbfs < -45.0);
     REQUIRE(std::abs(toneWithDcLevel.dbfs - toneOnlyLevel.dbfs) < 2.0);
@@ -300,7 +305,6 @@ TEST_CASE("computeSignalLevel remains selective at higher sample rates",
           "[signal_level]") {
     constexpr size_t kSamples = 8192;
     constexpr uint32_t kSampleRateHz = 1024000;
-    constexpr int kChannelBandwidthHz = 56000;
 
     const std::vector<uint8_t> inChannel =
         makeIqBuffer(kSamples, kSampleRateHz, {{12000.0f, 0.18f}});
@@ -312,73 +316,41 @@ TEST_CASE("computeSignalLevel remains selective at higher sample rates",
 
     const SignalLevelResult inChannelLevel =
         computeSignalLevel(inChannel.data(), kSamples, 0, 0.5, 0.0, -80.0, -12.0,
-                           kSampleRateHz, kChannelBandwidthHz);
+                           kSampleRateHz);
     const SignalLevelResult blockerLevel =
         computeSignalLevel(blocker.data(), kSamples, 0, 0.5, 0.0, -80.0, -12.0,
-                           kSampleRateHz, kChannelBandwidthHz);
+                           kSampleRateHz);
     const SignalLevelResult mixedLevel =
         computeSignalLevel(mixed.data(), kSamples, 0, 0.5, 0.0, -80.0, -12.0,
-                           kSampleRateHz, kChannelBandwidthHz);
+                           kSampleRateHz);
 
     REQUIRE(inChannelLevel.dbfs > blockerLevel.dbfs + 8.0);
     REQUIRE(std::abs(mixedLevel.dbfs - inChannelLevel.dbfs) < 2.5);
 }
 
-TEST_CASE("signal level meter survives an over-wide channel bandwidth",
+TEST_CASE("signal level meter stays sane for every block size and sample rate",
           "[signal_level]") {
-  // A channel bandwidth wider than the analysis window used to run the
-  // side-band estimator off the end of the FFT output: the positive branch
-  // read past the end, and the negative branch produced a negative index that
-  // was cast to a huge size_t. Below the overflow threshold the side window
-  // wrapped back over the channel, so the "noise floor" measured the signal
-  // itself and a strong station reported as no signal at all.
-  const uint32_t sampleRateHz = 256000;
-  const size_t samples = 8192;
-  auto iq = makeIqBuffer(samples, sampleRateHz, {{10000.0f, 0.5f}});
-
-  // The widths that overflowed the 8192-point transform.
-  for (int bwHz : {252000, 309000, 400000, 1000000, 2147483647}) {
-    const SignalLevelResult r = computeSignalLevel(
-        iq.data(), samples, 0, 0.5, 0.0, -65.0, -5.0, sampleRateHz, bwHz);
-    // The meter must not report a corrupted estimate. A NaN snrDb is the
-    // documented "no channel-aware estimate available" sentinel, so it is an
-    // acceptable outcome; what must never happen is a *finite* SNR derived
-    // from a noise floor that measured the signal itself (which is what made
-    // a strong station read as zero signal).
-    REQUIRE(std::isfinite(r.dbfs));
-    REQUIRE(std::isfinite(r.noiseFloorDbfs));
-    REQUIRE(std::isfinite(r.level120));
-    REQUIRE(r.level120 >= 0.0f);
-    REQUIRE(r.level120 <= 120.0f);
-    if (std::isfinite(r.snrDb)) {
-      // A finite SNR means an estimate was made: the noise floor must then
-      // be genuinely below the signal, and the SNR must be positive.
-      REQUIRE(r.noiseFloorDbfs < r.dbfs);
-      REQUIRE(r.snrDb > 0.0);
+  // The measurement window is 30 kHz wide, so it can be wider than the
+  // analysed spectrum: the band is then clipped to the spectrum instead of
+  // running off the end of the FFT output (which used to read past the end
+  // of the array and wrap the noise window back over the signal).
+  for (uint32_t sampleRateHz : {256000u, 512000u, 1024000u}) {
+    for (size_t samples : {size_t{1024}, size_t{2048}, size_t{4096},
+                           size_t{8192}, size_t{16384}}) {
+      const std::vector<uint8_t> iq =
+          makeIqBuffer(samples, sampleRateHz, {{10000.0f, 0.5f}});
+      const SignalLevelResult r = computeSignalLevel(
+          iq.data(), samples, 0, 0.5, 0.0, -65.0, -5.0, sampleRateHz);
+      REQUIRE(std::isfinite(r.dbfs));
+      REQUIRE(std::isfinite(r.noiseFloorDbfs));
+      REQUIRE(std::isfinite(r.level120));
+      REQUIRE(r.level120 >= 0.0f);
+      REQUIRE(r.level120 <= 120.0f);
+      // A station inside the window has to read as a station.
+      REQUIRE(r.dbfs > -60.0);
+      REQUIRE(r.level120 > 0.0f);
     }
   }
-
-  // The failure that actually bit: below the hard overflow, the negative
-  // side-band window aliased past Nyquist onto the positive spectrum where
-  // the station sits. The noise floor collapsed onto the signal power, the
-  // SNR pinned to 0 and the meter showed a strong station as no signal.
-  for (int bwHz : {242000, 244000, 246000}) {
-    const SignalLevelResult r = computeSignalLevel(
-        iq.data(), samples, 0, 0.5, 0.0, -65.0, -5.0, sampleRateHz, bwHz);
-    REQUIRE(std::isfinite(r.snrDb));
-    REQUIRE(r.snrDb > 10.0);
-    REQUIRE(r.noiseFloorDbfs < r.dbfs - 10.0);
-    REQUIRE(r.level120 > 50.0f);
-  }
-
-  // At a sane width the meter must still work — the guard must not disable
-  // the estimator for normal bandwidths.
-  const SignalLevelResult good = computeSignalLevel(
-      iq.data(), samples, 0, 0.5, 0.0, -65.0, -5.0, sampleRateHz, 194000);
-  REQUIRE(good.dbfs > -60.0);
-  REQUIRE(good.noiseFloorDbfs < good.dbfs);
-  REQUIRE(good.snrDb > 0.0);
-  REQUIRE(good.level120 > 0.0f);
 }
 
 TEST_CASE("clip ratio counts bytes, not samples", "[signal_level]") {
