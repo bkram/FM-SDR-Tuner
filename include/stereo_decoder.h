@@ -123,6 +123,35 @@ private:
     float process(float x);
   };
 
+  // A narrow band of the multiplex taken at a fraction of the input rate.
+  // The MPX is mixed down by a phase accumulator so the band sits at DC, then
+  // low-passed by a real-tap FIR that is evaluated only every `decim` input
+  // samples. With the band-pass's own Kaiser prototype as the low-pass, the
+  // output is the band-pass output shifted to DC, sampled at fs/decim: the
+  // same filter for 1/decim of the work. (At 256 kHz the pilot and RDS
+  // band-passes ran 245 and 163 taps on every sample and were the largest
+  // share of the decoder's time.)
+  struct BasebandBand {
+    fm_tuner::dsp::liquid::FIRFilter lowpass;
+    float step = 0.0f;  // mixer phase increment, rad/sample
+    float phase = 0.0f; // mixer phase of the next input sample
+    int decim = 1;
+    int count = 0;      // input samples since the last evaluation
+    std::complex<float> prev{0.0f, 0.0f};
+    std::complex<float> cur{0.0f, 0.0f};
+    void init(const std::vector<float> &taps, float centerHz, float sampleRate,
+              int decimation);
+    void reset();
+    // Mixes and pushes one sample. Returns true when a new low-pass output
+    // was computed (once every `decim` samples); it is then in `cur`. The
+    // mixer phase used for this sample is returned in `mixPhase`.
+    bool push(float x, float &mixPhase);
+    // The low-pass output `decim` samples ago, linearly interpolated between
+    // the last two evaluations: a continuous per-sample view of the band,
+    // delayed by exactly `decim` samples.
+    std::complex<float> interpolated() const;
+  };
+
   static constexpr float kPilotSnrReportDb = 3.0f;
   void calibrateNoiseScales();
   void updatePilotSnr();
@@ -187,8 +216,16 @@ private:
   std::vector<std::complex<float>> m_delayLine;
   size_t m_delayPos;
   int m_delaySamples;
-  fm_tuner::dsp::liquid::AnalyticBandpassFilter m_liquidPilotBandFilter;
-  fm_tuner::dsp::liquid::FIRFilter m_liquidRdsBandFilter;
+  // The pilot band: 19 kHz +- 250 Hz, rebuilt per sample from the baseband
+  // band for the PLL. m_pilotRotation folds in the prototype's group delay and
+  // the interpolation delay, so the rebuilt phasor is the analytic band-pass
+  // output m_delaySamples behind the input.
+  BasebandBand m_pilotBand;
+  std::complex<float> m_pilotRotation{1.0f, 0.0f};
+  // The 57 kHz RDS band for the RDS deviation meter. Only its power is used,
+  // so it is read at the decimated rate.
+  BasebandBand m_rdsBand;
+  float m_rdsEnvSmoothDecim = 0.0f; // kPilotEnvSmooth^decim
   fm_tuner::dsp::liquid::IIRFilterReal m_liquidHissBandFilter;
   fm_tuner::dsp::liquid::NCO m_liquidPilotPll;
   NoiseProbe m_pilotNoiseProbeLow;
