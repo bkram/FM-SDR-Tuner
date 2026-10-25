@@ -434,36 +434,53 @@ TEST_CASE("AF post reset reproduces identical output for identical input",
   REQUIRE(meanAbsDiff(outA_R.data(), outB_R.data(), outA) < 1e-6f);
 }
 
-TEST_CASE("Stereo decoder force-stereo recovers channel separation on synthetic MPX",
+TEST_CASE("Stereo decoder separates a left-only tone across the audio band",
           "[dsp][stereo]") {
+  // A standard multiplex: (L+R) at 0.45, a 9% pilot and the L-R DSB-SC
+  // subcarrier at 0.45, phase-locked to the pilot (sin(2wp) for a sin(wp)
+  // pilot). With a tone on the left only, everything the right channel
+  // carries at that frequency is crosstalk. The decoder runs on its own
+  // detection (no force-stereo), so the blend must reach full stereo and the
+  // hi-blend low-pass must stand aside for the separation to hold at the top
+  // of the band. The real-tap pilot filter (PLL pinned at its rail) and the
+  // low-pass left in at full blend held this to 19.8 / 9.1 / 3.5 dB.
   constexpr int kInputRate = 256000;
-  constexpr size_t kSamples = 65536;
-  constexpr float kPilotHz = 19000.0f;
-  constexpr float kTwoPi = 6.2831853071795864769f;
+  constexpr size_t kSamples = static_cast<size_t>(kInputRate) * 3;
+  constexpr size_t kBlock = 8192;
+  constexpr double kTwoPi = 6.283185307179586476925;
 
-  StereoDecoder stereo(kInputRate, 32000);
-  stereo.setForceStereo(true);
+  for (const double toneHz : {1000.0, 6000.0, 10000.0}) {
+    StereoDecoder stereo(kInputRate, 48000);
+    std::vector<float> mpx(kSamples, 0.0f);
+    for (size_t i = 0; i < kSamples; i++) {
+      const double t = static_cast<double>(i) / kInputRate;
+      const double l = std::sin(kTwoPi * toneHz * t);
+      const double pilotPhase = kTwoPi * 19000.0 * t;
+      mpx[i] = static_cast<float>((0.45 * l) + (0.09 * std::sin(pilotPhase)) +
+                                  (0.45 * l * std::sin(2.0 * pilotPhase)));
+    }
+    std::vector<float> left(kSamples, 0.0f);
+    std::vector<float> right(kSamples, 0.0f);
+    for (size_t off = 0; off < kSamples; off += kBlock) {
+      const size_t n = std::min(kBlock, kSamples - off);
+      REQUIRE(stereo.processAudio(mpx.data() + off, left.data() + off,
+                                  right.data() + off, n) == n);
+    }
+    REQUIRE(stereo.isStereo());
+    REQUIRE(stereo.getStereoBlend() > 0.99f);
 
-  std::vector<float> mpx(kSamples, 0.0f);
-  for (size_t i = 0; i < kSamples; i++) {
-    const float t = static_cast<float>(i) / static_cast<float>(kInputRate);
-    const float l = 0.45f * std::sin(kTwoPi * 1000.0f * t);
-    const float r = 0.45f * std::sin(kTwoPi * 2800.0f * t);
-    const float lr = l - r;
-    const float mono = l + r;
-    const float pilot = 0.08f * std::sin(kTwoPi * kPilotHz * t);
-    const float dsb = 0.25f * lr * std::sin(kTwoPi * (2.0f * kPilotHz) * t);
-    mpx[i] = mono + pilot + dsb;
+    const size_t settle = kSamples / 2;
+    const float leftMag =
+        toneMagnitude(left.data() + settle, kSamples - settle, kInputRate,
+                      static_cast<float>(toneHz));
+    const float rightMag =
+        toneMagnitude(right.data() + settle, kSamples - settle, kInputRate,
+                      static_cast<float>(toneHz));
+    const float separationDb =
+        20.0f * std::log10(leftMag / std::max(rightMag, 1e-9f));
+    INFO("tone " << toneHz << " Hz: separation " << separationDb << " dB");
+    REQUIRE(separationDb > 30.0f);
   }
-
-  std::vector<float> left(kSamples, 0.0f);
-  std::vector<float> right(kSamples, 0.0f);
-  const size_t out = stereo.processAudio(mpx.data(), left.data(), right.data(), kSamples);
-  REQUIRE(out == kSamples);
-
-  const size_t settle = kSamples / 4;
-  const float sep = meanAbsDiff(left.data() + settle, right.data() + settle, out - settle);
-  REQUIRE(sep > 0.03f);
 }
 
 TEST_CASE("Stereo decoder demod SNR is higher for a clean MPX than a noisy one",
@@ -2029,4 +2046,85 @@ TEST_CASE("the audio path follows the analog de-emphasis curve to 15 kHz",
 
   // With the de-emphasis off the path is flat to 15 kHz.
   REQUIRE(std::abs(levelDb(15000.0, 0)) < 0.3);
+}
+
+TEST_CASE("Stereo decoder reaches full blend and a quiet PLL on a clean pilot",
+          "[dsp][stereo]") {
+  // The pilot band-pass feeds an atan2 phase detector. A real-tap filter
+  // gives it a real sinusoid whose magnitude passes through zero twice a
+  // cycle, the phase error jumps by pi, the PLL sits pinned at its frequency
+  // clamp (250 Hz off) and the quality term caps the blend at 0.948 on a
+  // perfect signal. The analytic filter hands it a clean phasor.
+  constexpr int kInputRate = 256000;
+  constexpr size_t kBlock = 8192;
+  constexpr double kTwoPi = 6.283185307179586476925;
+  StereoDecoder stereo(kInputRate, 48000);
+  std::vector<float> mpx(kBlock), left(kBlock), right(kBlock);
+  size_t n = 0;
+  for (int block = 0; block < 60; block++) {
+    for (size_t i = 0; i < kBlock; i++, n++) {
+      const double t = static_cast<double>(n) / kInputRate;
+      const double l = 0.5 * std::sin(kTwoPi * 1000.0 * t);
+      const double r = 0.3 * std::sin(kTwoPi * 1700.0 * t);
+      const double pilotPhase = kTwoPi * 19000.0 * t;
+      mpx[i] = static_cast<float>((0.45 * (l + r)) +
+                                  (0.09 * std::sin(pilotPhase)) +
+                                  (0.45 * (l - r) * std::sin(2.0 * pilotPhase)));
+    }
+    stereo.processAudio(mpx.data(), left.data(), right.data(), kBlock);
+  }
+  INFO("blend " << stereo.getStereoBlend() << " quality "
+                << stereo.getStereoQuality() << " PLL error "
+                << stereo.getPllErrorHz() << " Hz");
+  REQUIRE(stereo.isStereo());
+  REQUIRE(stereo.getStereoBlend() > 0.99f);
+  REQUIRE(stereo.getStereoQuality() > 0.99f);
+  REQUIRE(stereo.getPllErrorHz() < 5.0f);
+  // 9% injection is 6.75 kHz of deviation.
+  REQUIRE(std::abs(stereo.getPilotDeviationKHz() - 6.75f) < 0.2f);
+}
+
+TEST_CASE("Stereo decoder does not report stereo, pilot or RDS on a dead channel",
+          "[dsp][stereo]") {
+  // No carrier at all: the IQ is receiver noise only, demodulated by the real
+  // FM path. The acquire-bandwidth PLL happily tracks the noise inside the
+  // pilot band, so the old coherence test passed it; the decoder declared
+  // stereo, read ~10 kHz of "pilot" and ~30 kHz of "RDS". The pilot-to-noise
+  // ratio against the guard band beside the pilot separates a pilot from that
+  // noise, and the readings are corrected for the noise in their bands.
+  constexpr int kInputRate = 256000;
+  constexpr size_t kBlock = 8192;
+  FMDemod demod(kInputRate, 48000);
+  StereoDecoder stereo(kInputRate, 48000);
+  std::vector<uint8_t> iq(kBlock * 2);
+  std::vector<float> mpx(kBlock), left(kBlock), right(kBlock);
+  uint32_t state = 0x2468ace1u;
+  auto gaussianByte = [&]() -> uint8_t {
+    // Sum of four uniforms: close enough to Gaussian receiver noise.
+    float acc = 0.0f;
+    for (int k = 0; k < 4; k++) {
+      state = state * 1664525u + 1013904223u;
+      acc += static_cast<float>((state >> 8) & 0x00ffffffu) / 16777216.0f;
+    }
+    const float v = 127.5f + 40.0f * (acc - 2.0f);
+    return static_cast<uint8_t>(std::clamp(std::lround(v), 0L, 255L));
+  };
+  int stereoBlocks = 0;
+  for (int block = 0; block < 60; block++) {
+    for (auto &b : iq) {
+      b = gaussianByte();
+    }
+    demod.processSplit(iq.data(), mpx.data(), nullptr, kBlock);
+    stereo.processAudio(mpx.data(), left.data(), right.data(), kBlock);
+    if (block >= 20 && stereo.isStereo()) {
+      stereoBlocks++;
+    }
+  }
+  INFO("pilot SNR " << stereo.getPilotSnrDb() << " dB, pilot "
+                    << stereo.getPilotDeviationKHz() << " kHz, RDS "
+                    << stereo.getRdsDeviationKHz() << " kHz");
+  REQUIRE(stereoBlocks == 0);
+  REQUIRE(stereo.getStereoBlend() < 0.01f);
+  REQUIRE(stereo.getPilotDeviationKHz() < 1.0f);
+  REQUIRE(stereo.getRdsDeviationKHz() < 2.0f);
 }

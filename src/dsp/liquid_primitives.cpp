@@ -209,6 +209,91 @@ std::size_t FIRFilter::length() const {
     return firfilt_crcf_get_length(m_object);
 }
 
+AnalyticBandpassFilter::~AnalyticBandpassFilter() { destroy(); }
+
+void AnalyticBandpassFilter::destroy() {
+    if (m_re != nullptr) {
+        firfilt_rrrf_destroy(m_re);
+        m_re = nullptr;
+    }
+    if (m_im != nullptr) {
+        firfilt_rrrf_destroy(m_im);
+        m_im = nullptr;
+    }
+}
+
+void AnalyticBandpassFilter::init(std::uint32_t length, float halfBandwidth,
+                                  float stopBandAtten, float center) {
+    destroy();
+    if ((length % 2) == 0) {
+        length++;
+    }
+    m_length = length;
+    std::vector<float> proto(length, 0.0f);
+#if FM_TUNER_LIQUID_FIRDES_KAISER_RETURNS_VOID
+    liquid_firdes_kaiser(length, halfBandwidth, stopBandAtten, 0.0f, proto.data());
+#else
+    if (liquid_firdes_kaiser(length, halfBandwidth, stopBandAtten, 0.0f, proto.data()) != LIQUID_OK) {
+        throw std::runtime_error("failed to design liquid kaiser taps");
+    }
+#endif
+    // A real tone A·cos(ωn) is ½A·e^{+jωn} + ½A·e^{−jωn}; only the first half
+    // passes. A prototype DC gain of 2 therefore makes the output phasor's
+    // magnitude equal the real input tone's amplitude A.
+    double sum = 0.0;
+    for (float tap : proto) {
+        sum += tap;
+    }
+    const float norm = (std::abs(sum) > 1e-12) ? static_cast<float>(2.0 / sum) : 2.0f;
+    std::vector<float> re(length, 0.0f);
+    std::vector<float> im(length, 0.0f);
+    const int mid = static_cast<int>((length - 1) / 2);
+    constexpr double kTwoPi = 6.28318530717958647692;
+    for (std::uint32_t n = 0; n < length; ++n) {
+        const double phase =
+            kTwoPi * static_cast<double>(center) * static_cast<double>(static_cast<int>(n) - mid);
+        const double h = static_cast<double>(proto[n] * norm);
+        re[n] = static_cast<float>(h * std::cos(phase));
+        im[n] = static_cast<float>(h * std::sin(phase));
+    }
+    // liquid's firfilt computes y = Σ h[k]·x[n−k] with the taps reversed
+    // internally, i.e. a true convolution, so h[n] here is the impulse
+    // response and the output phasor rotates at +center.
+    m_re = firfilt_rrrf_create(re.data(), length);
+    m_im = firfilt_rrrf_create(im.data(), length);
+    if (m_re == nullptr || m_im == nullptr) {
+        destroy();
+        throw std::runtime_error("failed to create liquid firfilt_rrrf (analytic band-pass)");
+    }
+}
+
+void AnalyticBandpassFilter::reset() {
+    if (m_re != nullptr) {
+        firfilt_rrrf_reset(m_re);
+    }
+    if (m_im != nullptr) {
+        firfilt_rrrf_reset(m_im);
+    }
+}
+
+void AnalyticBandpassFilter::push(float sample) const {
+    if (m_re != nullptr && m_im != nullptr) {
+        firfilt_rrrf_push(m_re, sample);
+        firfilt_rrrf_push(m_im, sample);
+    }
+}
+
+std::complex<float> AnalyticBandpassFilter::execute() const {
+    if (m_re == nullptr || m_im == nullptr) {
+        return {};
+    }
+    float yr = 0.0f;
+    float yi = 0.0f;
+    firfilt_rrrf_execute(m_re, &yr);
+    firfilt_rrrf_execute(m_im, &yi);
+    return {yr, yi};
+}
+
 NCO::~NCO() {
     if (m_object != nullptr) {
         nco_crcf_destroy(m_object);

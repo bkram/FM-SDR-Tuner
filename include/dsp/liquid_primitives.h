@@ -76,6 +76,42 @@ private:
   float m_scale = 1.0f;
 };
 
+// Analytic band-pass for a real input: complex taps h[n]·e^{j2πfc(n−mid)}
+// built on a Kaiser low-pass prototype. The output is the complex phasor of
+// the band around +fc, scaled so that a real input tone of amplitude A at fc
+// gives a phasor of magnitude A; the mirror band at −fc lies in the
+// prototype's stop band and is rejected.
+// A phase detector fed this output sees a clean rotating phasor instead of a
+// real sinusoid whose magnitude swings through zero twice per cycle. Built as
+// two real FIRs (in-phase and quadrature taps) so a real input costs the same
+// two MACs per tap as a real-tap filter on a complex input. Group delay is
+// (length−1)/2 samples, the same as the real-tap design.
+class AnalyticBandpassFilter {
+public:
+  AnalyticBandpassFilter() = default;
+  ~AnalyticBandpassFilter();
+  AnalyticBandpassFilter(const AnalyticBandpassFilter &) = delete;
+  AnalyticBandpassFilter &operator=(const AnalyticBandpassFilter &) = delete;
+  AnalyticBandpassFilter(AnalyticBandpassFilter &&) = delete;
+  AnalyticBandpassFilter &operator=(AnalyticBandpassFilter &&) = delete;
+
+  // length must be odd. halfBandwidth and center are fractions of the
+  // sample rate (f/Fs), as for FIRFilter.
+  void init(std::uint32_t length, float halfBandwidth, float stopBandAtten,
+            float center);
+  void reset();
+  void push(float sample) const;
+  std::complex<float> execute() const;
+  std::size_t length() const { return m_length; }
+  bool ready() const { return m_re != nullptr && m_im != nullptr; }
+
+private:
+  void destroy();
+  firfilt_rrrf m_re = nullptr;
+  firfilt_rrrf m_im = nullptr;
+  std::uint32_t m_length = 0;
+};
+
 class NCO {
 public:
   NCO() = default;
