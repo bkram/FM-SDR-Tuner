@@ -308,7 +308,9 @@ int Application::run() {
   // disposition terminates the process. The per-socket MSG_NOSIGNAL /
   // SO_NOSIGPIPE guards cover the sends we control; this is the belt-and-braces
   // backstop so no future socket path can take the tuner down.
+#if !defined(_WIN32)
   signal(SIGPIPE, SIG_IGN);
+#endif
 
   TunerController tuner(tunerSource, tcpHost, tcpPort, rtlDeviceIndex);
   tuner.setLowLatencyMode(lowLatencyIq);
