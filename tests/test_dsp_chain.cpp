@@ -1914,8 +1914,8 @@ TEST_CASE("the analog de-emphasis matches its reference response",
   //   |H(f)| = 1 / sqrt(1 + (tau * 2 * fs * tan(pi * f / fs))^2)
   //
   // The measurement isolates the filter: the same tone is played with and
-  // without the de-emphasis, so the resampler and the DC blocker (which are
-  // in front of and behind it) cancel out.
+  // without the de-emphasis, so the resampler and the DC blocker (which both
+  // follow it) cancel out.
   constexpr int kRate = 48000;
   constexpr size_t kSamples = 48000; // 1 s
   constexpr float kTwoPi = 6.28318530717958647692f;
@@ -1973,4 +1973,60 @@ TEST_CASE("the analog de-emphasis matches its reference response",
   // warped reference, and rolls off faster than the plain analog curve.
   REQUIRE(std::abs(responseDb(8000.0f, 50) - referenceDb(8000.0f, 50e-6)) < 0.2);
   REQUIRE(responseDb(8000.0f, 50) < analogDb(8000.0f, 50e-6) - 0.4);
+}
+
+TEST_CASE("the audio path follows the analog de-emphasis curve to 15 kHz",
+          "[dsp][af_post][deemphasis]") {
+  // The production path: 256 kHz in, 48 kHz out. The whole response - the
+  // de-emphasis and the resampler together - has to follow the analog RC
+  // curve across the FM audio band. Two defects used to pull the treble
+  // down: the de-emphasis ran at 48 kHz, where the bilinear transform's zero
+  // at Nyquist cost 1.2 dB at 10 kHz and 3.4 dB at 15 kHz, and the resampler
+  // rolled off from 12 kHz (-3.6 dB at 15 kHz). Together the top end was
+  // 7 dB low at 15 kHz.
+  constexpr int kInRate = 256000;
+  constexpr int kOutRate = 48000;
+  constexpr size_t kInSamples = 256000; // 1 s
+  constexpr double kAmplitude = 0.25;
+
+  auto levelDb = [&](double toneHz, int tauUs) {
+    AFPostProcessor af(kInRate, kOutRate);
+    af.setDeemphasis(tauUs);
+    std::vector<float> in(kInSamples);
+    for (size_t i = 0; i < kInSamples; i++) {
+      in[i] = static_cast<float>(
+          kAmplitude * std::sin(2.0 * M_PI * toneHz * static_cast<double>(i) /
+                                kInRate));
+    }
+    std::vector<float> outL(kInSamples, 0.0f);
+    std::vector<float> outR(kInSamples, 0.0f);
+    const size_t out = af.process(in.data(), in.data(), kInSamples,
+                                  outL.data(), outR.data(), outL.size());
+    REQUIRE(out > 40000);
+    // Skip the filters' start-up; measure the settled half second.
+    const size_t skip = out / 2;
+    std::vector<float> settled(outL.begin() + static_cast<long>(skip),
+                               outL.begin() + static_cast<long>(out));
+    return 20.0 * std::log10(
+                      toneMagnitude(settled, settled.size(), kOutRate, toneHz) /
+                      kAmplitude);
+  };
+  auto analogDb = [](double toneHz, double tauSec) {
+    const double w = 2.0 * M_PI * toneHz * tauSec;
+    return -10.0 * std::log10(1.0 + w * w);
+  };
+
+  for (int tauUs : {50, 75}) {
+    for (double f : {1000.0, 5000.0, 8000.0, 10000.0, 12000.0, 14000.0,
+                     15000.0}) {
+      const double got = levelDb(f, tauUs);
+      const double want = analogDb(f, tauUs * 1e-6);
+      INFO("tau " << tauUs << " us, " << f << " Hz: " << got
+                  << " dB, analog " << want << " dB");
+      REQUIRE(std::abs(got - want) < 0.3);
+    }
+  }
+
+  // With the de-emphasis off the path is flat to 15 kHz.
+  REQUIRE(std::abs(levelDb(15000.0, 0)) < 0.3);
 }
