@@ -1473,8 +1473,11 @@ TEST_CASE("XDRServer sends the salt first even when a peer leaves meanwhile",
   closeSock(peer);
 
   REQUIRE(recvLine(newcomer, line));
+  // An "o<auth>,<guest>" line always holds a comma; a salt never does (its
+  // alphabet is letters, digits, '_' and '-'). A salt may itself start with
+  // 'o', so the first character proves nothing.
   REQUIRE(line.size() == XDRServer::SALT_LENGTH);
-  REQUIRE(line[0] != 'o');
+  REQUIRE(line.find(',') == std::string::npos);
   closeSock(newcomer);
   server.stop();
 }
