@@ -613,19 +613,58 @@ std::string XDRServer::onlineLine() const {
          "," + std::to_string(m_onlineGuest.load(std::memory_order_relaxed));
 }
 
-void XDRServer::broadcastOnlineLine() {
+void XDRServer::broadcastOnlineLine(SocketHandle exclude) {
   // The reference daemon pushes the updated count to every client when a
   // peer connects or disconnects (research/xdrd/xdrd.c:561, :597). A client
   // that only reads the line on connect would otherwise never learn that
   // somebody else joined or left.
+  //
+  // Only established sessions receive it. A client inside protocol detection
+  // or the auth exchange expects its salt as the first line; an "o0,0" sent
+  // there was taken as the salt and the login failed. FM-DX clients are never
+  // in the set: the line is not part of their protocol.
   std::string line = onlineLine() + "\n";
   std::vector<SocketHandle> sockets;
   {
     std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
-    sockets = m_clientSockets;
+    sockets = m_onlineSockets;
   }
   for (SocketHandle sock : sockets) {
-    sendSocket(sock, line.c_str(), line.length());
+    if (sock != exclude) {
+      sendSocket(sock, line.c_str(), line.length());
+    }
+  }
+}
+
+void XDRServer::acquireFmdxTuner() {
+  std::lock_guard<std::mutex> lock(m_fmdxTunerMutex);
+  const bool alreadyRunning = m_tunerActiveCallback && m_tunerActiveCallback();
+  if (!alreadyRunning) {
+    // A client starts a stopped tuner, so the FM-DX clients own it. A tuner
+    // that was already running (auto-start, an XDR client) is only joined.
+    m_fmdxStartedTuner = true;
+  }
+  m_fmdxTunerUsers++;
+  if (m_startCallback) {
+    m_startCallback();
+  }
+}
+
+void XDRServer::releaseFmdxTuner(bool stopNow) {
+  std::lock_guard<std::mutex> lock(m_fmdxTunerMutex);
+  if (m_fmdxTunerUsers > 0) {
+    m_fmdxTunerUsers--;
+  }
+  // An explicit "X" stops the tuner for everyone, as before. Otherwise the
+  // tuner stops only when the last FM-DX client using it leaves, and only if
+  // an FM-DX client was the one that started it.
+  const bool stop =
+      stopNow || (m_fmdxTunerUsers == 0 && m_fmdxStartedTuner);
+  if (stop) {
+    m_fmdxStartedTuner = false;
+    if (m_stopCallback) {
+      m_stopCallback();
+    }
   }
 }
 
@@ -948,31 +987,45 @@ void XDRServer::handleFmdxClient(SocketHandle clientSocket,
   // line that is some other payload is not a valid FM-DX client, and a
   // first line that is oversized is rejected outright.
   bool sawStartupLine = false;
-  // True when this client is the one that put the tuner into play. A client
-  // that connects to a tuner that is already running (--auto-start, or a
-  // client that is already connected) does not own the tuner, so its
-  // disconnect must not stop it: the programme would cut out in the middle
-  // of the listener's music because a browser tab was closed.
-  bool clientOwnsTuner = false;
-  // The salt sent with the startup reply, and the deadline by which the
-  // client must answer with the matching hash.
+  // Set when the client sent "x" but has not authenticated yet. The tuner is
+  // started only once the hash checks out, so a client with a wrong password
+  // cannot switch the radio on.
+  bool pendingStart = false;
+  // The salt sent with the startup reply.
   std::string fmdxSalt;
-  auto fmdxAuthDeadline =
-      std::chrono::steady_clock::time_point::max();
+  // The whole handshake - the "x" line and, with a password, the hash - must
+  // complete by this deadline. It is armed at connect and checked on every
+  // pass, not only when a read times out, so a client that sends "x" without
+  // a newline, or trickles bytes, cannot pin this thread.
+  const auto handshakeDeadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(kHandshakeTimeoutMs);
+
+  // The tuner is shared by the FM-DX clients using it (acquireFmdxTuner):
+  // this client's share is released on every exit path, and the tuner stops
+  // only when the last client that uses it leaves. A client that joins a
+  // tuner already running (--auto-start, an XDR client) never stops it.
+  struct FmdxTunerRelease {
+    XDRServer *server;
+    const bool *started;
+    ~FmdxTunerRelease() {
+      if (*started) {
+        server->releaseFmdxTuner(false);
+      }
+    }
+  } releaseOnExit{this, &tunerStarted};
 
   while (m_running && !disconnectRequested) {
+    if ((!sawStartupLine || awaitingAuth) &&
+        std::chrono::steady_clock::now() >= handshakeDeadline) {
+      std::cout << "[XDR] FM-DX client did not complete the handshake within "
+                << (kHandshakeTimeoutMs / 1000) << " s; closing\n";
+      break;
+    }
     const auto n =
         recv(nativeSocket(clientSocket), cmdBuffer, sizeof(cmdBuffer) - 1, 0);
     if (n < 0) {
       if (socketWouldBlock(lastSocketError())) {
-        // A client that stalls during the auth exchange is dropped once the
-        // handshake deadline passes, so it cannot pin this thread.
-        if (awaitingAuth &&
-            std::chrono::steady_clock::now() >= fmdxAuthDeadline) {
-          std::cout << "[XDR] FM-DX client disconnected before sending auth "
-                       "hash\n";
-          break;
-        }
         continue;
       }
       break;
@@ -1023,20 +1076,17 @@ void XDRServer::handleFmdxClient(SocketHandle clientSocket,
       }
 
       if (line == "x") {
-        if (tunerStarted) {
+        if (tunerStarted || pendingStart) {
           // A second "x" is a duplicate startup line. Answer it the same
           // way so a client that re-sends the handshake is not left waiting.
           sendSocket(clientSocket, "\nOK\n", 4);
           continue;
         }
-        tunerStarted = true;
-        // The tuner is only "owned" by this client when it was not already
-        // running: the stop-on-disconnect below must not cut a tuner that
-        // somebody else (--auto-start, another client) is using.
-        clientOwnsTuner =
-            !(m_tunerActiveCallback && m_tunerActiveCallback());
-        if (m_startCallback) {
-          m_startCallback();
+        if (awaitingAuth) {
+          pendingStart = true;
+        } else {
+          tunerStarted = true;
+          acquireFmdxTuner();
         }
         // The reference client's startup reply is "\nOK\n"
         // (Dispatcher::cbStartup). "1" was never part of the protocol.
@@ -1057,8 +1107,6 @@ void XDRServer::handleFmdxClient(SocketHandle clientSocket,
           std::string saltMsg = salt + "\n";
           sendSocket(clientSocket, saltMsg.c_str(), saltMsg.length());
           fmdxSalt = salt;
-          fmdxAuthDeadline = std::chrono::steady_clock::now() +
-                             std::chrono::milliseconds(kHandshakeTimeoutMs);
         }
         continue;
       }
@@ -1088,6 +1136,11 @@ void XDRServer::handleFmdxClient(SocketHandle clientSocket,
         }
         authenticated = true;
         awaitingAuth = false;
+        if (pendingStart) {
+          pendingStart = false;
+          tunerStarted = true;
+          acquireFmdxTuner();
+        }
         continue;
       }
 
@@ -1098,8 +1151,11 @@ void XDRServer::handleFmdxClient(SocketHandle clientSocket,
       }
 
       if (line == "X") {
-        tunerStarted = false;
-        if (m_stopCallback) {
+        // An explicit stop stops the tuner for everyone, as it always has.
+        if (tunerStarted) {
+          tunerStarted = false;
+          releaseFmdxTuner(true);
+        } else if (m_stopCallback) {
           m_stopCallback();
         }
         sendSocket(clientSocket, "1\n", 2);
@@ -1119,10 +1175,6 @@ void XDRServer::handleFmdxClient(SocketHandle clientSocket,
     }
   }
   setRecvTimeoutMs(clientSocket, 0);
-
-  if (tunerStarted && clientOwnsTuner && m_stopCallback) {
-    m_stopCallback();
-  }
 }
 
 void XDRServer::handleXdrClient(SocketHandle clientSocket,
@@ -1220,8 +1272,12 @@ void XDRServer::handleXdrClient(SocketHandle clientSocket,
     addOnlineClient(authSuccess);
     std::string online = onlineLine() + "\n";
     sendSocket(clientSocket, online.c_str(), online.length());
+    {
+      std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
+      m_onlineSockets.push_back(clientSocket);
+    }
     // Tell the clients that were already connected that somebody joined.
-    broadcastOnlineLine();
+    broadcastOnlineLine(clientSocket);
 
     std::string snapshot = buildXdrStateSnapshot();
     snapshot += "\n";
@@ -1370,17 +1426,23 @@ void XDRServer::handleXdrClient(SocketHandle clientSocket,
 
   // A disconnect cancels the scan only when this client was the one that
   // armed it. Unconditionally cancelling meant that any second client
-  // connecting and hanging up aborted a sweep that belonged to somebody else.
-  const SocketHandle scanOwner =
-      m_scanOwnerSocket.load(std::memory_order_relaxed);
-  if (scanOwner == kInvalidSocket || scanOwner == clientSocket) {
+  // connecting and hanging up aborted a sweep that belonged to somebody else;
+  // with no scan armed there is nothing to cancel, and raising the flag then
+  // only left it pending for the next sweep.
+  SocketHandle scanOwner = clientSocket;
+  if (m_scanOwnerSocket.compare_exchange_strong(scanOwner, kInvalidSocket)) {
     m_scanCancelPending = true;
-    if (scanOwner == clientSocket) {
-      m_scanOwnerSocket.store(kInvalidSocket, std::memory_order_relaxed);
-    }
   }
 
   if (sessionEstablished) {
+    {
+      std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
+      auto it = std::find(m_onlineSockets.begin(), m_onlineSockets.end(),
+                          clientSocket);
+      if (it != m_onlineSockets.end()) {
+        m_onlineSockets.erase(it);
+      }
+    }
     removeOnlineClient(authSuccess);
     broadcastOnlineLine();
   }
@@ -1395,7 +1457,13 @@ std::string XDRServer::processCommand(const std::string &cmd,
   // the guest path.
   (void)guestSession;
   if (cmd.empty()) {
-    m_scanCancelPending = true;
+    // An empty line cancels a running scan (the TEF convention). Only an
+    // authenticated session may do that: a guest is read-only, and letting it
+    // cancel meant anyone who could reach the port - even with a wrong
+    // password - could abort the owner's sweep.
+    if (authenticated) {
+      m_scanCancelPending = true;
+    }
     return "";
   }
 
@@ -1452,12 +1520,16 @@ std::string XDRServer::processCommand(const std::string &cmd,
     // Sa<start_kHz> Sb<stop_kHz> Sc<step_kHz> Sw<bw_hz> Sz<antenna> S / Sm
     if (arg.empty()) {
       m_scanContinuous = false;
+      // A new sweep supersedes any cancel still pending from an earlier one.
+      m_scanCancelPending = false;
       m_scanStartPending = true;
       m_scanOwnerSocket.store(clientSocket, std::memory_order_relaxed);
       return "";
     }
     if (arg == "m") {
       m_scanContinuous = true;
+      // A new sweep supersedes any cancel still pending from an earlier one.
+      m_scanCancelPending = false;
       m_scanStartPending = true;
       m_scanOwnerSocket.store(clientSocket, std::memory_order_relaxed);
       return "";

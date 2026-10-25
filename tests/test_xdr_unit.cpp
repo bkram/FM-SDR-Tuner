@@ -342,3 +342,28 @@ TEST_CASE("XDR stop joins client threads and clears thread registry",
 
   closeSock(sock);
 }
+
+TEST_CASE("XDR empty line cancels a scan only for an authenticated session",
+          "[xdr_unit]") {
+  XDRServer xdr;
+  xdr.setVerboseLogging(false);
+
+  // A guest is read-only: its empty line must not abort the owner's sweep.
+  REQUIRE(xdr.processCommand("", false, true).empty());
+  REQUIRE_FALSE(xdr.consumeScanCancel());
+
+  REQUIRE(xdr.processCommand("", true, false).empty());
+  REQUIRE(xdr.consumeScanCancel());
+}
+
+TEST_CASE("XDR scan start clears a cancel left over from an earlier sweep",
+          "[xdr_unit]") {
+  XDRServer xdr;
+  xdr.setVerboseLogging(false);
+
+  REQUIRE(xdr.processCommand("", true, false).empty());
+  REQUIRE(xdr.processCommand("S", true, false).empty());
+  XDRServer::ScanConfig cfg{};
+  REQUIRE(xdr.consumeScanStart(cfg));
+  REQUIRE_FALSE(xdr.consumeScanCancel());
+}

@@ -1319,3 +1319,162 @@ TEST_CASE("FM-DX client disconnect stops only a tuner it started",
   // disconnect leaves the tuner alone.
   REQUIRE(runScenario(guestPort, true) == 0);
 }
+
+namespace {
+bool sendText(int sock, const std::string &text) {
+  return sendAll(sock, reinterpret_cast<const uint8_t *>(text.data()),
+                 text.size());
+}
+
+// Connects an FM-DX client and completes its startup line.
+int connectFmdx(uint16_t port) {
+  int sock = connectLoopback(port);
+  setRecvTimeoutMs(sock, 2500);
+  REQUIRE(sendText(sock, "x\n"));
+  REQUIRE(waitForExactLine(sock, "OK", std::chrono::milliseconds(1000)));
+  return sock;
+}
+} // namespace
+
+TEST_CASE("FM-DX client with a wrong password does not start the tuner",
+          "[protocol][xdr][fmdx]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  server.setPassword("secret123");
+  std::atomic<int> startCalls{0};
+  std::atomic<int> stopCalls{0};
+  server.setStartCallback([&]() { startCalls++; });
+  server.setStopCallback([&]() { stopCalls++; });
+  server.setTunerActiveCallback([&]() { return startCalls > stopCalls; });
+  REQUIRE(server.start());
+
+  int sock = connectFmdx(port);
+  std::string salt;
+  REQUIRE(recvLine(sock, salt));
+  REQUIRE(sendText(sock, std::string(40, '0') + "\n"));
+  REQUIRE(waitForPrefixLine(sock, "a0", std::chrono::milliseconds(1000)));
+  closeSock(sock);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  REQUIRE(startCalls.load() == 0);
+
+  // The correct hash starts it.
+  sock = connectFmdx(port);
+  REQUIRE(recvLine(sock, salt));
+  REQUIRE(sendText(sock, sha1Hex(salt + "secret123") + "\n"));
+  for (int i = 0; i < 40 && startCalls.load() == 0; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  REQUIRE(startCalls.load() == 1);
+  closeSock(sock);
+  server.stop();
+}
+
+TEST_CASE("FM-DX tuner stops only when the last client using it leaves",
+          "[protocol][xdr][fmdx]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  std::atomic<bool> running{false};
+  std::atomic<int> stopCalls{0};
+  server.setStartCallback([&]() { running = true; });
+  server.setStopCallback([&]() {
+    running = false;
+    stopCalls++;
+  });
+  server.setTunerActiveCallback([&]() { return running.load(); });
+  REQUIRE(server.start());
+
+  // A starts the tuner, B joins it.
+  int a = connectFmdx(port);
+  int b = connectFmdx(port);
+  REQUIRE(running.load());
+
+  // A leaves: B is still listening, so the tuner keeps running.
+  closeSock(a);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  REQUIRE(stopCalls.load() == 0);
+  REQUIRE(running.load());
+
+  // B was the last one: the tuner an FM-DX client started is stopped.
+  closeSock(b);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  REQUIRE(stopCalls.load() == 1);
+  REQUIRE_FALSE(running.load());
+  server.stop();
+}
+
+TEST_CASE("FM-DX client that never finishes its startup line is dropped",
+          "[protocol][xdr][fmdx]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  REQUIRE(server.start());
+
+  int sock = connectLoopback(port);
+  REQUIRE(sendText(sock, "x"));
+  // The handshake deadline is 5 s; the server must close well before 8 s.
+  setRecvTimeoutMs(sock, 8000);
+  uint8_t byte = 0;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto n = recv(sock, reinterpret_cast<char *>(&byte), 1, 0);
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  REQUIRE(n == 0);
+  REQUIRE(waited < std::chrono::milliseconds(7000));
+  closeSock(sock);
+  server.stop();
+}
+
+TEST_CASE("XDRServer sends the salt first even when a peer leaves meanwhile",
+          "[protocol][xdr]") {
+#if defined(_WIN32)
+  WinSockInit wsa;
+#endif
+  const uint16_t port = reserveLoopbackPort();
+  if (port == 0) {
+    SKIP("Loopback sockets are unavailable in this environment");
+  }
+  XDRServer server(port);
+  server.setVerboseLogging(false);
+  REQUIRE(server.start());
+
+  // A peer with an established session.
+  int peer = connectLoopback(port);
+  setRecvTimeoutMs(peer, 2500);
+  std::string line;
+  REQUIRE(recvLine(peer, line));
+  REQUIRE(sendText(peer, sha1Hex(line) + "\n"));
+  REQUIRE(waitForPrefixLine(peer, "a2", std::chrono::milliseconds(1000)));
+
+  // A newcomer connects, and the peer leaves while the newcomer is still in
+  // protocol detection. The peer's departure broadcasts an "o" line, which
+  // must not reach the newcomer ahead of its salt.
+  int newcomer = connectLoopback(port);
+  setRecvTimeoutMs(newcomer, 2500);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  closeSock(peer);
+
+  REQUIRE(recvLine(newcomer, line));
+  REQUIRE(line.size() == XDRServer::SALT_LENGTH);
+  REQUIRE(line[0] != 'o');
+  closeSock(newcomer);
+  server.stop();
+}

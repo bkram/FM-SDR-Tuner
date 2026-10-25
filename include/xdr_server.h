@@ -132,7 +132,16 @@ private:
   void addOnlineClient(bool authenticated);
   void removeOnlineClient(bool authenticated);
   std::string onlineLine() const;
-  void broadcastOnlineLine();
+  // Sends the "o" line to every client whose session is established, except
+  // `exclude`. A client still in its handshake is left out: it is waiting for
+  // its salt, and an "o" line arriving first would be read as the salt.
+  void broadcastOnlineLine(SocketHandle exclude = kInvalidSocket);
+  // Shared use of the tuner by FM-DX clients. The first client to start a
+  // stopped tuner makes the FM-DX clients its owner; it is stopped again only
+  // when the last FM-DX client using it leaves, so one client hanging up does
+  // not stop the station under another.
+  void acquireFmdxTuner();
+  void releaseFmdxTuner(bool stopNow);
 
   uint16_t m_port;
   // The listening socket. Atomic because stop() reads it (to shutdown) while
@@ -144,6 +153,12 @@ private:
   std::thread m_acceptThread;
   std::mutex m_clientSocketsMutex;
   std::vector<SocketHandle> m_clientSockets;
+  // The subset of m_clientSockets whose XDR session is established (salt
+  // sent, hash answered). Only these receive the broadcast "o" line.
+  std::vector<SocketHandle> m_onlineSockets;
+  std::mutex m_fmdxTunerMutex;
+  int m_fmdxTunerUsers = 0;
+  bool m_fmdxStartedTuner = false;
   std::mutex m_clientThreadsMutex;
   // Each accepted client gets a worker thread. The entry carries a `done` flag
   // so the accept loop can join and drop the threads of clients that have
