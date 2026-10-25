@@ -311,9 +311,10 @@ parser sizes its array from the comma count and drops the last entry without
 it.
 
 **The plot is a spectrum, not a list of stations.** Every grid point reports
-the level of the band at that frequency, measured with the same estimator and
-the same 30 kHz window the signal meter uses — so the plot and the meter read
-the same number for the same signal. A signal that is not a station stays a
+the level of the band at that frequency, measured with the same estimator as the
+signal meter over a 30 kHz window. The meter integrates the whole channel, so
+the two read the same number for an unmodulated carrier and the meter reads a
+modulated station higher than the plot. A signal that is not a station stays a
 bump in the noise floor, the way a spectrum display shows it, instead of
 turning into a station of its own. That is the difference between this plot
 and a sparse "stations only" scan, where a single noise maximum is drawn like
@@ -363,7 +364,7 @@ their own frequency
 The station's own frequency is measured, not assumed: a station that sits
 between two grid points is reported on the one it belongs to. A station
 measured on 96.188 MHz — 12 kHz off the 96.2 grid point — is reported on
-96.2, and the meter shows the same number for it.
+96.2.
 
 **Levels are on the client's plot scale.** The reference client draws the scan
 in a fixed 3..84 window and clips everything outside it, so the scan line is
@@ -747,7 +748,8 @@ cp fm-sdr-tuner-sdrplay.ini.example fm-sdr-tuner.ini
 
 The RTL example is the profile that was measured on this site (an R820T with
 the indoor antenna): a fixed 10 dB gain, the meter window that goes with it
-(`-43 / -19`), and the REST control API enabled on `127.0.0.1:9090` — the
+(`-33 / -10`, shifted from the `-43 / -19` measured with the earlier 30 kHz
+meter), and the REST control API enabled on `127.0.0.1:9090` — the
 address the fm-dx-webserver plugin talks to by default. The gain, the meter
 window and the antenna in it are the ones that were verified on real
 hardware; re-derive them with `--calibrate` after a change of antenna or
@@ -781,8 +783,8 @@ Important sections:
 - `[xdr]`: server port/password/guest mode
 
 Signal meter related keys (`[sdr]`):
-- `signal_floor_dbfs` (default `-55.0`)
-- `signal_ceil_dbfs` (default `-10.0`)
+- `signal_floor_dbfs` (default `-45.0`)
+- `signal_ceil_dbfs` (default `-1.0`)
 - `signal_bias_db` (default `0.0`)
 
 ### Getting reasonable signal-strength readings
@@ -797,13 +799,15 @@ a **linear mapping of the tuned-channel power** (compensated dBFS) onto a
 - `signal_bias_db` shifts the whole scale up/down to line up with a reference
   receiver, if you have one (otherwise leave it at `0`).
 
-The measured power is the **band power of a 30 kHz window** around the tuned
-carrier — the same window, the same estimator and the same calibration the
-spectral scan integrates, so the plot and the meter report the same number for
-the same signal. Half of the applied gain is taken out of the reading, so a
-station keeps its level when the gain strategy changes.
+The measured power is the **band power of the whole 200 kHz channel** around
+the tuned carrier. An FM signal has a constant envelope, so the reading does not
+move with the programme (a 30 kHz window read the same carrier 8 dB lower at
+full modulation than in silence). The spectral scan uses the same estimator
+over 30 kHz, so the two agree for an unmodulated carrier and the meter reads a
+modulated station higher than the plot. Half of the applied gain is taken out
+of the reading, so a station keeps its level when the gain strategy changes.
 
-The shipped default (`-55` / `-10`) puts the noise floor of an empty band at 0
+The shipped default (`-45` / `-1`) puts the noise floor of an empty band at 0
 and a strong local station near 115. To make the reading track your own site:
 
 1. **Fix RF gain first.** A meter calibrated over a clipping or starved front
@@ -857,7 +861,7 @@ clipping.
 
 ### 1. Start From A Known-Good Baseline
 
-The shipped RTL profile (`fm-sdr-tuner.ini.example`) is the one that was measured on real hardware at this site: a fixed 10 dB gain with the most headroom of the settings tried, the meter window that goes with it (`-43 / -19`), and the REST control API on `127.0.0.1:9090` so the fm-dx-webserver plugin can drive the tuner. Copy it over `fm-sdr-tuner.ini` and start from there. The optional adaptive features (`hicut`, `adaptive_bandwidth`, `multipath_eq`) are off so the audio is identical to a passive demod chain until you opt in.
+The shipped RTL profile (`fm-sdr-tuner.ini.example`) is the one that was measured on real hardware at this site: a fixed 10 dB gain with the most headroom of the settings tried, the meter window that goes with it (`-33 / -10`, shifted from the `-43 / -19` measured with the earlier 30 kHz meter), and the REST control API on `127.0.0.1:9090` so the fm-dx-webserver plugin can drive the tuner. Copy it over `fm-sdr-tuner.ini` and start from there. The optional adaptive features (`hicut`, `adaptive_bandwidth`, `multipath_eq`) are off so the audio is identical to a passive demod chain until you opt in.
 
 For a dedicated site profile, put overrides in `fm-sdr-tuner.ini`:
 
@@ -869,8 +873,8 @@ default_custom_gain_flags = 0
 freq_correction_ppm = 0
 # The window measured with the 10 dB gain above: the empty band reads 0 and
 # the local station reads 91-100 of 120.
-signal_floor_dbfs = -43.0
-signal_ceil_dbfs = -19.0
+signal_floor_dbfs = -33.0
+signal_ceil_dbfs = -10.0
 signal_bias_db = 0.0
 
 [processing]
@@ -1473,7 +1477,7 @@ A station is drawn on the wrong frequency:
 - if one strong station has a weaker copy next to it, that is an overload image — reduce the gain first
 
 The scan levels and the signal meter disagree:
-- the scan and the meter measure the same spectrum through the same estimator and the same 30 kHz window, so they report the same number for the same signal
+- the meter integrates the whole channel and the scan 30 kHz per grid point, so a modulated station reads higher on the meter than on the plot; an unmodulated carrier reads the same on both
 - if the scan is uniformly much lower, check that the channel bandwidth matches what the meter is using (`Sw` / `w0_bandwidth_hz`)
 - the scan line is remapped onto the client's fixed 3..84 plot window; the `S` line and the REST status keep the 0..120 scale, so the two are not directly comparable as numbers
 

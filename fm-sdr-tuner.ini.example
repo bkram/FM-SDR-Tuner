@@ -147,11 +147,17 @@ sdrpp_rtl_agc_gain_db = 18
 # window is moved up (floor=-21, ceil=-9 was measured here). The [METER]
 # session line prints the window that fits the session it saw.
 #
-# The spectral scan reports the same number for the same signal: the scan and
-# the meter measure the same spectrum through the same estimator and the same
-# 30 kHz window.
-signal_floor_dbfs = -43.0
-signal_ceil_dbfs = -19.0
+# The meter integrates the whole 200 kHz channel, so its reading does not move
+# with the programme. The spectral scan integrates 30 kHz around each grid
+# point: both read the same number for an unmodulated carrier, and the meter
+# reads a modulated station higher than the scan does.
+#
+# The window was measured as -43 / -19 with the earlier 30 kHz meter. The
+# whole-channel meter reads about 10 dB higher at the floor and 9 dB higher at
+# the top, so the window moved by that much. Re-run --calibrate on the site's
+# own antenna to confirm it.
+signal_floor_dbfs = -33.0
+signal_ceil_dbfs = -10.0
 signal_bias_db = 0.0
 
 # Spectral-scan plot scale. The scan line is the spectrum of the band: every

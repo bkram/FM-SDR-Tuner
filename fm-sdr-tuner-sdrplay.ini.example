@@ -110,11 +110,12 @@ sdrpp_rtl_agc_gain_db = 18
 # reads 0 and a strong local station near 115. Widen the window if your
 # site is quieter, narrow it if your stations are stronger.
 #
-# The spectral scan reports the same number for the same signal: the scan and
-# the meter measure the same spectrum through the same estimator and the same
-# 30 kHz window.
-signal_floor_dbfs = -55.0
-signal_ceil_dbfs = -10.0
+# The meter integrates the whole 200 kHz channel, so its reading does not move
+# with the programme. The spectral scan integrates 30 kHz around each grid
+# point: both read the same number for an unmodulated carrier, and the meter
+# reads a modulated station higher than the scan does.
+signal_floor_dbfs = -45.0
+signal_ceil_dbfs = -1.0
 signal_bias_db = 0.0
 
 # Drop stale IQ backlog when overloaded

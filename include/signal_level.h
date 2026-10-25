@@ -10,8 +10,9 @@
 
 namespace fm_tuner {
 
-// The width of the measurement window that the signal meter and the scan
-// engine both integrate around the point they are looking at.
+// The width of the measurement window that the scan engine integrates around
+// every point of its grid. (The tuned meter integrates the whole channel; see
+// kTunedMeterWindowHz.)
 //
 // An FM station occupies far more spectrum than this: its carrier and its
 // immediate sidebands (the part that carries the station's identity) span
@@ -55,9 +56,10 @@ struct SignalLevelSmoother {
 // One windowed FFT of an IQ block, plus the measurements the signal meter and
 // the scan engine take from it.
 //
-// Both surfaces read the same spectrum through this class and integrate the
-// same window, so a station shows the same number on the meter as on the
-// spectrum plot. The scan engine uses it to measure the band power around
+// Both surfaces read the same spectrum through this class. The scan
+// integrates 30 kHz around each grid point and the meter the whole channel,
+// so an unmodulated carrier shows the same number on both, and a modulated
+// station reads higher on the meter. The scan engine uses it to measure the band power around
 // every point of a fine frequency grid; the meter uses it to measure the
 // band power around the tuned carrier.
 class IqSpectrum {

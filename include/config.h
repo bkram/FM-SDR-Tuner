@@ -25,16 +25,16 @@ struct Config {
     bool sdrpp_rtl_agc = false;
     int sdrpp_rtl_agc_gain_db = 18;
     // Meter calibration window: maps (compensated dBFS) → 0..120 linearly.
-    // The measured power is the band power of a 30 kHz window around the
-    // tuned carrier (the same window the scan engine integrates), so the
-    // values are the power of that band: an empty band reads about -55 dBFS
-    // and a strong local station about -12 dBFS at 18 dB of gain. The
+    // The measured power is the band power of the whole 200 kHz channel
+    // around the tuned carrier (kTunedMeterWindowHz), so the values are the
+    // power of that band: an empty band reads about -45 dBFS and a strong
+    // local station about -3 dBFS at 18 dB of gain. The
     // default window below puts the noise floor at 0 and a strong local
     // station near 115. Override per site in the INI; the active values are
     // logged at startup as [METER] and the observed range is reported as
     // [METER] session observed.
-    double signal_floor_dbfs = -55.0;
-    double signal_ceil_dbfs = -10.0;
+    double signal_floor_dbfs = -45.0;
+    double signal_ceil_dbfs = -1.0;
     double signal_bias_db = 0.0;
     // The spectral-scan plot window of the reference client. xdr-gtk draws
     // the scan in a FIXED 3..84 window (SCAN_DEFAULT_MIN_LEVEL/MAX_LEVEL)

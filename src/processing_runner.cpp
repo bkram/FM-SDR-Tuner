@@ -89,8 +89,8 @@ bool processAudioBlock(
   // The demodulator's noise-triangle SNR is the reception quality of the
   // tuned channel: it is gain-invariant, it is always available, and it is
   // the only figure that says how clean the audio is. The strength of the
-  // channel stays the spectrum-based one, because that is the same number
-  // the scan engine reports for the same station.
+  // channel stays the spectrum-based one, measured through the same
+  // estimator the scan engine uses.
   if (std::isfinite(dspOut.demodSnrDb)) {
     displaySignal.snrDb = dspOut.demodSnrDb;
   }
