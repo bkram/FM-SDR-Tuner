@@ -31,18 +31,23 @@ CI only runs on PRs to `main` (and pushes to `main`), so open a PR:
 gh pr create --base main --head vX.Y.Z --title "vX.Y.Z — <summary>" --body "..."
 ```
 
-This runs three workflows ([.github/workflows/](.github/workflows/)):
+This automatically runs two workflows ([.github/workflows/](.github/workflows/)):
 
 - **Build (Linux)** — coverage job + `.deb` (Ubuntu 24.04, Debian trixie) and
   `.rpm` (Fedora 42/43) for `x86_64` **and** `aarch64`, plus container
   install smoke-tests. These jobs build **SDRplay-enabled** (they fetch the
   vendor's public API headers at build time; the lib is `dlopen`'d, nothing
   proprietary is bundled).
-- **Build (macOS)** — SDRplay-enabled arm64 build + tests.
 - **Build (Windows / MinGW-w64)** — RTL-only (no SDRplay loader on Windows).
 
-Each build runs `ctest` and uploads a platform artifact. Wait until all three
-are green (`gh run list --branch vX.Y.Z`).
+Each build runs `ctest` and uploads a platform artifact. Wait until both are
+green (`gh run list --branch vX.Y.Z`). The macOS workflow is disabled for
+pushes and pull requests. Run it manually only when a macOS release artifact is
+needed:
+
+```bash
+gh workflow run build-macos.yml --ref vX.Y.Z
+```
 
 ## 3. Merge to main
 

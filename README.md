@@ -1572,7 +1572,7 @@ Notes:
 
 Current workflows exist for:
 - Linux (`x64`, `arm64`)
-- macOS (`macos-latest`)
+- macOS (`macos-latest`, manual dispatch only)
 - Windows (`windows-latest`, MinGW-w64 via MSYS2)
 
 Artifacts currently uploaded by CI:
@@ -1587,7 +1587,7 @@ Artifacts currently uploaded by CI:
   - `fm-sdr-tuner-linux-rpm-fedora-42-arm64`
   - `fm-sdr-tuner-linux-rpm-fedora-43-x64`
   - `fm-sdr-tuner-linux-rpm-fedora-43-arm64`
-- macOS build job:
+- Manually dispatched macOS build job:
   - `fm-sdr-tuner-macos` (binary + `README.md` + `USER-MANUAL.md` + ready-to-use `fm-sdr-tuner.ini` + both `*.ini.example` configs + `rest_test_panel.py` + `run_rest_panel.sh`)
 - Windows MinGW job:
   - `fm-sdr-tuner-windows-mingw` (`.exe` + required DLLs + `dependencies.txt` + `README.md` + `USER-MANUAL.md` + ready-to-use `fm-sdr-tuner.ini` + `fm-sdr-tuner.ini.example` + `rest_test_panel.py`)
@@ -1603,6 +1603,9 @@ loader). Building SDRplay from source needs `-DFM_TUNER_ENABLE_SDRPLAY=ON`
 (macOS/Linux only).
 
 Notes:
+- macOS CI does not run automatically for pushes or pull requests. Dispatch
+  `.github/workflows/build-macos.yml` manually when a macOS build or release
+  artifact is needed.
 - Linux smoke-test jobs validate package installability in fresh containers, but
   they do not upload additional artifacts.
 - Artifact names and platform matrix are defined in:
