@@ -336,10 +336,14 @@ void RestServer::stop() {
     for (SocketHandle sock : m_clientSockets) {
 #if defined(_WIN32)
       shutdown(nativeSocket(sock), SD_BOTH);
+      CLOSESOCKET(nativeSocket(sock));
 #else
       ::shutdown(nativeSocket(sock), SHUT_RDWR);
 #endif
     }
+#if defined(_WIN32)
+    m_clientSockets.clear();
+#endif
   }
   // Join the client workers.
   std::vector<std::shared_ptr<ClientThread>> clients;
@@ -379,15 +383,20 @@ void RestServer::acceptLoop() {
     auto entry = std::make_shared<ClientThread>();
     std::thread worker([this, client, entry]() {
       handleConnection(client);
+      bool closeClient = false;
       {
-        // Remove the socket from the live list and close it under the same
-        // lock. stop() shuts the sockets down while holding this lock, so it
-        // can never act on a descriptor that has already been closed and
-        // possibly reused by a new connection.
+        // Remove the socket from the live list while holding the same lock
+        // stop() uses. If stop() already closed it to interrupt a Winsock
+        // recv, it also removed it and owns the close.
         std::lock_guard<std::mutex> lock(m_clientSocketsMutex);
-        m_clientSockets.erase(
-            std::remove(m_clientSockets.begin(), m_clientSockets.end(), client),
-            m_clientSockets.end());
+        const auto it =
+            std::find(m_clientSockets.begin(), m_clientSockets.end(), client);
+        if (it != m_clientSockets.end()) {
+          m_clientSockets.erase(it);
+          closeClient = true;
+        }
+      }
+      if (closeClient) {
         CLOSESOCKET(nativeSocket(client));
       }
       entry->done.store(true, std::memory_order_release);
