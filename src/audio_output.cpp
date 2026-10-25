@@ -311,6 +311,14 @@ void AudioOutput::clearSpeakerQueueLocked() {
   m_speakerReadPos = 0;
   m_speakerWritePos = 0;
   m_speakerSize = 0;
+  m_speakerPrimed = false;
+}
+
+bool AudioOutput::primeSpeakerQueueLocked(size_t minimumSamples) {
+  if (!m_speakerPrimed && m_speakerSize >= minimumSamples) {
+    m_speakerPrimed = true;
+  }
+  return m_speakerPrimed;
 }
 
 void AudioOutput::logSpeakerOverflow(const char *backendLabel,
@@ -341,6 +349,18 @@ void AudioOutput::pushSpeakerSamples(const float *left, const float *right,
   if (!left || !right || numSamples == 0 || m_speakerRing.empty()) {
     return;
   }
+#ifdef FM_TUNER_HAS_COREAUDIO
+  if (m_verboseLogging) {
+    const uint32_t count =
+        m_coreAudioUnderflowCount.load(std::memory_order_relaxed);
+    const uint32_t reported = m_coreAudioReportedUnderflowCount.exchange(
+        count, std::memory_order_relaxed);
+    if (count != reported && (count <= 5 || (count % 50) == 0)) {
+      std::cerr << "[AUDIO] CoreAudio underrun (" << count
+                << "); rebuffering 200 ms\n";
+    }
+  }
+#endif
   const size_t incomingSamples = numSamples * CHANNELS;
   const size_t capacity = m_speakerRing.size();
   size_t startSample = 0;
@@ -436,8 +456,20 @@ OSStatus AudioOutput::coreAudioRenderCallback(void *inRefCon,
   }
 
   std::lock_guard<std::mutex> lock(self->m_speakerMutex);
-  const size_t samplePairs = std::min(self->m_speakerSize / 2,
-                                      static_cast<size_t>(inNumberFrames));
+  if (!self->primeSpeakerQueueLocked(kCoreAudioPrebufferSamples)) {
+    for (size_t i = 0; i < static_cast<size_t>(inNumberFrames); i++) {
+      if (outB) {
+        outA[i] = 0.0f;
+        outB[i] = 0.0f;
+      } else {
+        outA[i * 2] = 0.0f;
+        outA[i * 2 + 1] = 0.0f;
+      }
+    }
+    return noErr;
+  }
+  const size_t samplePairs =
+      std::min(self->m_speakerSize / 2, static_cast<size_t>(inNumberFrames));
   for (size_t i = 0; i < samplePairs; i++) {
     const float l = self->m_speakerRing[self->m_speakerReadPos];
     self->m_speakerReadPos =
@@ -463,6 +495,10 @@ OSStatus AudioOutput::coreAudioRenderCallback(void *inRefCon,
     }
   }
   self->m_speakerSize -= samplePairs * 2;
+  if (samplePairs < static_cast<size_t>(inNumberFrames)) {
+    self->m_speakerPrimed = false;
+    self->m_coreAudioUnderflowCount.fetch_add(1, std::memory_order_relaxed);
+  }
   return noErr;
 }
 #endif
@@ -826,14 +862,14 @@ void AudioOutput::runWinMMOutputThread() {
 AudioOutput::AudioOutput()
     : m_enableSpeaker(false), m_wavHandle(nullptr), m_running(false),
       m_wavThreadRunning(false), m_wavFatalError(false), m_wavDataSize(0),
-      m_verboseLogging(true),
-      m_requestedVolumePercent(kMaxVolumePercent),
+      m_verboseLogging(true), m_requestedVolumePercent(kMaxVolumePercent),
       m_currentVolumeScale(kDefaultVolumeScale), m_speakerReadPos(0),
-      m_speakerWritePos(0), m_speakerSize(0), m_wavReadPos(0), m_wavWritePos(0),
-      m_wavSize(0)
+      m_speakerWritePos(0), m_speakerSize(0), m_speakerPrimed(false),
+      m_wavReadPos(0), m_wavWritePos(0), m_wavSize(0)
 #ifdef FM_TUNER_HAS_COREAUDIO
       ,
-      m_audioUnit(nullptr)
+      m_audioUnit(nullptr), m_coreAudioUnderflowCount(0),
+      m_coreAudioReportedUnderflowCount(0)
 #endif
 #ifdef FM_TUNER_HAS_WINMM
       ,
@@ -857,7 +893,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
   // The device selector is consumed by whichever native backend this build
   // has. A build with no backend (and the unit-test build, which compiles
   // this file without one) has no consumer for it.
-#if !defined(FM_TUNER_HAS_COREAUDIO) && !defined(FM_TUNER_HAS_ALSA) &&      \
+#if !defined(FM_TUNER_HAS_COREAUDIO) && !defined(FM_TUNER_HAS_ALSA) &&         \
     !defined(FM_TUNER_HAS_WINMM)
   (void)deviceSelector;
 #endif
@@ -1014,9 +1050,9 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
       return false;
     }
 
-    const MMRESULT wr = waveOutOpen(
-        &m_waveOut, openId, &fmt,
-        reinterpret_cast<DWORD_PTR>(m_winmmEvent), 0, CALLBACK_EVENT);
+    const MMRESULT wr = waveOutOpen(&m_waveOut, openId, &fmt,
+                                    reinterpret_cast<DWORD_PTR>(m_winmmEvent),
+                                    0, CALLBACK_EVENT);
     if (wr != MMSYSERR_NOERROR || !m_waveOut) {
       std::cerr << "WinMM open failed: " << wr << "\n";
       CloseHandle(m_winmmEvent);
@@ -1140,20 +1176,19 @@ bool AudioOutput::writeWAVHeader() {
     return false;
   }
 
-  const bool ok =
-      fwrite("RIFF", 1, 4, m_wavHandle) == 4 &&
-      fwrite(&fileSize, 4, 1, m_wavHandle) == 1 &&
-      fwrite("WAVE", 1, 4, m_wavHandle) == 4 &&
-      fwrite("fmt ", 1, 4, m_wavHandle) == 4 &&
-      fwrite(&fmtSize, 4, 1, m_wavHandle) == 1 &&
-      fwrite(&audioFormat, 2, 1, m_wavHandle) == 1 &&
-      fwrite(&numChannels, 2, 1, m_wavHandle) == 1 &&
-      fwrite(&sampleRate, 4, 1, m_wavHandle) == 1 &&
-      fwrite(&byteRate, 4, 1, m_wavHandle) == 1 &&
-      fwrite(&blockAlign, 2, 1, m_wavHandle) == 1 &&
-      fwrite(&bitsPerSample, 2, 1, m_wavHandle) == 1 &&
-      fwrite("data", 1, 4, m_wavHandle) == 4 &&
-      fwrite(&dataSize, 4, 1, m_wavHandle) == 1;
+  const bool ok = fwrite("RIFF", 1, 4, m_wavHandle) == 4 &&
+                  fwrite(&fileSize, 4, 1, m_wavHandle) == 1 &&
+                  fwrite("WAVE", 1, 4, m_wavHandle) == 4 &&
+                  fwrite("fmt ", 1, 4, m_wavHandle) == 4 &&
+                  fwrite(&fmtSize, 4, 1, m_wavHandle) == 1 &&
+                  fwrite(&audioFormat, 2, 1, m_wavHandle) == 1 &&
+                  fwrite(&numChannels, 2, 1, m_wavHandle) == 1 &&
+                  fwrite(&sampleRate, 4, 1, m_wavHandle) == 1 &&
+                  fwrite(&byteRate, 4, 1, m_wavHandle) == 1 &&
+                  fwrite(&blockAlign, 2, 1, m_wavHandle) == 1 &&
+                  fwrite(&bitsPerSample, 2, 1, m_wavHandle) == 1 &&
+                  fwrite("data", 1, 4, m_wavHandle) == 4 &&
+                  fwrite(&dataSize, 4, 1, m_wavHandle) == 1;
   if (!ok && m_verboseLogging) {
     std::cerr << "[AUDIO] failed to write WAV header\n";
   }

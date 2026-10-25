@@ -16,8 +16,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
 #include <mmsystem.h>
+#include <windows.h>
 #elif defined(__linux__)
 #if defined(FM_TUNER_HAS_ALSA)
 #include <alsa/asoundlib.h>
@@ -43,6 +43,10 @@ public:
   // steady-state latency.
   static constexpr size_t kSpeakerQueueSamples =
       static_cast<size_t>(SAMPLE_RATE) * CHANNELS * 2;
+  // CoreAudio pulls continuously on a real-time thread. Keep 200 ms queued so
+  // short RTL-SDR control/USB stalls do not become gaps in the speaker stream.
+  static constexpr size_t kCoreAudioPrebufferSamples =
+      (static_cast<size_t>(SAMPLE_RATE) * CHANNELS) / 5;
   static constexpr size_t kWavQueueSamples =
       static_cast<size_t>(SAMPLE_RATE) * CHANNELS * 2;
   static constexpr float kVolumeEpsilon = 1e-6f;
@@ -68,11 +72,13 @@ private:
   void runWavWriterThread();
   void runAlsaOutputThread();
   void clearSpeakerQueueLocked();
+  bool primeSpeakerQueueLocked(size_t minimumSamples);
   void logSpeakerOverflow(const char *backendLabel, uint32_t count) const;
-  void pushSpeakerSamples(const float *left, const float *right, size_t numSamples,
-                         const char *backendLabel);
+  void pushSpeakerSamples(const float *left, const float *right,
+                          size_t numSamples, const char *backendLabel);
   size_t popSpeakerSamplesLocked(float *dest, size_t maxSamples);
-  bool enqueueWavSamples(const float *left, const float *right, size_t numSamples);
+  bool enqueueWavSamples(const float *left, const float *right,
+                         size_t numSamples);
   static bool listAlsaDevices();
 #if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
   static bool listCoreAudioDevices();
@@ -110,6 +116,7 @@ private:
   size_t m_speakerReadPos;
   size_t m_speakerWritePos;
   size_t m_speakerSize;
+  bool m_speakerPrimed;
   std::mutex m_wavMutex;
   std::condition_variable m_wavCv;
   std::vector<int16_t> m_wavRing;
@@ -120,6 +127,8 @@ private:
 
 #if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
   AudioUnit m_audioUnit;
+  std::atomic<uint32_t> m_coreAudioUnderflowCount;
+  std::atomic<uint32_t> m_coreAudioReportedUnderflowCount;
 #endif
 
 #if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)

@@ -656,10 +656,12 @@ A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; no
 - Default startup frequency is `87500 kHz` (EU bottom of band — unlikely to hit a strong local on first run).
 - Audio output sample rate is fixed at `48000 Hz`.
 - Device/buffer latency is backend-specific (Core Audio / ALSA / WinMM). The
-  Windows WinMM output is event-driven (`CALLBACK_EVENT`, ~170 ms of device
-  buffering). If you ever see `[AUDIO] WinMM output can't keep up with 48 kHz`,
-  the selected device/driver can't sustain the stream — switch to the system
-  default device (`-d` / `[audio] device`).
+  macOS CoreAudio path keeps a 200 ms playback reserve to absorb short SDR
+  control/USB stalls; after an underrun it rebuilds that reserve before
+  resuming. Windows WinMM is event-driven (`CALLBACK_EVENT`, ~170 ms of device
+  buffering). If you ever see `[AUDIO] CoreAudio underrun` or `[AUDIO] WinMM
+  output can't keep up with 48 kHz`, the selected device/driver could not
+  sustain the stream.
 - Diagnostic logging (`[SIG]`, `[ST]`, `[AUDIO]`, …) follows `[debug] log_level`
   in the INI (default on). Override per-run with `-v`/`--verbose` or
   `-q`/`--quiet`. The SDRplay source's own connect trace (`[SDRplay] …`) follows
