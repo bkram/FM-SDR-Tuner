@@ -1120,6 +1120,7 @@ int Application::run() {
       tunerSetFrequency(restoreFreqHz);
     }
     dspRuntime.reset(fm_tuner::dsp::ResetReason::ScanRestore);
+    resetSignalLevelDcTracking();
     retuneMuteSamplesRemaining = kRetuneMuteSamples;
     retuneMuteTotalSamples = kRetuneMuteSamples;
     rdsWorker.requestReset();

@@ -1,4 +1,5 @@
 #include "runtime_loop.h"
+#include "signal_level.h"
 
 #include "auto_gain_policy.h"
 #include "retune_policy.h"
@@ -78,6 +79,9 @@ bool handleControlAndScan(
       applyRtlGainAndAgc("retune/reassert");
       audioOut.clearRealtimeQueue();
       dspRuntime.reset(fm_tuner::dsp::ResetReason::Retune);
+      // The meter tracks the DC offset across blocks; the previous station's
+      // estimate would otherwise linger in the new one's reading.
+      resetSignalLevelDcTracking();
       retuneMuteSamplesRemaining = kRetuneMuteSamples;
       retuneMuteTotalSamples = kRetuneMuteSamples;
       rdsWorker.requestReset();
