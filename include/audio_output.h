@@ -16,8 +16,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <mmsystem.h>
 #include <windows.h>
+#include <mmsystem.h>
 #elif defined(__linux__)
 #if defined(FM_TUNER_HAS_ALSA)
 #include <alsa/asoundlib.h>
