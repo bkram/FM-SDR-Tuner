@@ -55,6 +55,13 @@ private:
   // Removes the front end's static DC offset from one IQ sample.
   std::complex<float> removeIqDc(std::complex<float> sample);
   void resetIqDc();
+  // Feeds one sample to the channel FIR through the IQ history (see
+  // m_iqHistory) and returns the filtered sample.
+  std::complex<float> filterIq(std::complex<float> sample);
+  // Designs the channel FIR and primes it from the IQ history, so a
+  // bandwidth change continues the stream instead of restarting it.
+  void designIqFilter(std::uint32_t length, float cutoffNorm,
+                      float stopBandAtten);
 
   int m_inputRate;
   int m_outputRate;
@@ -73,6 +80,15 @@ private:
   float m_clippingRatio;
   double m_filteredChannelPowerDbfs;
   fm_tuner::dsp::liquid::FIRFilter m_liquidIqFilter;
+  // The channel FIR's recent input. It lets a bandwidth change prime the new
+  // filter with the samples the old one held, and it delays the input of a
+  // shorter filter so every design has the longest one's group delay: the
+  // discriminator output does not jump in time when the bandwidth changes.
+  static constexpr std::size_t kIqHistorySize = 128;
+  static constexpr std::uint32_t kIqFirMaxLength = 121;
+  std::array<std::complex<float>, kIqHistorySize> m_iqHistory{};
+  std::size_t m_iqHistoryPos = 0;
+  std::size_t m_iqFirDelay = 0;
   fm_tuner::dsp::liquid::FreqDemod m_liquidFreqDemod;
   // IQ DC tracker: a running mean whose time constant starts short (20 Hz
   // corner) after a reset and glides to a 0.1 Hz corner. See removeIqDc().

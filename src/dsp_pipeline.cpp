@@ -147,8 +147,10 @@ void DspPipeline::reset() {
 }
 
 void DspPipeline::setBandwidthHz(int bandwidthHz) {
+  // A bandwidth change swaps only the channel filter (FMDemod keeps its
+  // state and its group delay), so the stereo decoder and the AF stage keep
+  // running: resetting them dropped stereo for ~200 ms on every change.
   m_demod.setBandwidthHz(bandwidthHz);
-  m_pendingAudioReset = true;
 }
 
 void DspPipeline::setDeemphasisMode(int deemphasisMode) {

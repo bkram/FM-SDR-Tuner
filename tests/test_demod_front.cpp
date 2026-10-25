@@ -315,3 +315,58 @@ TEST_CASE("IQ DC tracker still removes a static front-end offset",
                     << " dB with a static offset 11 dB below the carrier");
   CHECK(withOffset >= clean - 1.0);
 }
+
+TEST_CASE("Bandwidth change keeps stereo and the programme level",
+          "[dsp][demod][bandwidth]") {
+  // A W command (or adaptive bandwidth) used to reset the whole demodulator
+  // and the stereo decoder: stereo dropped for ~200 ms and the level dipped.
+  Config::ProcessingSection processing;
+  DspPipeline dsp(256000, 48000, processing, false, 8192, 1);
+  FmSource src(256000.0);
+
+  std::vector<uint8_t> iq;
+  DspPipeline::Result out;
+  auto blockRms = [&]() {
+    double acc = 0.0;
+    for (size_t i = 0; i < out.outSamples; i++) {
+      acc += static_cast<double>(out.left[i]) * out.left[i];
+    }
+    return std::sqrt(acc / static_cast<double>(std::max<size_t>(1, out.outSamples)));
+  };
+
+  double priorBlend = 0.0;
+  double priorRms = 0.0;
+  for (int block = 0; block < 90; block++) {
+    src.fill(iq, 8192);
+    dsp.process(iq.data(), 8192, nullptr, out);
+    if (block >= 80) {
+      priorBlend += out.stereoBlend / 10.0;
+      priorRms += blockRms() / 10.0;
+    }
+  }
+  REQUIRE(out.stereoDetected);
+
+  for (int bandwidth : {142000, 194000, 95000}) {
+    dsp.setBandwidthHz(bandwidth);
+    double minBlend = 1.0;
+    double minRms = 1e9;
+    bool stereoHeld = true;
+    for (int block = 0; block < 30; block++) {
+      src.fill(iq, 8192);
+      dsp.process(iq.data(), 8192, nullptr, out);
+      minBlend = std::min(minBlend, static_cast<double>(out.stereoBlend));
+      minRms = std::min(minRms, blockRms());
+      stereoHeld = stereoHeld && out.stereoDetected;
+    }
+    INFO("bandwidth " << bandwidth << ": blend min " << minBlend << " (prior "
+                      << priorBlend << "), rms min " << minRms << " (prior "
+                      << priorRms << ")");
+    CHECK(stereoHeld);
+    CHECK(minBlend >= priorBlend - 0.05);
+    // 95 kHz trims the L-R subcarrier (23-53 kHz) itself, which lowers a
+    // left-only signal for real; the level check is for the wide filters.
+    if (bandwidth >= 142000) {
+      CHECK(20.0 * std::log10(minRms / priorRms) >= -1.0);
+    }
+  }
+}
