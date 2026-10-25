@@ -16,19 +16,16 @@ not retained; consult `git log` and merged PR descriptions for history.
   that owns connect/tune/gain/capabilities — see `src/tuner_session.cpp`
   and `src/tuner_controller.cpp`. Blocks any future Soapy / HackRF / Airspy
   work.
-- **Drop the pilot bandpass FIR (P18)**: `StereoDecoder` runs a 243-tap
-  complex bandpass per sample (fed the **demodulated MPX**, not the raw IQ as
-  an earlier revision of this list said; a 163-tap RDS band FIR was added on
-  top of it since, so the cost is if anything larger than when this item was
-  written) — the biggest remaining
-  hotspot in the post-v1.6.0 profile (`dotprod_crcf_execute_neon4`).
-  Reference
-  implementation in `research/sdr-j-fm/src/fm/pilot-recover.cpp` uses a bare
-  product-detector PLL on the raw MPX float and relies on the loop bandwidth
-  itself to provide the bandpass behavior. Estimated **5-10 pp of one core
-  saved** plus a simpler architecture (no FIR group delay to compensate in
-  the L-R recovery delay line). Trade-off: less out-of-band rejection on the
-  PLL input, must validate on stations with strong adjacent splatter.
+- **Drop the pilot bandpass FIR (P18)**: the CPU case for this is mostly
+  gone. Since `a8c777d` the pilot band (245-tap prototype) and the RDS band
+  (163 taps) run on the band mixed down to DC at 32 kHz, an eighth of their
+  former cost; see `PERFORMANCE.md`. What remains is the simpler
+  architecture: `research/sdr-j-fm/src/fm/pilot-recover.cpp` uses a bare
+  product-detector PLL on the raw MPX and relies on the loop bandwidth for
+  the band-pass, with no FIR group delay to compensate in the L-R delay line.
+  Trade-off: less out-of-band rejection on the PLL input, and the noise-gated
+  stereo detection and pilot SNR depend on the band power the filter
+  measures, so both would need a replacement.
 - **ADC-rail-aware gain policy refusal (P17b)**: the L1 normalization on the
   IQ FIR is wired (`processing.iq_fir_l1_normalize`, default off — see v1.6.2)
   so post-filter envelope can be hard-bounded. Still open: the gain policy
@@ -72,24 +69,13 @@ not retained; consult `git log` and merged PR descriptions for history.
 - **`WSAStartup` without `WSACleanup`** in `xdr_server.cpp` and
   `rtl_tcp_client.cpp`. Process exit reclaims; cosmetic.
 
-## Future CPU work (deferred from v1.6.0)
+## Future CPU work
 
-The v1.6.0 perf pass closed out Tier 1 (atan2 polynomial, gated biquad
-redesign) and Tier 2A/B (pilot bandpass widening, sincos LUT). The Tier 3
-ideas were documented but deferred because the M1 measurement noise
-floor exceeded the expected gain:
-
-- **Block-batched FIR convolution**: replace per-sample push+execute with
-  64-sample blocks so liquid's NEON kernel stays hot. Estimated ~3-5 pp
-  on M1. Significant code change.
-- **Fixed-rate polyphase 256→48 resampler**: liquid's `resamp_rrrf` has
-  per-call ratio handling that a fixed-ratio design can skip. Estimated
-  ~1-2 pp.
-
-(The third idea here, a custom phase accumulator that skips liquid's NCO
-step, is obsolete: the pilot PLL no longer uses liquid's NCO at all — it is
-hand-rolled over a 1024-entry interpolated sin/cos LUT. The per-sample trig
-cost it wanted to remove is already gone.)
+See `PERFORMANCE.md` for the measured profile (x86 and M1) and the options,
+with the expected gain for each: an own SIMD dot-product kernel, a two-stage
+audio resampler, building liquid-dsp with SIMD, block-batched filtering and a
+fast discriminator `atan2`. The pilot and RDS bands already run at 32 kHz
+(`a8c777d`).
 
 Worth revisiting only if a real CPU-bound deployment (e.g. Raspberry Pi 4)
 needs the headroom — see the README "Running On Low-CPU Devices" section.
@@ -106,7 +92,7 @@ These would catch regressions that current CI can't:
   bound and the post-retune buffer flush are already covered in
   `test_scan_engine`).
 - `WavWriter` / `AudioOutput::writeWAVData` 4 GiB boundary saturation
-  + fatal-error propagation.
+  - fatal-error propagation.
 - Analog-de-emphasis response-reference regression.
 - IF-AGC refusal path under chronic clip (depends on P17b).
 
