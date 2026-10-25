@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -11,6 +12,8 @@
 #undef private
 #include "rds_decoder.h"
 #include "rds_signal.h"
+#include "redsea_port/block_sync.hh"
+#include "redsea_port/group.hh"
 
 namespace {
 
@@ -109,4 +112,83 @@ TEST_CASE("RDS worker recovers quickly after dropping a block on overload",
   // Fed straight across the gap the decoder held a false block sync for
   // about a second, losing ~10 groups.
   REQUIRE(workerClean >= referenceClean - 2);
+}
+
+TEST_CASE("RDS burst correction stands down at a high block error rate",
+          "[rds]") {
+  // Feed the block synchroniser bits directly, with random bit errors, and
+  // count the blocks it reports as corrected but whose data is wrong. The
+  // groups start at bit 0, so a group that ends on a multiple of 104 bits
+  // tells exactly which one was sent; one that does not came from a false
+  // sync and is not counted.
+  struct Result {
+    int correctedRight = 0;
+    int correctedWrong = 0;
+    int blocks = 0;
+  };
+  auto run = [](double bitErrorRate) {
+    const std::vector<rds_signal::Group> sent =
+        rds_signal::makeGroups(3000, 0x2000);
+    std::vector<int> bits = rds_signal::groupsToBits(sent);
+    std::mt19937 rng(7);
+    std::bernoulli_distribution flip(bitErrorRate);
+    for (int &b : bits) {
+      if (flip(rng)) {
+        b ^= 1;
+      }
+    }
+
+    redsea::Options options;
+    options.use_fec = true;
+    redsea::BlockStream stream;
+    stream.init(options);
+
+    Result r;
+    size_t pushed = 0;
+    for (int bit : bits) {
+      stream.pushBit(bit != 0);
+      pushed++;
+      if (!stream.hasGroupReady()) {
+        continue;
+      }
+      const redsea::Group g = stream.popGroup();
+      if (pushed % 104 != 0) {
+        continue;
+      }
+      const size_t index = pushed / 104 - 1;
+      const rds_signal::Group &s = sent[static_cast<size_t>(index)];
+      const uint16_t want[4] = {s.a, s.b, s.c, s.d};
+      const redsea::eBlockNumber num[4] = {redsea::BLOCK1, redsea::BLOCK2,
+                                           redsea::BLOCK3, redsea::BLOCK4};
+      for (int k = 0; k < 4; k++) {
+        r.blocks++;
+        if (!g.has(num[k]) || !g.hadErrors(num[k])) {
+          continue;
+        }
+        if (g.get(num[k]) == want[k]) {
+          r.correctedRight++;
+        } else {
+          r.correctedWrong++;
+        }
+      }
+    }
+    return r;
+  };
+
+  // A good signal (~5% BLER): correction still repairs the odd bad block.
+  const Result good = run(0.002);
+  INFO("good: right " << good.correctedRight << " wrong "
+                      << good.correctedWrong);
+  REQUIRE(good.correctedRight > 50);
+  REQUIRE(good.correctedWrong <= good.correctedRight / 50);
+
+  // A poor signal (~65% and ~75% BLER, well above the 50% gate): a corrected
+  // block must be trusted, so wrong corrections have to stay rare.
+  for (double ber : {0.04, 0.05}) {
+    const Result poor = run(ber);
+    INFO("BER " << ber << ": blocks " << poor.blocks << " right "
+                << poor.correctedRight << " wrong " << poor.correctedWrong);
+    REQUIRE(poor.blocks > 1000);
+    REQUIRE(poor.correctedWrong <= poor.blocks / 500);
+  }
 }

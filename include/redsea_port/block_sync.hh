@@ -70,6 +70,10 @@ class BlockStream {
   Offset expected_offset_{Offset::A};
   bool is_in_sync_{false};
   RunningSum<int, 50> block_error_sum50_;
+  // The same 50-block error history, but not cleared when sync is lost: it
+  // decides whether burst correction is trusted, and a fresh sync on a poor
+  // signal must not start out believing the error rate is zero.
+  RunningSum<int, 50> correction_error_sum50_;
   Options options_{};
   RunningAverage<float, kNumBlerAverageGroups> bler_average_;
   Group current_group_;
