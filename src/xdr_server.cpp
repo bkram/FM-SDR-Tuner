@@ -571,9 +571,19 @@ void XDRServer::updateRDS(uint16_t blockA, uint16_t blockB, uint16_t blockC,
   // PTY/TP/TA/MS bits are in block B. Drop groups where block B had errors to
   // avoid noisy flag flapping in clients.
   if (blockBErr == 0) {
+    // The 3-block "R" line carries the legacy error byte: block B in bits
+    // 0-1, C in bits 2-3, D in bits 4-5 (research/FM-DX-Tuner/src/Controllers/
+    // Tuner/Tuner.cpp:194-197, research/xdr-gtk/src/tuner-callbacks.c:162-164).
+    // `errors` arrives in the 4-block layout (A<<6 | B<<4 | C<<2 | D); sending
+    // it unconverted swapped the B and D flags, so clients dropped groups with
+    // a bad block D as "bad B" and never saw D's own error state.
+    const uint8_t blockCErr = static_cast<uint8_t>((errors >> 2) & 0x03u);
+    const uint8_t blockDErr = static_cast<uint8_t>(errors & 0x03u);
+    const uint8_t legacyErrors = static_cast<uint8_t>(
+        blockBErr | (blockCErr << 2) | (blockDErr << 4));
     char buffer[32];
     std::snprintf(buffer, sizeof(buffer), "R%04X%04X%04X%02X", blockB, blockC,
-                  blockD, errors);
+                  blockD, legacyErrors);
     if (m_rdsQueue.size() >= kMaxRdsQueue) {
       m_rdsQueue.pop_front();
     }

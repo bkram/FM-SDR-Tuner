@@ -367,3 +367,29 @@ TEST_CASE("XDR scan start clears a cancel left over from an earlier sweep",
   REQUIRE(xdr.consumeScanStart(cfg));
   REQUIRE_FALSE(xdr.consumeScanCancel());
 }
+
+TEST_CASE("XDR R line carries the legacy error byte layout", "[xdr_unit]") {
+  XDRServer xdr;
+  xdr.setVerboseLogging(false);
+
+  // The decoder reports errors as A<<6 | B<<4 | C<<2 | D. The 3-block R line
+  // must carry B in bits 0-1, C in bits 2-3 and D in bits 4-5, the layout the
+  // FM-DX-Tuner firmware sends and xdr-gtk's legacy parser expects.
+  xdr.updateRDS(0x1111, 0xAAAA, 0xBBBB, 0xCCCC, 0x03); // D uncorrectable
+  xdr.updateRDS(0x1111, 0xAAAA, 0xBBBB, 0xDDDD, 0x04); // C corrected
+  xdr.updateRDS(0x1111, 0xAAAA, 0xBBBB, 0xEEEE, 0xC1); // A missing, D corrected
+
+  std::vector<std::string> lines;
+  {
+    std::lock_guard<std::mutex> lock(xdr.m_rdsMutex);
+    for (const auto &entry : xdr.m_rdsQueue) {
+      if (!entry.second.empty() && entry.second[0] == 'R') {
+        lines.push_back(entry.second);
+      }
+    }
+  }
+  REQUIRE(lines.size() == 3);
+  REQUIRE(lines[0] == "RAAAABBBBCCCC30");
+  REQUIRE(lines[1] == "RAAAABBBBDDDD04");
+  REQUIRE(lines[2] == "RAAAABBBBEEEE10");
+}
