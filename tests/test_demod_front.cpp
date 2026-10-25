@@ -40,6 +40,8 @@ struct FmSource {
   bool stereo = true;
   double rds = 0.0;
   double noise = 0.0;
+  // A static front-end DC offset, added to every IQ sample.
+  std::complex<double> dc{0.0, 0.0};
 
   double t = 0.0;
   double phase = 0.0;
@@ -69,7 +71,7 @@ struct FmSource {
       phase -= 2.0 * kPi;
     }
     t += 1.0 / fs;
-    return std::polar(amp, phase) +
+    return std::polar(amp, phase) + dc +
            std::complex<double>(noise * gauss(rng), noise * gauss(rng));
   }
 
@@ -210,4 +212,106 @@ TEST_CASE("Mono audio path de-emphasis follows the analog curve",
       CHECK(std::abs(measured - expected) <= 0.25);
     }
   }
+}
+
+TEST_CASE("IQ DC blocker leaves a carrier a few hertz off centre intact",
+          "[dsp][demod][dc]") {
+  // A station tuned within ~20 Hz of the centre used to be notched by the
+  // 20 Hz DC blocker: an unmodulated carrier became full-scale discriminator
+  // noise, and a modulated one was distorted.
+  auto run = [](double offsetHz, double toneLevel) {
+    FMDemod demod(256000, 48000);
+    FmSource src(256000.0);
+    src.pilot = false;
+    src.stereo = false;
+    src.offsetHz = offsetHz;
+    src.left = toneLevel;
+    src.right = toneLevel;
+    // The unmodulated runs get ~31 dB carrier-to-noise: a notched carrier
+    // drops into the noise, which the discriminator turns into hiss. (Without
+    // noise the discriminator ignores the carrier's amplitude.) The modulated
+    // runs stay clean so the distortion check is not masked by hiss.
+    src.noise = (toneLevel == 0.0) ? 0.01 : 0.0;
+    std::vector<uint8_t> iq;
+    std::vector<float> demodOut(8192);
+    std::vector<float> collected;
+    // 1.6 s settle, then 0.5 s measured.
+    for (int block = 0; block < 66; block++) {
+      src.fill(iq, 8192);
+      demod.processNoDownsample(iq.data(), demodOut.data(), 8192);
+      if (block >= 50) {
+        collected.insert(collected.end(), demodOut.begin(), demodOut.end());
+      }
+    }
+    return collected;
+  };
+
+  const auto refTone = run(1000.0, 0.1);
+  const double refLevel = toneDb(refTone, 1000.0, 256000.0);
+  const double refClean = toneToRestDb(refTone, 1000.0, 256000.0);
+
+  auto residualRms = [](const std::vector<float> &x) {
+    double mean = 0.0;
+    for (float v : x) {
+      mean += v;
+    }
+    mean /= static_cast<double>(x.size());
+    double acc = 0.0;
+    for (float v : x) {
+      acc += (v - mean) * (v - mean);
+    }
+    return std::sqrt(acc / static_cast<double>(x.size()));
+  };
+  const double refSilence = residualRms(run(1000.0, 0.0));
+
+  for (double offset : {2.0, 5.0, 20.0}) {
+    const auto tone = run(offset, 0.1);
+    const double level = toneDb(tone, 1000.0, 256000.0);
+    const double clean = toneToRestDb(tone, 1000.0, 256000.0);
+    INFO("offset " << offset << " Hz: tone " << level << " dB (ref "
+                   << refLevel << "), tone/rest " << clean << " dB (ref "
+                   << refClean << ")");
+    CHECK(std::abs(level - refLevel) <= 0.3);
+    CHECK(clean >= refClean - 3.0);
+
+    const double silence = residualRms(run(offset, 0.0));
+    INFO("unmodulated carrier residual " << silence << " (ref " << refSilence
+                                         << ")");
+    CHECK(silence <= 2.0 * refSilence);
+  }
+}
+
+TEST_CASE("IQ DC tracker still removes a static front-end offset",
+          "[dsp][demod][dc]") {
+  // The slow tracker must still take out the RTL's static DC offset, which
+  // sits on top of the carrier and distorts the discriminator. It starts at
+  // the old fast corner after a reset, so the offset is gone well inside the
+  // retune mute.
+  auto run = [](std::complex<double> dc) {
+    FMDemod demod(256000, 48000);
+    FmSource src(256000.0);
+    src.pilot = false;
+    src.stereo = false;
+    src.offsetHz = 1000.0;
+    src.amp = 0.2;
+    src.left = 0.1;
+    src.right = 0.1;
+    src.dc = dc;
+    std::vector<uint8_t> iq;
+    std::vector<float> demodOut(8192);
+    std::vector<float> collected;
+    for (int block = 0; block < 40; block++) {
+      src.fill(iq, 8192);
+      demod.processNoDownsample(iq.data(), demodOut.data(), 8192);
+      if (block >= 24) {
+        collected.insert(collected.end(), demodOut.begin(), demodOut.end());
+      }
+    }
+    return toneToRestDb(collected, 1000.0, 256000.0);
+  };
+  const double clean = run({0.0, 0.0});
+  const double withOffset = run({0.06, -0.04});
+  INFO("tone/rest " << clean << " dB clean, " << withOffset
+                    << " dB with a static offset 11 dB below the carrier");
+  CHECK(withOffset >= clean - 1.0);
 }

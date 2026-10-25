@@ -9,6 +9,10 @@
 #include <limits>
 
 namespace {
+// Starting step of the IQ DC tracker: a 20 Hz corner at 256 kHz, the corner
+// the former fixed DC blocker used throughout.
+constexpr double kIqDcAlphaFast = 0.0005;
+
 constexpr std::array<int, 30> kXdrFmBwHz = {
     309000, 298000, 281000, 263000, 246000, 229000, 211000, 194000,
     177000, 159000, 142000, 125000, 108000, 95000,  90000,  83000,
@@ -36,8 +40,16 @@ FMDemod::FMDemod(int inputRate, int outputRate)
   const float iqCutoffNorm =
       std::clamp(110000.0f / static_cast<float>(m_inputRate), 0.01f, 0.45f);
   m_liquidIqFilter.init(81, iqCutoffNorm, 60.0f, 0.0f, m_iqFirL1Normalize);
-  m_liquidIqDcBlockI.initDCBlocker(0.0005f);
-  m_liquidIqDcBlockQ.initDCBlocker(0.0005f);
+  // The IQ DC tracker settles to a 0.1 Hz corner over the first half second
+  // after a reset (see removeIqDc()).
+  constexpr double kIqDcSlowCornerHz = 0.1;
+  constexpr double kIqDcGlideSeconds = 0.5;
+  m_iqDcAlphaSlow = 2.0 * 3.14159265358979323846 * kIqDcSlowCornerHz /
+                    static_cast<double>(m_inputRate);
+  m_iqDcAlphaDecay =
+      std::pow(m_iqDcAlphaSlow / kIqDcAlphaFast,
+               1.0 / (kIqDcGlideSeconds * static_cast<double>(m_inputRate)));
+  resetIqDc();
   const float ratio =
       static_cast<float>(m_outputRate) / static_cast<float>(m_inputRate);
   // The mono path (stereo = false) feeds the raw multiplex - pilot 19 kHz,
@@ -100,8 +112,7 @@ void FMDemod::reset() {
   m_filteredChannelPowerDbfs = -120.0;
   m_liquidIqFilter.reset();
   m_liquidFreqDemod.reset();
-  m_liquidIqDcBlockI.reset();
-  m_liquidIqDcBlockQ.reset();
+  resetIqDc();
   if (m_deemphasisEnabled) {
     m_liquidMonoDeemphasis.reset();
   }
@@ -215,12 +226,10 @@ void FMDemod::demodulate(const uint8_t *iq, float *audio, size_t len) {
       clipCount++;
     }
 
-    const float iRaw = kIqNorm[iByte];
-    const float qRaw = kIqNorm[qByte];
-    const float iDc = m_liquidIqDcBlockI.execute(iRaw);
-    const float qDc = m_liquidIqDcBlockQ.execute(qRaw);
+    const std::complex<float> iqDc =
+        removeIqDc(std::complex<float>(kIqNorm[iByte], kIqNorm[qByte]));
 
-    m_liquidIqFilter.push(std::complex<float>(iDc, qDc));
+    m_liquidIqFilter.push(iqDc);
     std::complex<float> iqFiltered = m_liquidIqFilter.execute();
     powerSum += static_cast<double>(iqFiltered.real()) * iqFiltered.real() +
                 static_cast<double>(iqFiltered.imag()) * iqFiltered.imag();
@@ -261,10 +270,7 @@ void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
       clipCount++;
     }
 
-    const float iDc = m_liquidIqDcBlockI.execute(iRaw);
-    const float qDc = m_liquidIqDcBlockQ.execute(qRaw);
-
-    m_liquidIqFilter.push(std::complex<float>(iDc, qDc));
+    m_liquidIqFilter.push(removeIqDc(iq[i]));
     std::complex<float> iqFiltered = m_liquidIqFilter.execute();
     powerSum += static_cast<double>(iqFiltered.real()) * iqFiltered.real() +
                 static_cast<double>(iqFiltered.imag()) * iqFiltered.imag();
@@ -287,6 +293,29 @@ void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
                          std::log10((powerSum / static_cast<double>(len)) +
                                     1e-20))
           : -120.0;
+}
+
+void FMDemod::resetIqDc() {
+  m_iqDcMean = {0.0, 0.0};
+  m_iqDcAlpha = kIqDcAlphaFast;
+}
+
+std::complex<float> FMDemod::removeIqDc(std::complex<float> sample) {
+  // The station is tuned to the centre of the band, so the front end's DC
+  // offset sits on top of the carrier. A fixed 20 Hz DC blocker also removed
+  // a carrier tuned within ~20 Hz of the centre: on a quiet passage an
+  // unmodulated carrier became discriminator noise, and a modulated one was
+  // distorted. The offset itself is static, so after a reset the tracker
+  // starts at the old 20 Hz corner (the offset is gone within milliseconds
+  // of a retune) and then glides to a 0.1 Hz corner in half a second, which
+  // leaves a carrier even 2 Hz off centre untouched.
+  const std::complex<double> x(sample.real(), sample.imag());
+  m_iqDcMean += m_iqDcAlpha * (x - m_iqDcMean);
+  if (m_iqDcAlpha > m_iqDcAlphaSlow) {
+    m_iqDcAlpha = std::max(m_iqDcAlphaSlow, m_iqDcAlpha * m_iqDcAlphaDecay);
+  }
+  return {static_cast<float>(x.real() - m_iqDcMean.real()),
+          static_cast<float>(x.imag() - m_iqDcMean.imag())};
 }
 
 float *FMDemod::ensureScratch(size_t numSamples) {

@@ -52,6 +52,9 @@ private:
                          size_t len);
   // Returns the demodulator's scratch buffer, grown to numSamples if needed.
   float *ensureScratch(size_t numSamples);
+  // Removes the front end's static DC offset from one IQ sample.
+  std::complex<float> removeIqDc(std::complex<float> sample);
+  void resetIqDc();
 
   int m_inputRate;
   int m_outputRate;
@@ -71,8 +74,12 @@ private:
   double m_filteredChannelPowerDbfs;
   fm_tuner::dsp::liquid::FIRFilter m_liquidIqFilter;
   fm_tuner::dsp::liquid::FreqDemod m_liquidFreqDemod;
-  fm_tuner::dsp::liquid::IIRFilterReal m_liquidIqDcBlockI;
-  fm_tuner::dsp::liquid::IIRFilterReal m_liquidIqDcBlockQ;
+  // IQ DC tracker: a running mean whose time constant starts short (20 Hz
+  // corner) after a reset and glides to a 0.1 Hz corner. See removeIqDc().
+  std::complex<double> m_iqDcMean{0.0, 0.0};
+  double m_iqDcAlpha = 0.0;
+  double m_iqDcAlphaSlow = 0.0;
+  double m_iqDcAlphaDecay = 1.0;
   fm_tuner::dsp::liquid::IIRFilterReal m_liquidMonoDeemphasis;
   fm_tuner::dsp::liquid::IIRFilterReal m_liquidMonoDcBlock;
   fm_tuner::dsp::liquid::Resampler m_liquidMonoResampler;
