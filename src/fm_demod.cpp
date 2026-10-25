@@ -40,7 +40,21 @@ FMDemod::FMDemod(int inputRate, int outputRate)
   m_liquidIqDcBlockQ.initDCBlocker(0.0005f);
   const float ratio =
       static_cast<float>(m_outputRate) / static_cast<float>(m_inputRate);
-  m_liquidMonoResampler.init(ratio);
+  // The mono path (stereo = false) feeds the raw multiplex - pilot 19 kHz,
+  // L-R subcarrier 23-53 kHz, RDS 57 kHz - into this resampler, so it is also
+  // the audio anti-alias filter. liquid's default cutoff does not band-limit a
+  // 5.33x downsample at all: the L-R sidebands folded to 9-11 kHz and the
+  // pilot passed at full level. The filter is flat to 15 kHz and rejects the
+  // pilot by 78 dB and everything above it by 90 dB. It is computed only at
+  // the output rate, so the long filter costs ~15 M multiply-adds a second.
+  constexpr float kMonoAudioCutoffHz = 17000.0f;
+  constexpr std::uint32_t kMonoResampHalfLen = 160;
+  constexpr float kMonoResampStopBandDb = 80.0f;
+  constexpr std::uint32_t kMonoResampPolyphase = 64;
+  const float monoCutoffNorm = std::min(
+      0.45f, kMonoAudioCutoffHz / static_cast<float>(m_inputRate));
+  m_liquidMonoResampler.init(ratio, kMonoResampHalfLen, monoCutoffNorm,
+                             kMonoResampStopBandDb, kMonoResampPolyphase);
   m_liquidMonoDcBlock.initDCBlocker(0.0008f);
   setDeviation(75000.0);
   setDeemphasis(50);
@@ -58,12 +72,17 @@ void FMDemod::setDeemphasis(int tau_us) {
     return;
   }
   m_deemphasisEnabled = true;
+  // Pre-warped bilinear one-pole (the AF stage's design), run at the input
+  // rate ahead of the resampler. At 256 kHz the bilinear transform's
+  // frequency warping is negligible across the audio band, so the response
+  // tracks the analog RC curve to within 0.1 dB up to 15 kHz. The former
+  // Euler one-pole at 48 kHz was 0.7-1.0 dB low from 3 to 10 kHz.
   const float tau = static_cast<float>(tau_us) * 1e-6f;
-  const float dt = 1.0f / static_cast<float>(m_outputRate);
-  const float alpha = dt / (tau + dt);
-  const std::vector<float> b = {alpha};
-  const std::vector<float> a = {1.0f, -(1.0f - alpha)};
-  m_liquidMonoDeemphasis.init(b, a);
+  const float fs = static_cast<float>(m_inputRate);
+  const float wpp = std::tan(1.0f / (2.0f * fs * tau));
+  const float b0 = wpp / (wpp + 1.0f);
+  const float a1 = (wpp - 1.0f) / (wpp + 1.0f);
+  m_liquidMonoDeemphasis.init({b0, b0}, {1.0f, a1});
 }
 
 void FMDemod::setDeviation(double deviation) {
@@ -286,15 +305,13 @@ size_t FMDemod::downsampleAudio(const float *demod, float *audio,
                                 size_t numSamples) {
   size_t outCount = 0;
   for (size_t i = 0; i < numSamples; i++) {
+    const float in = m_deemphasisEnabled
+                         ? m_liquidMonoDeemphasis.execute(demod[i])
+                         : demod[i];
     const uint32_t produced =
-        m_liquidMonoResampler.execute(demod[i], m_liquidResampleTmp);
+        m_liquidMonoResampler.execute(in, m_liquidResampleTmp);
     for (uint32_t p = 0; p < produced; p++) {
-      float sample = m_liquidResampleTmp[p];
-      if (m_deemphasisEnabled) {
-        sample = m_liquidMonoDeemphasis.execute(sample);
-      }
-      sample = m_liquidMonoDcBlock.execute(sample);
-      audio[outCount++] = sample;
+      audio[outCount++] = m_liquidMonoDcBlock.execute(m_liquidResampleTmp[p]);
     }
   }
   return outCount;

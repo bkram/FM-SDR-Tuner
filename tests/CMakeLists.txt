@@ -85,6 +85,30 @@ else()
     target_link_libraries(test_dsp_chain PRIVATE ${LIQUID_LIBRARIES})
 endif()
 
+add_executable(test_demod_front test_demod_front.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/dsp/liquid_primitives.cpp
+    ${CMAKE_SOURCE_DIR}/src/dsp/multipath_eq.cpp
+    ${CMAKE_SOURCE_DIR}/src/dsp_pipeline.cpp
+    ${CMAKE_SOURCE_DIR}/src/fm_demod.cpp
+    ${CMAKE_SOURCE_DIR}/src/stereo_decoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/af_post_processor.cpp
+)
+target_include_directories(test_demod_front PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_demod_front PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+    Threads::Threads
+)
+if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
+    target_link_libraries(test_demod_front PRIVATE PkgConfig::PC_LIQUID)
+else()
+    target_include_directories(test_demod_front PRIVATE ${LIQUID_INCLUDE_DIRS})
+    target_link_libraries(test_demod_front PRIVATE ${LIQUID_LIBRARIES})
+endif()
+
 add_executable(test_runtime test_runtime.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/dsp/liquid_primitives.cpp
@@ -430,6 +454,7 @@ add_test(NAME rds COMMAND test_rds)
 add_test(NAME config COMMAND test_config)
 add_test(NAME app_options COMMAND test_app_options)
 add_test(NAME dsp_chain COMMAND test_dsp_chain)
+add_test(NAME demod_front COMMAND test_demod_front)
 add_test(NAME adaptive_bandwidth COMMAND test_adaptive_bandwidth)
 add_test(NAME auto_gain COMMAND test_auto_gain)
 add_test(NAME retune_policy COMMAND test_retune_policy)
