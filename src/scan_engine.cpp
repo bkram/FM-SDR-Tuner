@@ -557,10 +557,18 @@ bool ScanEngine::runIfActive(
   // Fallback for uncovered fine points so the client receives complete scan
   // lines. Batch contiguous uncovered points into the largest span one
   // retune can cover, instead of retuning once per missing point.
-  for (int n = 0; n < fineCount;) {
+  //
+  // A cancelled or aborted sweep skips the fallback: after an early cancel
+  // nearly every fine point is uncovered, and filling them in would keep the
+  // tuner off the listener's station for many seconds after the cancel.
+  for (int n = 0; m_active && n < fineCount;) {
     if (std::isfinite(bandPowerByFine[static_cast<size_t>(n)])) {
       n++;
       continue;
+    }
+    if (!shouldRun() || xdrServer.consumeScanCancel()) {
+      m_active = false;
+      break;
     }
 
     const int batchStart = n;
