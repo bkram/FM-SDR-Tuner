@@ -1,5 +1,7 @@
 #include "wav_writer.h"
 
+#include "dsp/mpx_resampler.h"
+
 #include "wav_limits.h"
 
 #include <algorithm>
@@ -62,7 +64,8 @@ bool WavWriter::init(const std::string &filename, uint32_t sampleRate,
     const float ratio =
         static_cast<float>(sampleRate) / static_cast<float>(resampleFromHz);
     try {
-      m_resampler.init(ratio);
+      fm_tuner::dsp::initMpxResampler(m_resampler, resampleFromHz,
+                                      sampleRate);
       m_resampleEnabled = true;
       if (m_verboseLogging) {
         std::cout << "[AUDIO] " << m_label << " resample "

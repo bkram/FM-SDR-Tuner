@@ -241,3 +241,54 @@ TEST_CASE("WavWriter refuses a write that would cross the 4 GiB limit",
   writer.shutdown();
   std::remove(path.c_str());
 }
+
+TEST_CASE("WavWriter band-limits MPX before resampling it down",
+          "[wav_writer][mpx_resample]") {
+  // 256 kHz in, 192 kHz out: a 110 kHz component lies above the output's
+  // 96 kHz Nyquist rate and must be filtered out, not folded down to 82 kHz.
+  // With liquid's default resampler it came out at -0.9 dB.
+  const std::string path = "test_mpx_bandlimit.wav";
+  std::remove(path.c_str());
+
+  constexpr uint32_t kInputRate = 256000;
+  constexpr uint32_t kTargetRate = 192000;
+  constexpr size_t kInputSamples = kInputRate; // 1 s
+  constexpr float kAmplitude = 0.30f;
+
+  WavWriter writer;
+  REQUIRE(writer.init(path, kTargetRate, 1, false, "MPX WAV", kInputRate));
+  constexpr double kTwoPi = 6.283185307179586;
+  std::vector<float> input(kInputSamples);
+  for (size_t i = 0; i < kInputSamples; i++) {
+    input[i] = kAmplitude *
+               static_cast<float>(std::sin(kTwoPi * 110000.0 *
+                                           static_cast<double>(i) / kInputRate));
+  }
+  for (size_t off = 0; off < kInputSamples; off += 8192) {
+    REQUIRE(writer.enqueueMonoFloat(input.data() + off,
+                                    std::min<size_t>(8192, kInputSamples - off)));
+  }
+  writer.shutdown();
+
+  std::ifstream f(path, std::ios::binary);
+  REQUIRE(f.good());
+  const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                                   std::istreambuf_iterator<char>());
+  REQUIRE(bytes.size() > 44);
+  const size_t numOut = readLe32(bytes, 40) / sizeof(int16_t);
+  const size_t skip = kTargetRate / 10;
+  REQUIRE(numOut > skip + kTargetRate / 2);
+  double acc = 0.0;
+  for (size_t i = skip; i < numOut; i++) {
+    const int16_t s =
+        static_cast<int16_t>(bytes[44 + i * 2] | (bytes[44 + i * 2 + 1] << 8));
+    const double v = static_cast<double>(s) / 32768.0;
+    acc += v * v;
+  }
+  const double rms = std::sqrt(acc / static_cast<double>(numOut - skip));
+  const double aliasDb = 20.0 * std::log10(rms / (kAmplitude / std::sqrt(2.0)) + 1e-12);
+  INFO("110 kHz alias at 82 kHz: " << aliasDb << " dB");
+  REQUIRE(aliasDb < -60.0);
+
+  std::remove(path.c_str());
+}
