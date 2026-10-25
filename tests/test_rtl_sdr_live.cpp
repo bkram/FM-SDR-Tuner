@@ -84,6 +84,11 @@ SignalLevelResult measureFrequencyLevel(RTLSDRDevice& dev, uint32_t freqKHz,
                                         int appliedGainDb) {
   REQUIRE(dev.setFrequency(freqKHz * 1000U));
   std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  // The device ring hands out its oldest samples first, and it holds far
+  // more than the reads below burn: without this flush the measurement is
+  // taken on the frequency tuned before, so the second of two measurements
+  // reported the first one's level.
+  dev.flushBuffers();
 
   // Burn 4 full ring's worth of samples to ensure we're past any residual
   // buffer from the previous tune frequency. Low-latency mode helps but is
