@@ -10,6 +10,53 @@
 
 ---
 
+## Follow-up: live verification and DSP review (2026-10-25)
+
+The fixes above were re-checked on 2026-10-25 against a USB RTL-SDR (R820T),
+and the DSP chain was reviewed with synthetic-signal harnesses. Several fixes
+in this report turned out incomplete, and the DSP review found defects this
+review did not cover. All of them are fixed on `v1.8`, each with a
+regression test that fails on the earlier code.
+
+**Session and protocol** (`bc828ed`, `8e70350`, `364b966`):
+
+- H1 / D9: a guest, even with a wrong password, could cancel the owner's
+  scan with an empty line. Only an authenticated session may cancel now.
+- D6: an FM-DX client with a wrong password started the tuner and left it
+  running. The start now waits for the hash.
+- ed2668f: on FM-DX, the client that started the tuner stopped it under
+  another listener. The tuner is now shared and stops when the last FM-DX
+  client leaves.
+- D8 fix: the "o" line reached clients still in their handshake, which read
+  it as the salt and failed to log in. It now goes to established sessions
+  only.
+- M7: an FM-DX "x" without a newline held a thread. The handshake deadline
+  now runs from connect.
+- A cancel kept the tuner off the station for 10.8 s while the fallback pass
+  ran; it now returns in 0.2 s.
+- xdr-gtk's A and G replay on connect discarded the profile's fixed gain.
+
+**DSP** (`ded2956` to `a8c777d`):
+
+- Stereo separation was 19.6 dB at 1 kHz and about 0 dB at 14 kHz: the pilot
+  band-pass was real-valued and pinned the PLL, and a low-pass stayed on L-R
+  at full blend. It is now 33 dB flat. Noise is no longer flagged as stereo.
+- The RDS error byte on the 3-block R line used the 4-block layout, swapping
+  the B and D flags.
+- Others: the mono path's missing anti-alias filter and de-emphasis error, the
+  DC blocker and meter notching a carrier near the centre, the meter pumping
+  with the programme, the bandwidth change resetting the chain, adaptive
+  bandwidth without hysteresis, fade-mute timing at high IQ rates, the CMA
+  step, the treble loss, the MPX resampling, and RDS recovery after a dropped
+  block and miscorrection at low SNR.
+
+The meter now integrates the whole channel and reads about 10 dB higher; the
+shipped windows moved accordingly (`f16c5c3`). The site profile referred to
+below as `fm-sdr-tuner.ini.site.example` was merged into
+`fm-sdr-tuner.ini.example`. Items still open are listed in `todo.md`.
+
+---
+
 ## Fix status
 
 All findings from the original review have been fixed. Fixes were applied in

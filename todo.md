@@ -1,6 +1,6 @@
 # FM-SDR-Tuner Issues and Improvements
 
-Last verified against current source: 2026-10-22 (on v1.8.0, branch `v1.8`)
+Last verified against current source: 2026-10-25 (on v1.8.0, branch `v1.8`)
 
 This file is a short-form punch list of open work — see `plan.md` for the
 fuller analysis with rationale and validation strategy. Closed tickets are
@@ -29,7 +29,8 @@ not retained; consult `git log` and merged PR descriptions for history.
 - **ADC-rail-aware gain policy refusal (P17b)**: the L1 normalization on the
   IQ FIR is wired (`processing.iq_fir_l1_normalize`, default off — see v1.6.2)
   so post-filter envelope can be hard-bounded. Still open: the gain policy
-  in `src/runtime_loop.cpp` accepts `G01` / `G11` requests that would push
+  accepts `G01` / `G11` requests (parsed in `src/xdr_server.cpp`, applied
+  through `src/xdr_facade.cpp` and `src/application.cpp`) that would push
   the front end into chronic ADC saturation. Add a refusal path that
   reports the chronic-clip ratio back through the XDR meter rather than
   silently mis-representing the level.
@@ -41,19 +42,28 @@ not retained; consult `git log` and merged PR descriptions for history.
 
 ### Medium
 
-- **Adaptive L-R phase alignment (P19)**: replace the current
-  `2·Re(MPX·conj(PLL)²)` L-R recovery (sensitive to pilot phase error) with
-  a Costas-style adaptive separator that drives the cos/sin cross-coupling
-  to zero. Reference: `PerfectStereoSeparation` in
-  `research/sdr-j-fm/src/fm/stereo-separation.cpp` by Thomas Neder. Improves
-  measured stereo separation on stations with marginal pilot quality
-  (where our current chain has 5-10° pilot phase error → ~3% crosstalk).
-  Self-contained ~150 lines; uses the existing pilot PLL as the phase
-  reference and adds a small integrator + LPF + error-witness path.
-- **`m_demodScratch` growth check on every call** (`src/fm_demod.cpp`):
-  reserve-and-reuse strategy can be tightened. Cheap, mechanical, isolated.
-- **`#if defined(...)` vs `#ifdef` style** in `src/audio_output.cpp`.
-  Cosmetic.
+- **Adaptive L-R phase alignment (P19)**: a Costas-style adaptive
+  separator (`PerfectStereoSeparation` in
+  `research/sdr-j-fm/src/fm/stereo-separation.cpp` by Thomas Neder) that
+  drives the cos/sin cross-coupling to zero. Since the pilot filter became
+  analytic, separation is 33 dB flat from 1 to 14 kHz on a clean signal; the
+  remaining limit is that L+R and L-R are aligned only to the nearest whole
+  sample. A fractional-delay alignment, or this separator, is the next step.
+- **rtl_tcp flush byte parity** (`RTLTCPClient::flushBuffers`): the drain
+  discards an arbitrary byte count and the pending half-sample without
+  tracking parity. An odd total would swap I and Q until the next flush,
+  mirroring the spectrum. Not seen in practice (rtl_tcp sends even-sized
+  blocks), but a two-line fix.
+- **SDRplay partial settle drop** (`src/application.cpp`): on a partial
+  drop of the burst after a connect, only the 8-bit buffer is shifted; the
+  complex pointer the demodulator reads still starts at the burst.
+- **REST request bodies over 64 KiB** are silently truncated rather than
+  rejected (`src/rest_server.cpp`).
+- **XDR pilot level** (`N`, `[ST] pilot=`) reads about 21 kHz for a 6.75 kHz
+  pilot. Left unchanged so clients keep displaying the scale they know.
+- **Protocol detection under load**: when 50 clients connect at once, some
+  FM-DX clients are classified as XDR. They are still closed by the XDR
+  handshake limit.
 
 ### Low / cross-cutting
 
@@ -62,12 +72,10 @@ not retained; consult `git log` and merged PR descriptions for history.
   do this partially in `include/dsp/` but most headers are flat. As the
   codebase grows this matters; defer until P5 refactor naturally surfaces
   the grouping.
-- **WinMM socket-handle truncation**: `int m_socket` / `int m_serverSocket`
-  in `rtl_tcp_client.cpp` and `xdr_server.cpp` hold `SOCKET` (UINT_PTR) on
-  Win64. In practice fits in 32 bits and `< 0` check works, but it's a
-  long-standing portability wart.
-- **`WSAStartup` without `WSACleanup`** in `xdr_server.cpp` and
-  `rtl_tcp_client.cpp`. Process exit reclaims; cosmetic.
+- **Meter calibration of the site profile**: the tuned meter integrates the
+  whole 200 kHz channel since v1.8 and reads about 10 dB higher. The shipped
+  window moved from `-43 / -19` to `-33 / -10` by the offset measured on
+  another antenna; confirm it with `--calibrate` on the site's own antenna.
 
 ## Future CPU work
 
@@ -85,16 +93,13 @@ needs the headroom — see the README "Running On Low-CPU Devices" section.
 These would catch regressions that current CI can't:
 
 - ALSA enumeration failure path (`AudioOutput::listAlsaDevices`).
-- Off-thread WAV writer shutdown-flush.
-- High-IQ-rate (`--iq-rate 1024000` / `2048000`) decimation-path
-  behaviour test.
-- Scan FFT plan / buffer reuse across retunes (the fallback retune-count
-  bound and the post-retune buffer flush are already covered in
-  `test_scan_engine`).
-- `WavWriter` / `AudioOutput::writeWAVData` 4 GiB boundary saturation
-  - fatal-error propagation.
-- Analog-de-emphasis response-reference regression.
 - IF-AGC refusal path under chronic clip (depends on P17b).
+- Scan cancel latency: the fallback-pass skip after a cancel is verified on
+  hardware only.
+- `AudioOutput`'s own WAV drain loop (`runWavWriterThread`); the shutdown
+  flush test covers `WavWriter` only.
+- The decimation test uses a clean in-band carrier, so it cannot detect a
+  missing anti-alias filter; it needs an out-of-band interferer.
 
 (`recvLine()` overflow and auth truncation are covered end to end in
 `test_protocol` — oversized XDR and FM-DX lines, oversized handshakes and

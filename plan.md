@@ -1,6 +1,6 @@
 # FM-SDR-Tuner Code Review Plan
 
-Last reviewed against current source: 2026-10-22 (on v1.8.0, branch `v1.8`)
+Last reviewed against current source: 2026-10-25 (on v1.8.0, branch `v1.8`)
 
 ## Scope
 
@@ -41,9 +41,9 @@ This plan focuses on:
 |---|---|---|---|---|---|
 | P5 | Medium | `src/application.cpp` | `Application::run()` still owns session bootstrap, tuner lifecycle, XDR lifecycle, scan restore, mute windows, reconnection flow, and the main processing loop. Makes backend work and future runtime fixes harder than they need to be. | Split into smaller responsibilities: session bootstrap, command/control state application, scan coordinator, main DSP/audio loop. Keep `Application` as the assembly layer. | Behavior-preserving tests around start/stop, reconnect, scan restore, and retune mute. |
 | P6 | High | `src/tuner_controller.cpp`, `src/tuner_session.cpp` | Tuner backend selection is a `SourceKind` switch over `rtl_sdr` / `rtl_tcp` / `sdrplay`. Not a sufficient abstraction for `SoapySDR`. Control surface is scattered between `TunerController`, `TunerSession`, and gain policy. | Backend interface that owns connect/disconnect, tuning, gain/AGC capabilities, sample-rate constraints, and capability queries. Policy in one layer, transport/device specifics in another. | Backend contract tests using a fake backend before adding `SoapySDR`. |
-| P17b | Medium | `src/runtime_loop.cpp` (gain policy) | The IQ FIR L1 normalization landed in v1.6.2 (`processing.iq_fir_l1_normalize`, default off), so post-filter envelope can be hard-bounded. Still open: the gain policy accepts `G01` / `G11` requests that would push the front end into chronic ADC saturation. | Gain policy refuses to enable IF AGC (`G01`/`G11`) when recent `clip` ratio exceeds threshold; log `[GAIN] refusing G01: clip=...` and report the chronic-clip ratio back through the XDR meter rather than silently mis-representing the level. | Gain-policy unit test for the IF-AGC refusal path under a synthetic chronic-clip ratio. |
-| P18 | High | `src/stereo_decoder.cpp` (`m_liquidPilotBandFilter`, `m_delayLine`) | The 243-tap complex bandpass FIR for pilot recovery dominates the post-v1.6.0 profile (`dotprod_crcf_execute_neon4`, ~525 samples = ~10% of one core). It is fed the **demodulated MPX**, not the raw IQ, and a 163-tap RDS band FIR was added alongside it since, so the cost is if anything larger than measured then. `research/sdr-j-fm/src/fm/pilot-recover.cpp` removes the bandpass entirely and relies on the PLL loop bandwidth itself for filtering: `PhaseError = pilot * sin(oscillatorPhase); oscillatorPhase += PhaseError * gain + omega`. The L-R recovery delay line also shortens because there's no FIR group delay to compensate. | Replace `m_liquidPilotBandFilter.push/execute` with a product-detector PLL on the raw MPX float. Reuse `m_liquidPilotPll` for the NCO. Adjust `m_delaySamples` to whatever residual phase compensation the new path needs (likely zero). Keep the lock-detection (`m_pilotConfidence`) path. | Verify lock acquisition time on a clean strong station is within 2× of current. Verify lock holds on the captured `mpx_88600_60s.wav` fixture. Re-baseline real-RF CPU on the same M1 hardware A/B protocol — expect 5-10 pp savings on one core. Listening test for adjacent-channel splatter scenarios (where the bandpass was earning its keep). |
-| P19 | Medium | `src/stereo_decoder.cpp` (L-R recovery block) | Today's L-R recovery `2·Re(MPX·conj(PLL_38k)²)` is sensitive to pilot phase error: a 5° error in the pilot reference rotates the L-R subcarrier by ~10° before demodulation, producing ~3% measurable crosstalk. `research/sdr-j-fm/src/fm/stereo-separation.cpp` (Thomas Neder, 2023) implements `PerfectStereoSeparation`: a Costas-style adaptive separator that drives the cos/sin cross-coupling on the L-R complex baseband to zero. | Add an adaptive phase-shift integrator that sits between the pilot PLL output and the L-R demix multiply: `sinCosPath = sincos(pilotPhase + accPhaseShift) * mux; LPF(sinCosPath); error = real * imag; accPhaseShift += alpha * error`. Lock detector reuses `mean_error < threshold` over a stability window. Bypassed when `m_forceMono` or `m_stereoBlend < threshold`. | Synthetic test feeds MPX with a deliberately-rotated pilot reference and asserts post-convergence crosstalk is ≤ 1/10 of the pre-convergence value. Listening regression against the captured WAV fixture confirms no degradation on clean signals. |
+| P17b | Medium | `src/xdr_server.cpp`, `src/xdr_facade.cpp`, `src/application.cpp` (gain policy) | The IQ FIR L1 normalization landed in v1.6.2 (`processing.iq_fir_l1_normalize`, default off), so post-filter envelope can be hard-bounded. Still open: the gain policy accepts `G01` / `G11` requests that would push the front end into chronic ADC saturation. | Gain policy refuses to enable IF AGC (`G01`/`G11`) when recent `clip` ratio exceeds threshold; log `[GAIN] refusing G01: clip=...` and report the chronic-clip ratio back through the XDR meter rather than silently mis-representing the level. | Gain-policy unit test for the IF-AGC refusal path under a synthetic chronic-clip ratio. |
+| P18 | Low | `src/stereo_decoder.cpp` (`m_pilotBand`, `m_delayLine`) | The CPU case is mostly gone: since `a8c777d` the pilot band (245-tap Kaiser prototype) and the RDS band (163 taps) are filtered on the band mixed down to DC at 32 kHz, an eighth of their former cost (see `PERFORMANCE.md`). `research/sdr-j-fm/src/fm/pilot-recover.cpp` removes the band-pass entirely and relies on the PLL loop bandwidth for filtering, which would also remove the FIR group delay from the L-R delay line. | Only worth doing for the simpler architecture. The noise-gated stereo detection, the pilot SNR that drives the blend, and the pilot deviation reading all use the band power this filter measures, so each needs a replacement. | The separation, clean-pilot and dead-channel tests in `test_dsp_chain`; lock acquisition time within 2× of current; a listening test with strong adjacent splatter, where the band-pass earns its keep. |
+| P19 | Medium | `src/stereo_decoder.cpp` (L-R recovery block) | Since the pilot filter became analytic, separation is 33 dB flat from 1 to 14 kHz on a clean signal. The remaining limit is that L+R and L-R are aligned only to the nearest whole sample (offsets of -1 and +1 give 19 and 6 dB). `research/sdr-j-fm/src/fm/stereo-separation.cpp` (Thomas Neder, 2023) implements `PerfectStereoSeparation`, a Costas-style adaptive separator that drives the cos/sin cross-coupling on the L-R baseband to zero. | Either a fractional-delay alignment of the L+R path, or the adaptive separator between the pilot PLL and the L-R demix: `sinCosPath = sincos(pilotPhase + accPhaseShift) * mux; LPF(sinCosPath); error = real * imag; accPhaseShift += alpha * error`, bypassed when `m_forceMono` or the blend is low. | The separation test in `test_dsp_chain` with a higher threshold; a synthetic test with a deliberately rotated pilot reference asserting post-convergence crosstalk at most 1/10 of the pre-convergence value. |
 
 ## DSP Chain Alignment Review
 
@@ -56,17 +56,20 @@ implementation matches the consensus in all load-bearing respects:
   Radio `quadrature_demod_cf`).
 - Coherent 38 kHz generation by squaring the 19 kHz NCO
   (conjugate-multiply-twice on the delayed MPX).
-- Matched group-delay compensation on the (L+R) path using
-  `(ntaps-1)/2` samples.
+- Matched group-delay compensation on the (L+R) path: the pilot band's
+  `(ntaps-1)/2` samples plus the 8-sample interpolation delay of the 32 kHz
+  band (`a8c777d`).
 - De-emphasis applied exactly once per sample (mono path skipped in
   stereo mode because `processSplit` is called with `monoOut = nullptr`).
-- Bilinear-pre-warped one-pole de-emphasis matching GNU Radio
-  `fm_emph.py`.
+- Bilinear pre-warped one-pole de-emphasis, run at 256 kHz before the
+  resampler on both the stereo and mono paths, within 0.2 dB of the analogue
+  50 and 75 µs curves to 15 kHz.
 - Per-channel independent resampling in `AFPostProcessor::process`.
 - RDS path mirrors redsea: 171 kHz target, `nco_crcf` PLL at 57 kHz,
   `symsync_crcf` RRC β=0.8, BPSK, 5-offset-word block sync.
 - Soft stereo blend driven by pilot coherence / PLL residual / PLL
-  frequency error. Both SDR++ and GNU Radio omit any soft blend;
+  frequency error / pilot SNR, with stereo detection gated on the pilot
+  SNR so noise is never flagged as stereo. Both SDR++ and GNU Radio omit any soft blend;
   retaining this is a deliberate strength.
 - LMS pilot canceller two-tap subtracts the 19 kHz residual from mono
   output; dispersion-form CMA equalizer with leak regularization sits
@@ -77,23 +80,20 @@ implementation matches the consensus in all load-bearing respects:
 These would catch regressions that current CI can't:
 
 1. ALSA enumeration failure path (`AudioOutput::listAlsaDevices`).
-2. Off-thread WAV writer shutdown-flush.
-3. High-IQ-rate decimation-path test (`--iq-rate 1024000` / `2048000`).
-4. Scan FFT plan / buffer reuse across retunes (the fallback retune-count
-   bound and the post-retune buffer flush are already covered in
-   `test_scan_engine`).
-5. `WavWriter` / `AudioOutput::writeWAVData` 4 GiB boundary +
-   fatal-error propagation.
-6. Analog-de-emphasis response-reference regression test (post the
-   bilinear switch in v1.5.0).
-7. IF-AGC refusal path under chronic clip (depends on P17b landing).
-8. DSP / feature gaps:
+2. IF-AGC refusal path under chronic clip (depends on P17b landing).
+3. Scan cancel latency: skipping the fallback pass after a cancel is
+   verified on hardware only.
+4. `AudioOutput::runWavWriterThread` drain on shutdown; the shutdown-flush
+   test covers `WavWriter` only.
+5. The high-IQ-rate decimation test uses a clean in-band carrier and cannot
+   detect a missing anti-alias filter; it needs an out-of-band interferer.
+6. The scan's FFT plan reuse depends on `thread_local IqSpectrum` in
+   `scan_engine.cpp`; the test exercises the class, not that line.
+7. DSP / feature gaps:
    - Multipath equalizer behaviour on a multi-ray channel that's
      also moving (Doppler-like). Currently only the static
      2-ray test exists in `test_dsp_chain`.
    - HiCut crossfade response audibility test (no current direct test).
-   - Adaptive bandwidth state machine across simulated SNR
-     transitions over hysteresis windows.
    - MPX-audio output reconnect-after-device-disappearance behaviour
      (e.g., USB DAC unplugged mid-stream).
 
@@ -149,11 +149,8 @@ cannot be added cleanly on top of it.
 
 **Stretch candidates that pair naturally with 1.7's architectural work:**
 
-- Drop the pilot bandpass FIR (P18) — the biggest remaining CPU win, but
-  also an architectural shape change in `StereoDecoder` that benefits
-  from being landed in the same major version as the backend refactor
-  so users can be told "everything reshuffled at 1.7, here's what
-  changed".
+- Drop the pilot bandpass FIR (P18) — no longer a CPU win since the band
+  runs at 32 kHz (`a8c777d`); only the architectural simplification remains.
 - Adaptive L-R phase alignment (P19) — independent of backend work but
   pairs with 1.7 for the same release-narrative reason.
 

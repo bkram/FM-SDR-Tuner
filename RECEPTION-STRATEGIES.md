@@ -68,9 +68,15 @@ The tuner drives a four-rung gain ladder (A0 = most gain, A3 = least).
 | A2 | 30 | 7 |
 | A3 | 24 | 0 |
 
-The **TEF** ladder is the default (`gain_strategy = tef`) and is the right
-choice for an indoor telescopic, because it gives the auto-gain loop much
-more headroom to climb on weak signals.
+`gain_strategy = tef` is the default strategy. Which column it uses depends
+on the source: a USB dongle (`source = rtl_sdr`) uses the direct-RTL column,
+an `rtl_tcp` server the TEF column.
+
+The ladder only acts while the gain is automatic. The shipped profile sets a
+fixed `rtl_gain_db = 10`, the setting that left the most headroom at this
+site, so the ladder stands down. An XDR `A` command changes the ladder's mode
+but does not release a fixed gain; a `G` command that changes the RF/IF flags,
+or the REST `auto_gain` control, does.
 
 The auto-gain servo has a deliberate 15 dB dead-band: it steps **down** when
 the clip ratio exceeds 0.02 **or** the level rises above −5 dBFS, and steps
@@ -249,11 +255,11 @@ to calibrate a site.
 
 ## 9. Site profile
 
-`fm-sdr-tuner.ini.site.example` is a ready-made profile for a European FM
-band with an indoor telescopic: TEF gain, 194 kHz bandwidth, aggressive blend,
-pilot canceller on, the adaptive features off, and the scan on the client's
-plot scale. Copy it to `fm-sdr-tuner.ini` and adjust the gain and the meter
-window for your own antenna.
+`fm-sdr-tuner.ini.example` is the profile measured at this site, for a
+European FM band with an indoor telescopic: a fixed 10 dB gain, 194 kHz
+bandwidth, normal blend, pilot canceller on, the adaptive features off, the
+meter window at `-33 / -10` and the scan on the client's plot scale. Copy it
+to `fm-sdr-tuner.ini` and re-run `--calibrate` for your own antenna.
 
 ---
 

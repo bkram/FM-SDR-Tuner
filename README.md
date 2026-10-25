@@ -54,7 +54,7 @@ With an RTL-SDR connected, the binary works with no CLI flags and no config file
 ./build/fm-sdr-tuner
 ```
 
-This opens the XDR server on `127.0.0.1:7373` and waits for a client (xdr-gtk, FM-DX-Webserver, etc.) to send the start command. To skip the wait and hear audio immediately:
+This opens the XDR server on port 7373 on all network interfaces (set `[xdr] password` if the machine is reachable from other hosts) and waits for a client (xdr-gtk, FM-DX-Webserver, etc.) to send the start command. To skip the wait and hear audio immediately:
 
 ```bash
 ./build/fm-sdr-tuner --auto-start
