@@ -74,3 +74,49 @@ TEST_CASE("Hysteresis ignores tiny bandwidth nudges", "[adaptive_bandwidth]") {
       applyAdaptiveBandwidthHysteresis(state, 140000, 130000, t);
   REQUIRE(proposed == 0);
 }
+
+TEST_CASE("Adaptive bandwidth holds still while the SNR hovers at a threshold",
+          "[adaptive_bandwidth]") {
+  // An SNR wobbling around the conservative 20 dB threshold used to switch
+  // 194 <-> 142 kHz at every rate-limit interval (2 s). The hysteresis band
+  // holds the bandwidth that is applied.
+  for (int startHz : {194000, 142000}) {
+    AdaptiveBandwidthState state{};
+    int applied = startHz;
+    int changes = 0;
+    auto t = std::chrono::steady_clock::time_point{} + std::chrono::seconds(10);
+    for (int step = 0; step < 20; step++) {
+      const double snr = (step % 2 == 0) ? 19.2 : 20.8;
+      const int proposed = pickAdaptiveBandwidthHz(
+          AdaptiveBandwidthMode::Conservative, snr, applied);
+      const int change =
+          applyAdaptiveBandwidthHysteresis(state, proposed, applied, t);
+      if (change > 0 && change != applied) {
+        applied = change;
+        changes++;
+      }
+      t += std::chrono::milliseconds(2500);
+    }
+    INFO("start " << startHz << " Hz: " << changes << " changes");
+    CHECK(changes == 0);
+    CHECK(applied == startHz);
+  }
+}
+
+TEST_CASE("Adaptive bandwidth still moves once the SNR leaves the band",
+          "[adaptive_bandwidth]") {
+  using M = AdaptiveBandwidthMode;
+  // Wide and staying wide down to threshold - 1.5 dB.
+  REQUIRE(pickAdaptiveBandwidthHz(M::Conservative, 18.6, 194000) == 194000);
+  REQUIRE(pickAdaptiveBandwidthHz(M::Conservative, 18.4, 194000) == 142000);
+  // Narrow and widening only above threshold + 1.5 dB.
+  REQUIRE(pickAdaptiveBandwidthHz(M::Conservative, 21.4, 142000) == 142000);
+  REQUIRE(pickAdaptiveBandwidthHz(M::Conservative, 21.6, 142000) == 194000);
+  // A deep fade still drops straight to the floor.
+  REQUIRE(pickAdaptiveBandwidthHz(M::Conservative, 2.0, 194000) == 95000);
+  REQUIRE(pickAdaptiveBandwidthHz(M::Aggressive, 30.0, 36000) == 200000);
+  REQUIRE(pickAdaptiveBandwidthHz(M::Aggressive, 1.0, 200000) == 36000);
+  // Without a current bandwidth the plain thresholds apply.
+  REQUIRE(pickAdaptiveBandwidthHz(M::Conservative, 20.5) == 194000);
+  REQUIRE(pickAdaptiveBandwidthHz(M::Conservative, 19.5) == 142000);
+}

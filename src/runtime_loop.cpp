@@ -216,7 +216,8 @@ void maybeAdjustAdaptiveBandwidth(
   if (mode == fm_tuner::AdaptiveBandwidthMode::Off) {
     return;
   }
-  const int proposed = fm_tuner::pickAdaptiveBandwidthHz(mode, signal.snrDb);
+  const int proposed = fm_tuner::pickAdaptiveBandwidthHz(
+      mode, signal.snrDb, currentAppliedBandwidthHz);
   if (proposed <= 0) {
     return;
   }
