@@ -35,9 +35,7 @@ This automatically runs two workflows ([.github/workflows/](.github/workflows/))
 
 - **Build (Linux)** — coverage job + `.deb` (Ubuntu 24.04, Debian trixie) and
   `.rpm` (Fedora 42/43) for `x86_64` **and** `aarch64`, plus container
-  install smoke-tests. These jobs build **SDRplay-enabled** (they fetch the
-  vendor's public API headers at build time; the lib is `dlopen`'d, nothing
-  proprietary is bundled).
+  install smoke-tests. Release artifacts are RTL-only.
 - **Build (Windows / MinGW-w64)** — RTL-only (no SDRplay loader on Windows).
 
 Each build runs `ctest` and uploads a platform artifact. Wait until both are
@@ -91,15 +89,14 @@ Verify: `gh release view v$V --json isDraft,isPrerelease,assets`.
 
 ## Notes
 
-- Prebuilt macOS/Linux binaries are SDRplay-capable but require the SDRplay API
-  service installed at runtime; Windows prebuilts are RTL-only. See
+- All prebuilt binaries are RTL-only. SDRplay remains available for local
+  macOS/Linux builds with an installed vendor SDK; see
   [USER-MANUAL.md](USER-MANUAL.md) and [README.md](README.md).
 - Every archive/package bundles `README.md`, `USER-MANUAL.md`, the ready-to-use
   `fm-sdr-tuner.ini`, and `rest_test_panel.py` (CI copies these in; see the
   workflow files and the CMake `install()` rules). macOS and Linux additionally
-  ship the `fm-sdr-tuner-sdrplay.ini.example` template and `run_rest_panel.sh`;
-  the Windows archive ships only `fm-sdr-tuner.ini.example` (SDRplay is
-  unsupported on Windows and `run_rest_panel.sh` is a POSIX shell launcher).
+  ship `run_rest_panel.sh`; Windows does not because it is a POSIX shell
+  launcher.
 - There is no automated release workflow yet; the publish step (4) is manual.
   A future improvement is a tag-triggered workflow that builds and attaches the
   assets automatically.

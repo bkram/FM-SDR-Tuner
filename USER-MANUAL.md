@@ -128,7 +128,7 @@ is optional and falls back to the default shown.
 ### `[tuner]` — source & RF
 | Key | Default | Meaning |
 |---|---|---|
-| `source` | `rtl_sdr` | `rtl_sdr` (USB), `rtl_tcp` (network), or `sdrplay` (RSP). macOS/Linux prebuilts are SDRplay-capable (install the SDRplay API service); Windows is RTL-only. |
+| `source` | `rtl_sdr` | `rtl_sdr` (USB), `rtl_tcp` (network), or `sdrplay` (RSP). Prebuilt binaries are RTL-only; SDRplay requires a local macOS/Linux source build with the vendor SDK. |
 | `rtl_device` | `0` | RTL-SDR device index when `source=rtl_sdr`. |
 | `default_freq` | `87500` | Startup frequency in kHz. |
 | `deemphasis` | `0` | `0`=50 µs (EU), `1`=75 µs (US/KR), `2`=off. |
@@ -357,12 +357,10 @@ curl  http://127.0.0.1:9090/api/status
 - **Config seems ignored:** check for the `[Config] auto-loading …` line at
   startup. If it's missing, no `fm-sdr-tuner.ini` was found in the working
   directory — `cd` into the folder that has it, or pass `-c <file>`.
-- **`--source sdrplay` does nothing:** the **macOS and Linux** prebuilt
-  binaries are SDRplay-capable, but you must install the **SDRplay API service**
-  (from <https://www.sdrplay.com/>) for the binary to talk to an RSP — install
-  it and retry. The **Windows** prebuilt is RTL-only (no SDRplay loader).
-  Building from source for SDRplay needs `-DFM_TUNER_ENABLE_SDRPLAY=ON`
-  (macOS/Linux only).
+- **`--source sdrplay` does nothing:** prebuilt binaries are RTL-only because
+  CI cannot reliably download the vendor SDK headers. Install the SDRplay SDK
+  and build locally with `-DFM_TUNER_ENABLE_SDRPLAY=ON` on macOS or Linux.
+  Windows SDRplay builds are unsupported.
 
 ---
 

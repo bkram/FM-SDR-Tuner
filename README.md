@@ -204,18 +204,10 @@ vcpkg install openssl librtlsdr liquid-dsp
 
 ## SDRplay (RSP) support
 
-The prebuilt **macOS and Linux** release binaries are **SDRplay-capable** — CI
-builds them with SDRplay support by fetching the vendor's public API *headers*
-at build time; the library itself is `dlopen`'d at runtime and never linked or
-bundled, so nothing proprietary is redistributed and the binary still runs on
-RTL-only systems. To use an RSP with a prebuilt binary, just install the
-**SDRplay API service** from <https://www.sdrplay.com/> and set
-`source = sdrplay`. The **Windows** build is RTL-only (no SDRplay loader).
-RTL-SDR users need none of this.
-
-Building it yourself is only needed for Windows SDRplay (unsupported) or custom
-builds; SDRplay support is off by default in a plain source build and enabled
-with the flag below.
+Prebuilt release binaries are RTL-only. CI does not build SDRplay support
+because the vendor SDK headers are no longer reliably downloadable in an
+unattended build. SDRplay remains available for local macOS and Linux builds
+when the SDK is already installed; Windows SDRplay remains unsupported.
 
 ### Building with SDRplay support
 
@@ -1588,19 +1580,12 @@ Artifacts currently uploaded by CI:
   - `fm-sdr-tuner-linux-rpm-fedora-43-x64`
   - `fm-sdr-tuner-linux-rpm-fedora-43-arm64`
 - Manually dispatched macOS build job:
-  - `fm-sdr-tuner-macos` (binary + `README.md` + `USER-MANUAL.md` + ready-to-use `fm-sdr-tuner.ini` + both `*.ini.example` configs + `rest_test_panel.py` + `run_rest_panel.sh`)
+  - `fm-sdr-tuner-macos` (RTL-only binary + `README.md` + `USER-MANUAL.md` + ready-to-use `fm-sdr-tuner.ini` + `fm-sdr-tuner.ini.example` + `rest_test_panel.py` + `run_rest_panel.sh`)
 - Windows MinGW job:
   - `fm-sdr-tuner-windows-mingw` (`.exe` + required DLLs + `dependencies.txt` + `README.md` + `USER-MANUAL.md` + ready-to-use `fm-sdr-tuner.ini` + `fm-sdr-tuner.ini.example` + `rest_test_panel.py`)
 
-The **macOS and Linux** release builds are **SDRplay-capable**: CI builds them
-with `-DFM_TUNER_ENABLE_SDRPLAY=ON` against the vendor's public API *headers*
-(fetched at build time). The SDRplay library is `dlopen`'d at runtime, never
-linked or bundled — so nothing proprietary is redistributed, no package
-dependency is added, and the binary still runs on RTL-only systems. To use an
-RSP with a prebuilt binary, just install the **SDRplay API service** from
-<https://www.sdrplay.com/>. The **Windows** build is RTL-only (no SDRplay
-loader). Building SDRplay from source needs `-DFM_TUNER_ENABLE_SDRPLAY=ON`
-(macOS/Linux only).
+All CI release artifacts are RTL-only. SDRplay builds require a local macOS or
+Linux SDK installation and `-DFM_TUNER_ENABLE_SDRPLAY=ON`.
 
 Notes:
 - macOS CI does not run automatically for pushes or pull requests. Dispatch

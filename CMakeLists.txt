@@ -222,8 +222,12 @@ if(APPLE)
 endif()
 
 install(TARGETS fm-sdr-tuner RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES fm-sdr-tuner.ini.example fm-sdr-tuner-sdrplay.ini.example
+install(FILES fm-sdr-tuner.ini.example
         DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/fm-sdr-tuner)
+if(FM_TUNER_HAVE_SDRPLAY)
+    install(FILES fm-sdr-tuner-sdrplay.ini.example
+            DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/fm-sdr-tuner)
+endif()
 install(FILES README.md USER-MANUAL.md LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
 install(PROGRAMS scripts/rest_test_panel.py scripts/run_rest_panel.sh
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/rest-panel)
