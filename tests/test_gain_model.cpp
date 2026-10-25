@@ -1,6 +1,6 @@
-#include "gain_model.h"
+#include "catch_compat.h"
 
-#include <catch2/catch_test_macros.hpp>
+#include "gain_model.h"
 
 using namespace fm_tuner;
 
