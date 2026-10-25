@@ -82,9 +82,11 @@ gain_strategy = tef
 # meter stays off the top of the scale.
 #
 # The gain in this file is the STARTING point: the plugin's gain control (and
-# an XDR client) may move it while the tuner runs, and the setting then
-# survives a retune. A -g on the command line pins the gain instead - no
-# client may change it after that.
+# an XDR client that changes its G flags) may move it while the tuner runs,
+# and the setting then survives a retune. An XDR A command, or a G that
+# repeats the current flags - which xdr-gtk sends on every connect - leaves
+# it alone. A -g on the command line pins the gain instead - no client may
+# change it after that.
 rtl_gain_db = 10
 
 # RTL frequency correction in ppm (set from known dongle offset)

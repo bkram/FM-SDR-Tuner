@@ -146,3 +146,37 @@ TEST_CASE("XdrFacade callbacks remain valid after install scope ends",
   REQUIRE(startCalls.load(std::memory_order_relaxed) == 1);
   REQUIRE(stopCalls.load(std::memory_order_relaxed) == 1);
 }
+
+TEST_CASE("XdrFacade keeps a manual gain unless the client changes the G flags",
+          "[xdr_facade]") {
+  XDRServer server(7384);
+  XdrCommandState state(88600000u, 0, 2, 0, 55, 1, false);
+  XdrFacade facade(server, state,
+                   {.verboseLogging = false,
+                    .useSdrppGainStrategy = false,
+                    .allowClientGainOverride = true});
+
+  facade.configureServer("", false);
+  facade.installCallbacks(
+      [&](int) {}, [&]() {}, [&]() {},
+      [&](int custom) {
+        return std::to_string((custom / 10) % 10) + std::to_string(custom % 10);
+      });
+
+  // The profile's fixed gain.
+  state.requestedGainDb.store(10, std::memory_order_relaxed);
+
+  // xdr-gtk replays its saved A and G on every connect. Neither may discard
+  // the fixed gain: A is a setting of the automatic ladder, and this G
+  // repeats the flags already in force.
+  server.processCommand("A0", true, false);
+  REQUIRE(state.requestedAGCMode.load(std::memory_order_relaxed) == 0);
+  REQUIRE(state.requestedGainDb.load(std::memory_order_relaxed) == 10);
+  server.processCommand("G00", true, false);
+  REQUIRE(state.requestedGainDb.load(std::memory_order_relaxed) == 10);
+
+  // Changing the flags is a deliberate gain change: the client takes over.
+  server.processCommand("G10", true, false);
+  REQUIRE(state.requestedCustomGain.load(std::memory_order_relaxed) == 10);
+  REQUIRE(state.requestedGainDb.load(std::memory_order_relaxed) == -1);
+}
