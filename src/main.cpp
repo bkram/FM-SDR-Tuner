@@ -22,7 +22,7 @@ int main(int argc, char *argv[]) {
     fm_tuner::calibration::BandSweepOptions sweep;
     sweep.deviceIndex = parse.options.rtlDeviceIndex;
     sweep.sampleRateHz = parse.options.iqSampleRate;
-    sweep.gainTenthsDb = parse.options.gain;
+    sweep.gainDb = parse.options.gain;
     return fm_tuner::calibration::runBandSweep(sweep);
   }
 

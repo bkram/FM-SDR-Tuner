@@ -1199,12 +1199,19 @@ The output includes:
 - a sorted list of detected stations (level120 > 30)
 - a recommendation block with `signal_floor_dbfs`, `signal_ceil_dbfs`, and `signal_bias_db` chosen so the window spans the signal envelope at your site
 
-Paste the recommendation block into the `[sdr]` section of your INI and restart. Takes ~45 seconds, no XDR client or audio backend needed. Re-run any time the antenna or location changes.
+Paste the recommendation block into the `[sdr]` section of your INI and
+restart. Calibration temporarily captures at least 1.024 MHz so each FFT covers
+several 100 kHz grid points; a full sweep normally takes about 5–10 seconds,
+with no XDR client or audio backend needed. Re-run any time the antenna,
+location, or gain changes.
 
 **Procedure B — Live auto-suggester (for tweaking while listening).**
 1. Start the tuner with the default wide window.
 2. Tune through your representative stations (strong local, mid, fringe, empty) over ~1 minute.
-3. Read the `[METER] session observed` line. It tracks the running min/max of compensated dBFS and recommends `floor ≈ min − 3 dB`, `ceil ≈ max + 3 dB` so the window spans your real signal range.
+3. Read the `[METER] session observed` line. It tracks the running min/max of
+   clean compensated dBFS, excluding blocks whose IQ clips, and recommends
+   `floor ≈ min − 3 dB`, `ceil ≈ max + 3 dB` so the window spans the usable
+   signal range.
 4. Apply those values to `[sdr]` in your INI.
 5. Restart and confirm: strong locals now settle near the top and an empty frequency at zero.
 

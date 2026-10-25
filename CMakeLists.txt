@@ -137,6 +137,7 @@ set(SOURCES
     src/signal_level.cpp
     src/adaptive_bandwidth.cpp
     src/calibration.cpp
+    src/calibration_policy.cpp
     src/dsp/multipath_eq.cpp
     src/main.cpp
 )

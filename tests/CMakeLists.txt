@@ -43,6 +43,18 @@ target_link_libraries(test_config PRIVATE
     ${FM_TUNER_CATCH2_TARGET}
 )
 
+add_executable(test_calibration test_calibration.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/calibration_policy.cpp
+)
+target_include_directories(test_calibration PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_calibration PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+)
+
 add_executable(test_app_options test_app_options.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/app_options.cpp
@@ -452,6 +464,7 @@ endif()
 add_test(NAME signal_level COMMAND test_signal_level)
 add_test(NAME rds COMMAND test_rds)
 add_test(NAME config COMMAND test_config)
+add_test(NAME calibration COMMAND test_calibration)
 add_test(NAME app_options COMMAND test_app_options)
 add_test(NAME dsp_chain COMMAND test_dsp_chain)
 add_test(NAME demod_front COMMAND test_demod_front)

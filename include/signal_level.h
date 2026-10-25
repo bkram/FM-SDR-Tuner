@@ -36,6 +36,13 @@ constexpr int kSignalChannelWindowHz = 30000;
 // modulated.
 constexpr int kTunedMeterWindowHz = 200000;
 
+// Gain compensation shared by the live meter, scan, and calibration paths.
+constexpr double kSignalGainCompFactor = 0.5;
+
+// Measurements at or above this IQ rail ratio are not suitable calibration
+// points: overload has already made their apparent power unreliable.
+constexpr double kCalibrationClipRatio = 0.001;
+
 } // namespace fm_tuner
 
 struct SignalLevelResult {

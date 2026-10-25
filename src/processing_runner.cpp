@@ -128,7 +128,8 @@ bool processAudioBlock(
                 << " dB), bias=" << config.sdr.signal_bias_db << " dB\n";
       meterIntroLogged = true;
     }
-    if (std::isfinite(displaySignal.compensatedDbfs)) {
+    if (std::isfinite(displaySignal.compensatedDbfs) &&
+        clipRatio < fm_tuner::kCalibrationClipRatio) {
       meterMinCompensated =
           std::min(meterMinCompensated, displaySignal.compensatedDbfs);
       meterMaxCompensated =

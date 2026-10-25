@@ -395,7 +395,6 @@ int Application::run() {
     }
     return calculateAppliedGainDb();
   };
-  constexpr double kSignalGainCompFactor = 0.5;
 
   // May a client change the gain? The command line wins over everything: -g
   // is a per-run override. The profile's gain is only the starting point, so
@@ -1176,7 +1175,7 @@ int Application::run() {
             tunerSetFrequency, [&]() { return tuner.currentFrequencyHz(); },
             tunerReadIQ, writeIqCapture, scanRetrySleep,
             iqBuffer, SDR_BUF_SAMPLES, iqSampleRate, effectiveAppliedGainDb(),
-            kSignalGainCompFactor, config.sdr, restoreAfterScan,
+            fm_tuner::kSignalGainCompFactor, config.sdr, restoreAfterScan,
             [&]() { return g_running.load(); },
             [&](bool wide) { return tuner.setScanWideMode(wide); },
             scanWideActive, scanWideRate, [&]() { tuner.flushBuffers(); })) {
@@ -1254,7 +1253,7 @@ int Application::run() {
     (void)processing_runner::processAudioBlock(
         iqBuffer, samples, OUTPUT_RATE, iqSampleRate,
         effectiveAppliedGainDb(),
-        kSignalGainCompFactor, config, verboseLogging, rfLevelSmoother,
+        fm_tuner::kSignalGainCompFactor, config, verboseLogging, rfLevelSmoother,
         [&](const SignalLevelResult &signal, double clipRatio,
             float rfLevelFiltered) {
           // Publish live telemetry for the REST API. Overload uses the same
