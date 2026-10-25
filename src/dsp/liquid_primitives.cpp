@@ -88,9 +88,11 @@ void FIRFilter::init(std::uint32_t length, float cutoff, float stopBandAtten, fl
 
         // L1-normalized lowpass: design taps explicitly, compute sum(|tap|),
         // and clamp the post-design scale so scale·L1 ≤ 1. The DC passband
-        // gain (scale·sum(tap)) shifts at most by min(1, 2·cutoff·L1) → 1,
-        // i.e. it drops by 20·log10(2·cutoff·L1) dB when L1 > 1/(2·cutoff).
-        // For typical FM lowpass at cutoff ≈ 0.45 the shift is < 1 dB.
+        // gain (scale·sum(tap)) then drops by 20·log10(2·cutoff·L1) dB
+        // whenever L1 > 1/(2·cutoff), which for the channel filter's
+        // cutoffs is always: measured -7.1 dB at cutoff 0.43, -5.4 dB at
+        // 0.15, -3.1 dB at 0.035. dcGain() reports it, so a power measured
+        // after the filter can be corrected.
         m_taps.assign(length, 0.0f);
 #if FM_TUNER_LIQUID_FIRDES_KAISER_RETURNS_VOID
         liquid_firdes_kaiser(length, cutoff, stopBandAtten, 0.0f, m_taps.data());
@@ -200,6 +202,19 @@ std::complex<float> FIRFilter::execute() const {
     std::complex<float> out{};
     firfilt_crcf_execute(m_object, &out);
     return out;
+}
+
+float FIRFilter::dcGain() const {
+    if (m_taps.empty()) {
+        // The Kaiser-create shortcut: scale 2·cutoff compensates liquid's
+        // design, so the passband gain is unity.
+        return 1.0f;
+    }
+    double sum = 0.0;
+    for (float tap : m_taps) {
+        sum += tap;
+    }
+    return static_cast<float>(sum) * m_scale;
 }
 
 std::size_t FIRFilter::length() const {

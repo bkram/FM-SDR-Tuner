@@ -181,6 +181,11 @@ void FMDemod::designIqFilter(std::uint32_t length, float cutoffNorm,
                              float stopBandAtten) {
   m_liquidIqFilter.init(length, cutoffNorm, stopBandAtten, 0.0f,
                         m_iqFirL1Normalize);
+  // The L1 bound lowers the filter's passband gain by 3-7 dB, depending on
+  // the cutoff. The channel power drives the meter, the squelch and the
+  // fade-mute, so it is measured as if the filter had unity gain.
+  const double gain = std::max(1e-6, static_cast<double>(m_liquidIqFilter.dcGain()));
+  m_iqFirPowerCorrection = 1.0 / (gain * gain);
   m_iqFirDelay = (kIqFirMaxLength - std::min(length, kIqFirMaxLength)) / 2;
   // Prime the new filter with the samples it would hold had it been running
   // all along: the last `length` inputs, each delayed by m_iqFirDelay.
@@ -278,7 +283,8 @@ void FMDemod::demodulate(const uint8_t *iq, float *audio, size_t len) {
       (len > 0)
           ? std::min(0.0,
                      10.0 *
-                         std::log10((powerSum / static_cast<double>(len)) +
+                         std::log10((powerSum * m_iqFirPowerCorrection /
+                                     static_cast<double>(len)) +
                                     1e-20))
           : -120.0;
 }
@@ -314,7 +320,8 @@ void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
       (len > 0)
           ? std::min(0.0,
                      10.0 *
-                         std::log10((powerSum / static_cast<double>(len)) +
+                         std::log10((powerSum * m_iqFirPowerCorrection /
+                                     static_cast<double>(len)) +
                                     1e-20))
           : -120.0;
 }

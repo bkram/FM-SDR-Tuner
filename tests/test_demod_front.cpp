@@ -503,3 +503,34 @@ TEST_CASE("Multipath equaliser stays bounded on noise", "[dsp][multipath]") {
     CHECK(std::abs(ratioDb) <= 6.0);
   }
 }
+
+TEST_CASE("L1-normalised channel FIR reports the same channel power",
+          "[dsp][demod][firfilter]") {
+  // The L1 bound lowers the FIR's passband gain by 3-7 dB depending on the
+  // bandwidth. The channel-power reading (meter, squelch, fade-mute) must not
+  // move with it.
+  for (int bandwidth : {194000, 95000, 42000}) {
+    double reading[2] = {0.0, 0.0};
+    for (int l1 = 0; l1 < 2; l1++) {
+      FMDemod demod(256000, 48000);
+      demod.setIqFirL1Normalize(l1 == 1);
+      demod.setBandwidthHz(bandwidth);
+      FmSource src(256000.0);
+      src.pilot = false;
+      src.stereo = false;
+      src.left = 0.0;
+      src.right = 0.0;
+      src.offsetHz = 3000.0;
+      std::vector<uint8_t> iq;
+      std::vector<float> demodOut(8192);
+      for (int block = 0; block < 4; block++) {
+        src.fill(iq, 8192);
+        demod.processNoDownsample(iq.data(), demodOut.data(), 8192);
+      }
+      reading[l1] = demod.getFilteredChannelPowerDbfs();
+    }
+    INFO("bandwidth " << bandwidth << ": Kaiser " << reading[0]
+                      << " dBFS, L1 " << reading[1] << " dBFS");
+    CHECK(std::abs(reading[1] - reading[0]) <= 0.5);
+  }
+}

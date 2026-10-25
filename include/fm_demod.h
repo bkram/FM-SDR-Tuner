@@ -89,6 +89,9 @@ private:
   std::array<std::complex<float>, kIqHistorySize> m_iqHistory{};
   std::size_t m_iqHistoryPos = 0;
   std::size_t m_iqFirDelay = 0;
+  // 1 / (channel FIR passband gain)², applied to the filtered channel power
+  // so the reading does not move with the L1-normalisation option.
+  double m_iqFirPowerCorrection = 1.0;
   fm_tuner::dsp::liquid::FreqDemod m_liquidFreqDemod;
   // IQ DC tracker: a running mean whose time constant starts short (20 Hz
   // corner) after a reset and glides to a 0.1 Hz corner. See removeIqDc().
