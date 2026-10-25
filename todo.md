@@ -2,9 +2,8 @@
 
 Last verified against current source: 2026-10-25 (on v1.8.0, branch `v1.8`)
 
-This file is a short-form punch list of open work — see `plan.md` for the
-fuller analysis with rationale and validation strategy. Closed tickets are
-not retained; consult `git log` and merged PR descriptions for history.
+This is the canonical punch list of open work. Closed tickets are not
+retained; consult `git log` and merged PR descriptions for history.
 
 ## Verified Open Issues
 
@@ -16,16 +15,9 @@ not retained; consult `git log` and merged PR descriptions for history.
   that owns connect/tune/gain/capabilities — see `src/tuner_session.cpp`
   and `src/tuner_controller.cpp`. Blocks any future Soapy / HackRF / Airspy
   work.
-- **Drop the pilot bandpass FIR (P18)**: the CPU case for this is mostly
-  gone. Since `a8c777d` the pilot band (245-tap prototype) and the RDS band
-  (163 taps) run on the band mixed down to DC at 32 kHz, an eighth of their
-  former cost; see `PERFORMANCE.md`. What remains is the simpler
-  architecture: `research/sdr-j-fm/src/fm/pilot-recover.cpp` uses a bare
-  product-detector PLL on the raw MPX and relies on the loop bandwidth for
-  the band-pass, with no FIR group delay to compensate in the L-R delay line.
-  Trade-off: less out-of-band rejection on the PLL input, and the noise-gated
-  stereo detection and pilot SNR depend on the band power the filter
-  measures, so both would need a replacement.
+
+### Medium
+
 - **ADC-rail-aware gain policy refusal (P17b)**: the L1 normalization on the
   IQ FIR is wired (`processing.iq_fir_l1_normalize`, default off — see v1.6.2)
   so post-filter envelope can be hard-bounded. Still open: the gain policy
@@ -39,9 +31,6 @@ not retained; consult `git log` and merged PR descriptions for history.
   reconnect, and the main DSP loop in one large function. Structural debt
   that makes backend work and future runtime fixes harder than they need to
   be.
-
-### Medium
-
 - **Adaptive L-R phase alignment (P19)**: a Costas-style adaptive
   separator (`PerfectStereoSeparation` in
   `research/sdr-j-fm/src/fm/stereo-separation.cpp` by Thomas Neder) that
@@ -67,6 +56,15 @@ not retained; consult `git log` and merged PR descriptions for history.
 
 ### Low / cross-cutting
 
+- **Drop the pilot bandpass FIR (P18)**: the CPU case is mostly gone. Since
+  `a8c777d` the pilot band (245-tap prototype) and the RDS band (163 taps)
+  run on the band mixed down to DC at 32 kHz, an eighth of their former cost;
+  see `PERFORMANCE.md`. What remains is the simpler architecture:
+  `research/sdr-j-fm/src/fm/pilot-recover.cpp` uses a bare product-detector
+  PLL on the raw MPX and relies on the loop bandwidth for the band-pass, with
+  no FIR group delay to compensate in the L-R delay line. The noise-gated
+  stereo detection and pilot SNR depend on the band power the filter measures,
+  so both need replacements before this filter can be removed safely.
 - **Subsystem-grouped include layout**: `research/sdr-j-fm` organizes
   `includes/fm/`, `includes/rds/`, `includes/various/` by subsystem. We
   do this partially in `include/dsp/` but most headers are flat. As the
@@ -100,21 +98,31 @@ These would catch regressions that current CI can't:
   flush test covers `WavWriter` only.
 - The decimation test uses a clean in-band carrier, so it cannot detect a
   missing anti-alias filter; it needs an out-of-band interferer.
+- Scan FFT plan reuse through `thread_local IqSpectrum` in `scan_engine.cpp`.
+- Multipath equalizer behavior on a moving multi-ray channel; only a static
+  two-ray channel is covered now.
+- HiCut crossfade audibility and MPX-audio reconnect after an output device
+  disappears.
 
 (`recvLine()` overflow and auth truncation are covered end to end in
 `test_protocol` — oversized XDR and FM-DX lines, oversized handshakes and
 oversized auth lines are all exercised. A direct unit test of the static
 helper would need it exported, which is why it is not listed here.)
 
-## Future Milestones
+## Roadmap
 
-- **1.7** — Broad SDR backend support. Backend capability interface (P6)
-  → `SoapySDR` implementation → contract tests → CLI/config/XDR
-  integration cleanup. Stretch goals if time allows: the pilot-FIR
-  removal (P18) and adaptive L-R alignment (P19), since both are
-  architectural-shape changes that pair naturally with the backend
-  refactor. **Shipped as v1.7.0 with the SDRplay backend only — the
-  capability interface (P6) was not done, so it is still open.**
-- **1.8** — Runtime structural cleanup. Decompose `Application::run`
-  (P5) into smaller responsibilities. **In progress: the backend layer is
-  not abstracted yet (P6 still open), and P5 is still open.**
+- **Broad SDR backend support:** backend capability interface (P6), then a
+  `SoapySDR` implementation, fake-backend contract tests, and CLI/config/XDR
+  integration cleanup.
+- **Runtime structural cleanup:** decompose `Application::run()` (P5) into
+  session bootstrap, command/control application, scan coordination, and the
+  main DSP/audio loop, with behavior-preserving tests around the affected
+  lifecycle paths.
+
+## References
+
+The P18 and P19 ideas come from
+[`sdr-j-fm`](https://github.com/JvanKatwijk/sdr-j-fm) by Jan van Katwijk
+(GPL-3.0); Thomas Neder contributed the adaptive stereo separator used as the
+P19 reference. A comparison clone may be kept under the untracked `research/`
+directory.

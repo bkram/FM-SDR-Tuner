@@ -1635,7 +1635,9 @@ This software is based on or integrates ideas/components from:
 - redsea (RDS decoding pipeline; this project now uses redsea-derived components)
 - XDR-GTK and librdsparser (XDR ecosystem compatibility/parsing behavior)
 - FM-DX-Tuner and xdrd (protocol and tuner-control ecosystem references)
-- sdr-j-fm (algorithmic references for pilot recovery without bandpass FIR, adaptive Costas-style stereo separator, and squelch — see roadmap items P18-P20 in `plan.md`)
+- sdr-j-fm (algorithmic references for pilot recovery without a bandpass FIR,
+  adaptive Costas-style stereo separation, and squelch — see P18 and P19 in
+  `todo.md`)
 
 Core third-party runtime/build dependencies used by this project include:
 
