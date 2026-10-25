@@ -9,8 +9,18 @@ namespace {
 // Step sizes for the dispersion-CMA form. Calibrated so a strong multipath
 // signal converges in well under a second; on a clean signal the dispersion
 // target makes the error near-zero and these values stay safe.
+//
+// The CMA gradient y·(|y|² - E|x|²)·conj(x) grows with the input amplitude to
+// the fourth power, so a fixed step tuned near full scale did nothing at the
+// levels a real front end delivers (no measurable improvement at amplitude
+// 0.05, where it was 7 dB at 0.7). The step is therefore divided by E[|x|²]²,
+// and these values are the steps at the calibration power below, where the
+// equaliser behaves exactly as before.
 constexpr float kMuLight = 5.0e-5f;
 constexpr float kMuAggressive = 2.0e-4f;
+constexpr float kMuReferencePower = 0.49f; // |x|² of a 0.7-amplitude carrier
+// Keeps the normalised step finite on silence (|x| below ~0.003).
+constexpr float kMuPowerFloor = 1.0e-5f;
 
 // Leak strength toward the centered-delta initialization. After each LMS
 // update we apply `taps *= (1 - leak)` and add `leak` back to the centre tap,
@@ -144,6 +154,9 @@ std::complex<float> MultipathEqualizer::execute(std::complex<float> input) {
     m_envelopeError +=
         kEnvErrorAlpha * (std::abs(envErr) - m_envelopeError);
 
+    const float power = std::max(m_inputMeanSqMag, kMuPowerFloor);
+    const float muNorm =
+        m_mu * (kMuReferencePower * kMuReferencePower) / (power * power);
     const std::complex<float> errTimesY = y * envErr;
     const std::uint32_t centreIdx = N / 2U;
     for (std::uint32_t k = 0; k < N; ++k) {
@@ -154,7 +167,7 @@ std::complex<float> MultipathEqualizer::execute(std::complex<float> input) {
       // and the centre tap is then nudged back toward 1. Pulls the filter
       // back to a pure pass-through when the LMS gradient is small —
       // preventing CMA's known phase-ambiguity wandering on clean FM.
-      m_taps[k] = m_taps[k] * (1.0f - m_leak) - m_mu * grad;
+      m_taps[k] = m_taps[k] * (1.0f - m_leak) - muNorm * grad;
       if (k == centreIdx) {
         m_taps[k] += m_leak * std::complex<float>(1.0f, 0.0f);
       }

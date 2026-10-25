@@ -425,3 +425,81 @@ TEST_CASE("Fade-mute recovery time does not depend on the IQ rate",
     CHECK(std::abs(t - base) <= 0.2);
   }
 }
+
+TEST_CASE("Multipath equaliser converges at any signal level",
+          "[dsp][multipath]") {
+  // The CMA update scales with the input amplitude to the fourth power, so a
+  // step size tuned near full scale did nothing at realistic levels.
+  auto thdn = [](double amp, const char *mode, bool echo) {
+    Config::ProcessingSection processing;
+    processing.multipath_eq = mode;
+    DspPipeline dsp(256000, 48000, processing, false, 8192, 1);
+    FmSource src(256000.0);
+    src.amp = amp;
+    std::deque<std::complex<double>> delay(3, {0.0, 0.0});
+    const std::complex<double> ghost = std::polar(0.4, 1.0);
+    std::vector<uint8_t> iq(2 * 8192);
+    DspPipeline::Result out;
+    std::vector<float> left;
+    // 3.8 s: the equaliser settles in well under a second; the last second
+    // is measured.
+    for (int block = 0; block < 120; block++) {
+      for (size_t i = 0; i < 8192; i++) {
+        const std::complex<double> c = src.next();
+        const std::complex<double> m = echo ? c + ghost * delay.front() : c;
+        delay.pop_front();
+        delay.push_back(c);
+        iq[2 * i] = FmSource::quantize(m.real());
+        iq[2 * i + 1] = FmSource::quantize(m.imag());
+      }
+      dsp.process(iq.data(), 8192, nullptr, out);
+      if (block >= 90) {
+        left.insert(left.end(), out.left, out.left + out.outSamples);
+      }
+    }
+    return toneToRestDb(left, 1000.0, 48000.0);
+  };
+
+  for (double amp : {0.05, 0.2, 0.7}) {
+    const double off = thdn(amp, "off", true);
+    const double eq = thdn(amp, "aggressive", true);
+    INFO("amplitude " << amp << ": THD+N " << off << " dB off, " << eq
+                      << " dB aggressive");
+    CHECK(eq >= off + 4.0);
+  }
+  // On a clean signal the equaliser must not make things worse.
+  for (double amp : {0.05, 0.7}) {
+    const double off = thdn(amp, "off", false);
+    const double eq = thdn(amp, "aggressive", false);
+    INFO("clean amplitude " << amp << ": " << off << " dB off, " << eq
+                            << " dB aggressive");
+    CHECK(eq >= off - 1.0);
+  }
+}
+
+TEST_CASE("Multipath equaliser stays bounded on noise", "[dsp][multipath]") {
+  for (double amp : {0.05, 0.7}) {
+    fm_tuner::dsp::MultipathEqualizer eq;
+    eq.init(fm_tuner::dsp::MultipathEqMode::Aggressive, 17, 256000.0f);
+    eq.setAdaptEnabled(true);
+    std::mt19937 rng(3);
+    std::normal_distribution<float> gauss(0.0f, static_cast<float>(amp));
+    double inPower = 0.0;
+    double outPower = 0.0;
+    bool finite = true;
+    const int n = 1 << 20;
+    for (int i = 0; i < n; i++) {
+      const std::complex<float> x(gauss(rng), gauss(rng));
+      const std::complex<float> y = eq.execute(x);
+      finite = finite && std::isfinite(y.real()) && std::isfinite(y.imag());
+      if (i >= n / 2) {
+        inPower += std::norm(x);
+        outPower += std::norm(y);
+      }
+    }
+    REQUIRE(finite);
+    const double ratioDb = 10.0 * std::log10(outPower / inPower);
+    INFO("amplitude " << amp << ": output/input power " << ratioDb << " dB");
+    CHECK(std::abs(ratioDb) <= 6.0);
+  }
+}
