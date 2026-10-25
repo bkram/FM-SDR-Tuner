@@ -1,5 +1,7 @@
 #include "mpx_audio_output.h"
 
+#include "dsp/mpx_resampler.h"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -359,10 +361,9 @@ bool MpxAudioOutput::init(const std::string &deviceSelector,
   m_resampleEnabled = false;
 
   if (sourceSampleRate != targetSampleRate) {
-    const float ratio =
-        static_cast<float>(targetSampleRate) / static_cast<float>(sourceSampleRate);
     try {
-      m_resampler.init(ratio);
+      fm_tuner::dsp::initMpxResampler(m_resampler, sourceSampleRate,
+                                      targetSampleRate);
       m_resampleEnabled = true;
     } catch (const std::exception &ex) {
       std::cerr << "[MPX-AUDIO] resampler init failed: " << ex.what() << "\n";

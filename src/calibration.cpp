@@ -1,5 +1,6 @@
 #include "calibration.h"
 
+#include "dsp/iq_saturation.h"
 #include "rtl_sdr_device.h"
 #include "signal_level.h"
 
@@ -7,20 +8,25 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace fm_tuner::calibration {
 
 namespace {
 
+constexpr uint32_t kMinimumCaptureRateHz = 1024000;
+constexpr size_t kCaptureSamples = 32768;
+
 bool readIqWithRetries(RTLSDRDevice &dev, std::vector<uint8_t> &iq,
-                      size_t requestedSamples, int attempts,
-                      std::chrono::milliseconds sleepBetween,
-                      size_t &samplesOut) {
+                       size_t requestedSamples, int attempts,
+                       std::chrono::milliseconds sleepBetween,
+                       size_t &samplesOut) {
   samplesOut = 0;
+  iq.resize(requestedSamples * 2);
   for (int attempt = 0; attempt < attempts && samplesOut == 0; ++attempt) {
     samplesOut = dev.readIQ(iq.data(), requestedSamples);
     if (samplesOut == 0) {
@@ -30,59 +36,40 @@ bool readIqWithRetries(RTLSDRDevice &dev, std::vector<uint8_t> &iq,
   return samplesOut > 0;
 }
 
-bool measureFrequency(RTLSDRDevice &dev, uint32_t freqKHz, uint32_t sampleRateHz,
-                      int appliedGainDb, int channelBandwidthHz,
-                      SignalLevelResult &out) {
-  if (!dev.setFrequency(freqKHz * 1000U)) {
-    return false;
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(120));
-
-  // Burn 4 buffer-loads to flush any in-flight USB samples from the previous
-  // tune; without this the FIFO holds stale data and measurements smear across
-  // recent neighbour frequencies.
-  std::vector<uint8_t> iq(4096 * 2, 0);
-  size_t discarded = 0;
-  for (int flush = 0; flush < 4; ++flush) {
-    (void)readIqWithRetries(dev, iq, iq.size() / 2, 4,
-                            std::chrono::milliseconds(15), discarded);
-  }
-
-  double dbfsSum = 0.0;
-  double compensatedSum = 0.0;
-  double levelSum = 0.0;
-  int validBlocks = 0;
-
-  for (int block = 0; block < 3; ++block) {
+bool settleAfterRetune(RTLSDRDevice &dev, std::vector<uint8_t> &iq,
+                       uint32_t sampleRateHz) {
+  dev.flushBuffers();
+  size_t remaining = std::max<size_t>(8192, sampleRateHz / 10);
+  while (remaining > 0) {
+    const size_t requested = std::min(remaining, kCaptureSamples);
     size_t samples = 0;
-    if (!readIqWithRetries(dev, iq, iq.size() / 2, 8,
-                           std::chrono::milliseconds(15), samples)) {
-      continue;
+    if (!readIqWithRetries(dev, iq, requested, 4, std::chrono::milliseconds(15),
+                           samples)) {
+      return false;
     }
-    iq.resize(samples * 2);
-
-    const SignalLevelResult signal = computeSignalLevel(
-        iq.data(), samples, appliedGainDb, 0.5, 0.0, -80.0, -12.0, sampleRateHz,
-        channelBandwidthHz);
-    if (!std::isfinite(signal.dbfs)) {
-      iq.assign(4096 * 2, 0);
-      continue;
-    }
-    dbfsSum += signal.dbfs;
-    compensatedSum += signal.compensatedDbfs;
-    levelSum += signal.level120;
-    validBlocks++;
-    iq.assign(4096 * 2, 0);
+    remaining -= std::min(remaining, samples);
   }
-
-  if (validBlocks == 0) {
-    return false;
-  }
-  out = {};
-  out.dbfs = dbfsSum / validBlocks;
-  out.compensatedDbfs = compensatedSum / validBlocks;
-  out.level120 = static_cast<float>(levelSum / validBlocks);
   return true;
+}
+
+double clipRatio(const uint8_t *iq, size_t samples) {
+  if (!iq || samples == 0) {
+    return 0.0;
+  }
+  size_t hard = 0;
+  size_t near = 0;
+  for (size_t i = 0; i < samples * 2; ++i) {
+    const uint8_t value = iq[i];
+    if (fm_tuner::dsp::isRtlSdrIqByteSaturated(value)) {
+      hard++;
+    }
+    if (value <= 8 || value >= 247) {
+      near++;
+    }
+  }
+  const double count = static_cast<double>(samples * 2);
+  return std::max(static_cast<double>(hard) / count,
+                  static_cast<double>(near) / count);
 }
 
 } // namespace
@@ -96,15 +83,18 @@ int runBandSweep(const BandSweepOptions &options) {
               << options.deviceIndex << "\n";
     return 1;
   }
-  if (!dev.setSampleRate(options.sampleRateHz)) {
-    std::cerr << "[CALIBRATE] failed to set sample rate "
-              << options.sampleRateHz << "\n";
+
+  const uint32_t captureRateHz =
+      std::max(options.sampleRateHz, kMinimumCaptureRateHz);
+  if (!dev.setSampleRate(captureRateHz)) {
+    std::cerr << "[CALIBRATE] failed to set sample rate " << captureRateHz
+              << "\n";
     dev.disconnect();
     return 1;
   }
 
-  dev.setLowLatencyMode(true);
-  const bool autoGain = options.gainTenthsDb < 0;
+  dev.setLowLatencyMode(false);
+  const bool autoGain = options.gainDb < 0;
   if (autoGain) {
     if (!dev.setGainMode(false)) {
       std::cerr << "[CALIBRATE] failed to enable auto-gain mode\n";
@@ -114,146 +104,174 @@ int runBandSweep(const BandSweepOptions &options) {
     std::cout << "[CALIBRATE] gain mode: auto\n";
   } else {
     if (!dev.setGainMode(true) ||
-        !dev.setGain(static_cast<uint32_t>(options.gainTenthsDb))) {
+        !dev.setGain(static_cast<uint32_t>(options.gainDb * 10))) {
       std::cerr << "[CALIBRATE] failed to set manual gain\n";
       dev.disconnect();
       return 1;
     }
     std::cout << "[CALIBRATE] gain mode: manual "
-              << (options.gainTenthsDb / 10.0) << " dB\n";
+              << options.gainDb << " dB\n";
   }
 
-  const uint32_t totalSteps =
-      (options.endKHz - options.startKHz) / options.stepKHz + 1;
+  const uint32_t startHz = options.startKHz * 1000U;
+  const uint32_t endHz = options.endKHz * 1000U;
+  const uint32_t gridStepHz = options.stepKHz * 1000U;
+  const std::vector<uint32_t> centers = makeCaptureCenters(
+      startHz, endHz, gridStepHz, captureRateHz, fm_tuner::kTunedMeterWindowHz);
+  if (centers.empty()) {
+    std::cerr << "[CALIBRATE] invalid sweep geometry\n";
+    dev.disconnect();
+    return 1;
+  }
+
+  const size_t pointCount = (endHz - startHz) / gridStepHz + 1;
+  std::vector<Measurement> measurements(pointCount);
+  for (size_t i = 0; i < pointCount; ++i) {
+    measurements[i].freqKHz =
+        (startHz + static_cast<uint32_t>(i) * gridStepHz) / 1000U;
+    measurements[i].dbfs = std::numeric_limits<double>::quiet_NaN();
+    measurements[i].compensatedDbfs = std::numeric_limits<double>::quiet_NaN();
+  }
+
   std::cout << "[CALIBRATE] sweeping " << (options.startKHz / 1000.0) << " - "
-            << (options.endKHz / 1000.0) << " MHz, step "
-            << options.stepKHz << " kHz, " << totalSteps << " points\n";
-  std::cout << "[CALIBRATE] channel BW: " << options.channelBandwidthHz
-            << " Hz, sample rate: " << options.sampleRateHz << " Hz\n";
+            << (options.endKHz / 1000.0) << " MHz, " << options.stepKHz
+            << " kHz grid, " << centers.size() << " wide captures for "
+            << pointCount << " points\n";
+  std::cout << "[CALIBRATE] measurement window: "
+            << fm_tuner::kTunedMeterWindowHz
+            << " Hz, temporary capture rate: " << captureRateHz << " Hz\n";
 
-  struct Row {
-    uint32_t freqKHz;
-    double dbfs;
-    double compensatedDbfs;
-    double level120;
-  };
-  std::vector<Row> rows;
-  rows.reserve(totalSteps);
-
-  uint32_t step = 0;
-  for (uint32_t f = options.startKHz; f <= options.endKHz;
-       f += options.stepKHz) {
-    SignalLevelResult r;
-    if (!measureFrequency(dev, f, options.sampleRateHz,
-                          autoGain ? 0 : options.gainTenthsDb / 10,
-                          options.channelBandwidthHz, r)) {
+  const int appliedGainDb = autoGain ? 0 : options.gainDb;
+  IqSpectrum spectrum;
+  std::vector<uint8_t> iq(kCaptureSamples * 2);
+  for (size_t capture = 0; capture < centers.size(); ++capture) {
+    const uint32_t centerHz = centers[capture];
+    if (!dev.setFrequency(centerHz) ||
+        !settleAfterRetune(dev, iq, captureRateHz)) {
+      std::cerr << "[CALIBRATE] warning: failed to settle at "
+                << (centerHz / 1000U) << " kHz\n";
       continue;
     }
-    rows.push_back({f, r.dbfs, r.compensatedDbfs, r.level120});
-    step++;
-    if (step % 20 == 0) {
-      std::cout << "[CALIBRATE] progress: " << step << "/" << totalSteps << "\n";
+
+    size_t samples = 0;
+    if (!readIqWithRetries(dev, iq, kCaptureSamples, 4,
+                           std::chrono::milliseconds(15), samples) ||
+        !spectrum.analyse(iq.data(), samples, captureRateHz)) {
+      std::cerr << "[CALIBRATE] warning: no spectrum at " << (centerHz / 1000U)
+                << " kHz\n";
+      continue;
     }
+
+    const double captureClipRatio = clipRatio(iq.data(), samples);
+    const int64_t usableHalfSpan =
+        static_cast<int64_t>(spectrum.halfSpanHz() * 0.85) -
+        fm_tuner::kTunedMeterWindowHz / 2;
+    for (size_t point = 0; point < measurements.size(); ++point) {
+      const int64_t frequencyHz = static_cast<int64_t>(startHz) +
+                                  static_cast<int64_t>(point) * gridStepHz;
+      const int64_t offsetHz = frequencyHz - centerHz;
+      if (std::llabs(offsetHz) > usableHalfSpan) {
+        continue;
+      }
+      const double dbfs =
+          spectrum.channelDbfs(offsetHz, fm_tuner::kTunedMeterWindowHz);
+      if (!std::isfinite(dbfs)) {
+        continue;
+      }
+
+      Measurement &slot = measurements[point];
+      const bool candidateClipped =
+          captureClipRatio >= fm_tuner::kCalibrationClipRatio;
+      const bool slotClipped =
+          slot.clipRatio >= fm_tuner::kCalibrationClipRatio;
+      if (!std::isfinite(slot.dbfs) || (slotClipped && !candidateClipped) ||
+          (slotClipped == candidateClipped && dbfs > slot.dbfs)) {
+        slot.dbfs = dbfs;
+        slot.compensatedDbfs = dbfs - static_cast<double>(appliedGainDb) *
+                                          fm_tuner::kSignalGainCompFactor;
+        slot.clipRatio = captureClipRatio;
+      }
+    }
+
+    std::cout << "[CALIBRATE] progress: " << (capture + 1) << "/"
+              << centers.size() << " captures\n";
   }
   dev.disconnect();
 
-  if (rows.empty()) {
+  measurements.erase(std::remove_if(measurements.begin(), measurements.end(),
+                                    [](const Measurement &measurement) {
+                                      return !std::isfinite(measurement.dbfs);
+                                    }),
+                     measurements.end());
+  if (measurements.empty()) {
     std::cerr << "[CALIBRATE] no measurements collected\n";
     return 1;
   }
 
+  const Recommendation recommendation = recommendWindow(measurements);
+  if (!recommendation.valid) {
+    std::cerr
+        << "[CALIBRATE] too few clean measurements; lower gain and retry\n";
+    return 1;
+  }
+
   std::cout << "\n[CALIBRATE] per-frequency results:\n";
-  std::cout << "  freq_MHz   dBFS   level120\n";
-  for (const Row &row : rows) {
-    std::printf("  %7.1f   %5.1f   %6.1f\n", row.freqKHz / 1000.0, row.dbfs,
-                row.level120);
+  std::cout << "  freq_MHz   dBFS   compensated   level120   clip\n";
+  for (const Measurement &row : measurements) {
+    const float level = computeDisplaySignalLevel120(
+        row.dbfs, 0.0, appliedGainDb, fm_tuner::kSignalGainCompFactor, 0.0,
+        recommendation.floorDbfs, recommendation.ceilDbfs, false);
+    std::printf("  %7.1f   %5.1f      %5.1f       %6.1f   %.4f%s\n",
+                row.freqKHz / 1000.0, row.dbfs, row.compensatedDbfs, level,
+                row.clipRatio,
+                row.clipRatio >= fm_tuner::kCalibrationClipRatio ? " *" : "");
   }
 
   std::cout << "\n[CALIBRATE] detected stations (level120 > 30):\n";
-  std::cout << "  freq_MHz   dBFS   level120\n";
-  std::vector<Row> stations;
-  for (const Row &row : rows) {
-    if (row.level120 > 30.0) {
-      stations.push_back(row);
+  std::cout << "  freq_MHz   compensated   level120\n";
+  std::vector<std::pair<float, const Measurement *>> stations;
+  for (const Measurement &row : measurements) {
+    if (row.clipRatio >= fm_tuner::kCalibrationClipRatio) {
+      continue;
+    }
+    const float level = computeDisplaySignalLevel120(
+        row.dbfs, 0.0, appliedGainDb, fm_tuner::kSignalGainCompFactor, 0.0,
+        recommendation.floorDbfs, recommendation.ceilDbfs, false);
+    if (level > 30.0f) {
+      stations.emplace_back(level, &row);
     }
   }
   std::sort(stations.begin(), stations.end(),
-            [](const Row &a, const Row &b) { return a.level120 > b.level120; });
-  for (const Row &row : stations) {
-    std::printf("  %7.1f   %5.1f   %6.1f\n", row.freqKHz / 1000.0, row.dbfs,
-                row.level120);
+            [](const auto &a, const auto &b) { return a.first > b.first; });
+  for (const auto &[level, row] : stations) {
+    std::printf("  %7.1f      %5.1f       %6.1f\n", row->freqKHz / 1000.0,
+                row->compensatedDbfs, level);
   }
   if (stations.empty()) {
     std::cout << "  (none — check antenna connection and signal coverage)\n";
   }
 
-  std::vector<double> dbfsSorted;
-  dbfsSorted.reserve(rows.size());
-  for (const Row &row : rows) {
-    dbfsSorted.push_back(row.dbfs);
-  }
-  std::sort(dbfsSorted.begin(), dbfsSorted.end());
-  const double p05 = dbfsSorted[static_cast<size_t>(dbfsSorted.size() * 0.05)];
-  const double p50 = dbfsSorted[dbfsSorted.size() / 2];
-  const double p95 = dbfsSorted[static_cast<size_t>(dbfsSorted.size() * 0.95)];
-  const double pMax = dbfsSorted.back();
-  const double pMin = dbfsSorted.front();
-
-  // Compute the ceiling from the strongest *non-saturated* readings only.
-  // RTL-SDR with R820T saturates around -3 to -6 dBFS — past that point the
-  // tuner AGC has clipped and the dBFS value no longer reflects the true RF
-  // strength of the station, it just hugs the rail. Including those points
-  // in p95 pulls the meter ceiling up into saturation territory and burns
-  // meter resolution on stations the receiver can't represent accurately.
-  // -6 dBFS is the conservative cutoff: anything closer to 0 dBFS is in
-  // the rail region and shouldn't drive the calibration window.
-  constexpr double kSaturationThresholdDbfs = -6.0;
-  std::vector<double> dbfsCleanSorted;
-  dbfsCleanSorted.reserve(rows.size());
-  for (const Row &row : rows) {
-    if (row.dbfs <= kSaturationThresholdDbfs) {
-      dbfsCleanSorted.push_back(row.dbfs);
-    }
-  }
-  std::sort(dbfsCleanSorted.begin(), dbfsCleanSorted.end());
-  const size_t saturatedCount = rows.size() - dbfsCleanSorted.size();
-  // Fall back to the full p95 if too few non-saturated points exist to make a
-  // meaningful percentile (e.g. very hot antenna with no gain reduction).
-  const double cleanP95 =
-      (dbfsCleanSorted.size() >= 10)
-          ? dbfsCleanSorted[static_cast<size_t>(dbfsCleanSorted.size() * 0.95)]
-          : p95;
-
-  std::cout << "\n[CALIBRATE] signal envelope: min=" << pMin << " p05=" << p05
-            << " median=" << p50 << " p95=" << p95 << " max=" << pMax
-            << " dBFS\n";
-  if (saturatedCount > 0) {
-    std::cout << "[CALIBRATE] " << saturatedCount
-              << " point(s) at >= " << kSaturationThresholdDbfs
-              << " dBFS treated as ADC-saturated and excluded from ceiling "
-                 "calculation (non-saturated p95 = "
-              << cleanP95 << " dBFS)\n";
+  std::cout << "\n[CALIBRATE] clean compensated envelope: min="
+            << recommendation.minimumDbfs << " p05=" << recommendation.p05Dbfs
+            << " median=" << recommendation.medianDbfs
+            << " p95=" << recommendation.p95Dbfs
+            << " max=" << recommendation.maximumDbfs << " dBFS\n";
+  if (recommendation.saturatedCount > 0) {
+    std::cout << "[CALIBRATE] " << recommendation.saturatedCount
+              << " grid point(s) excluded because their capture clipped. "
+                 "Lower gain and recalibrate if important stations are marked "
+                 "with *.\n";
   }
 
-  const int recommendedFloor = static_cast<int>(std::round(p05 - 3.0));
-  // Ceiling = strongest non-saturated reading + 3 dB headroom, but never
-  // above the saturation threshold. The clamp is what makes the algorithm
-  // self-correcting on hot antennas: if cleanP95 already sits just below
-  // the rail, the +3 dB would otherwise push it back into the saturation
-  // zone and we'd lose the resolution we just gained by filtering. Capping
-  // at the threshold means "everything at or past the rail maps to 120",
-  // which matches what the meter physically can represent.
-  const double rawCeil = cleanP95 + 3.0;
-  const double clampedCeil = std::min(rawCeil, kSaturationThresholdDbfs);
-  const int recommendedCeil = static_cast<int>(std::round(clampedCeil));
   std::cout << "\n[CALIBRATE] recommended INI values for this antenna / "
                "location — paste into the [sdr] section of your config:\n\n";
-  std::cout << "    signal_floor_dbfs = " << recommendedFloor << "\n";
-  std::cout << "    signal_ceil_dbfs  = " << recommendedCeil << "\n";
+  std::cout << "    signal_floor_dbfs = " << recommendation.floorDbfs << "\n";
+  std::cout << "    signal_ceil_dbfs  = " << recommendation.ceilDbfs << "\n";
   std::cout << "    signal_bias_db    = 0.0\n";
-  std::cout << "\n    # window: " << (recommendedCeil - recommendedFloor)
-            << " dB (default is 60 dB; tighter = finer per-step meter "
-               "resolution at this location)\n\n";
+  std::cout << "\n    # window: "
+            << (recommendation.ceilDbfs - recommendation.floorDbfs)
+            << " dB; recommendation uses clean compensated measurements and "
+               "ignores the existing meter window\n\n";
   return 0;
 }
 

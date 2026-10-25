@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(fm-sdr-tuner VERSION 1.7.4.1 LANGUAGES CXX)
+project(fm-sdr-tuner VERSION 1.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -137,6 +137,7 @@ set(SOURCES
     src/signal_level.cpp
     src/adaptive_bandwidth.cpp
     src/calibration.cpp
+    src/calibration_policy.cpp
     src/dsp/multipath_eq.cpp
     src/main.cpp
 )
@@ -222,8 +223,12 @@ if(APPLE)
 endif()
 
 install(TARGETS fm-sdr-tuner RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES fm-sdr-tuner.ini.example fm-sdr-tuner-sdrplay.ini.example
+install(FILES fm-sdr-tuner.ini.example
         DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/fm-sdr-tuner)
+if(FM_TUNER_HAVE_SDRPLAY)
+    install(FILES fm-sdr-tuner-sdrplay.ini.example
+            DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/fm-sdr-tuner)
+endif()
 install(FILES README.md USER-MANUAL.md LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
 install(PROGRAMS scripts/rest_test_panel.py scripts/run_rest_panel.sh
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/rest-panel)

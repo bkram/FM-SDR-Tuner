@@ -1,10 +1,7 @@
 name: Build (macOS)
 
 on:
-  push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -23,26 +20,10 @@ jobs:
           fi
         done
 
-    # Fetch the SDRplay API *headers* so the shipped binary is SDRplay-capable.
-    # The library is dlopen'd at runtime (never linked/bundled), so this
-    # redistributes nothing proprietary and the binary still runs on RTL-only
-    # systems. Public vendor download, no auth; pkgutil --expand-full unpacks
-    # the .pkg payload without running the installer. Pinned version — bump if
-    # it 404s.
-    - name: Fetch SDRplay API headers
-      run: |
-        curl -sSL --retry 3 --max-time 120 -o sdrplay-mac.pkg \
-          https://www.sdrplay.com/software/SDRplayAPI-macos-installer-universal-3.15.1.pkg
-        pkgutil --expand-full sdrplay-mac.pkg sdrplay_pkg
-        echo "SDRPLAY_INC=$(dirname "$(find "$PWD/sdrplay_pkg" -name sdrplay_api.h | head -1)")" >> "$GITHUB_ENV"
-
-    - name: Build (SDRplay-enabled)
+    - name: Build
       run: |
         export OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
-        cmake -S . -B build -DFM_TUNER_ENABLE_SDRPLAY=ON \
-          -DSDRPLAY_INCLUDE_DIR="$SDRPLAY_INC" 2>&1 | tee cmake.log
-        # Fail loudly rather than silently ship an RTL-only binary.
-        grep -q "SDRplay support enabled" cmake.log
+        cmake -S . -B build
         cmake --build build -j$(sysctl -n hw.ncpu)
 
     - name: Run tests
@@ -55,7 +36,7 @@ jobs:
         mkdir -p dist/macos
         cp build/fm-sdr-tuner dist/macos/
         cp README.md USER-MANUAL.md dist/macos/
-        cp fm-sdr-tuner.ini.example fm-sdr-tuner-sdrplay.ini.example dist/macos/
+        cp fm-sdr-tuner.ini.example dist/macos/
         # Ready-to-use config so auto-load (no -c) works on first run.
         cp fm-sdr-tuner.ini.example dist/macos/fm-sdr-tuner.ini
         cp scripts/rest_test_panel.py scripts/run_rest_panel.sh dist/macos/

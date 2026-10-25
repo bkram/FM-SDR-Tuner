@@ -13,6 +13,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 #endif
+#include "socket_subsystem.h"
+
 #include <cerrno>
 #include <cstring>
 #include <iostream>
@@ -23,13 +25,38 @@ namespace {
 constexpr uint32_t kRtlTcpMaxTunerType = 6;
 constexpr uint32_t kRtlTcpMaxGainCount = 512;
 
-void closeSocket(int sock) {
+void closeSocket(SocketHandle sock) {
 #if defined(_WIN32)
   closesocket(static_cast<SOCKET>(sock));
 #else
-  close(sock);
+  close(static_cast<int>(sock));
 #endif
 }
+
+// The length argument of send()/recv() is size_t on POSIX and int on
+// Windows. Clamp to int on Windows (a single socket transfer never reaches
+// 2 GB) and pass the size_t through unchanged elsewhere, so neither platform
+// trips a sign-conversion warning.
+#if defined(_WIN32)
+using SocketLength = int;
+inline SocketLength socketLength(size_t n) {
+  return static_cast<int>(n > 0x7FFFFFFFu ? 0x7FFFFFFFu : n);
+}
+#else
+using SocketLength = size_t;
+inline SocketLength socketLength(size_t n) { return n; }
+#endif
+
+// The platform's socket type: SOCKET on Windows, an int descriptor on POSIX.
+#if defined(_WIN32)
+inline SOCKET nativeSocket(SocketHandle handle) {
+  return static_cast<SOCKET>(handle);
+}
+#else
+inline int nativeSocket(SocketHandle handle) {
+  return static_cast<int>(handle);
+}
+#endif
 
 int lastSocketError() {
 #if defined(_WIN32)
@@ -55,7 +82,7 @@ bool socketWouldBlock(int err) {
 #endif
 }
 
-void setRecvTimeoutMs(int sock, int timeoutMs) {
+void setRecvTimeoutMs(SocketHandle sock, int timeoutMs) {
 #if defined(_WIN32)
   const DWORD timeout = timeoutMs > 0 ? static_cast<DWORD>(timeoutMs) : 0;
   setsockopt(static_cast<SOCKET>(sock), SOL_SOCKET, SO_RCVTIMEO,
@@ -64,20 +91,17 @@ void setRecvTimeoutMs(int sock, int timeoutMs) {
   struct timeval tv;
   tv.tv_sec = timeoutMs / 1000;
   tv.tv_usec = (timeoutMs % 1000) * 1000;
-  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(static_cast<int>(sock), SOL_SOCKET, SO_RCVTIMEO, &tv,
+             sizeof(tv));
 #endif
 }
 
 bool ensureSocketSubsystem() {
 #if defined(_WIN32)
-  static bool initialized = false;
-  static bool success = false;
-  if (!initialized) {
-    WSADATA wsaData;
-    success = (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0);
-    initialized = true;
-  }
-  return success;
+  // One reference for the lifetime of the process; the subsystem is shut
+  // down when the static lease is destroyed at exit.
+  static SocketSubsystemLease lease;
+  return lease.ok();
 #else
   return true;
 #endif
@@ -109,7 +133,8 @@ bool validateRtlTcpHeader(const uint8_t *header) {
 } // namespace
 
 RTLTCPClient::RTLTCPClient(const std::string &host, uint16_t port)
-    : m_host(host), m_port(port), m_socket(-1), m_connected(false),
+    : m_host(host), m_port(port), m_socket(kInvalidSocket),
+      m_connected(false),
       m_frequency(0), m_sampleRate(1024000), m_havePendingIqByte(false),
       m_pendingIqByte(0) {}
 
@@ -137,14 +162,14 @@ bool RTLTCPClient::connect() {
     return false;
   }
 
-  m_socket = -1;
+  m_socket = kInvalidSocket;
   for (struct addrinfo *ai = results; ai != nullptr; ai = ai->ai_next) {
-    const int sock = static_cast<int>(
+    const SocketHandle sock = static_cast<SocketHandle>(
         socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol));
-    if (sock < 0) {
+    if (sock == kInvalidSocket) {
       continue;
     }
-    if (::connect(sock, ai->ai_addr, ai->ai_addrlen) == 0) {
+    if (::connect(nativeSocket(sock), ai->ai_addr, ai->ai_addrlen) == 0) {
       m_socket = sock;
       break;
     }
@@ -152,7 +177,7 @@ bool RTLTCPClient::connect() {
   }
   freeaddrinfo(results);
 
-  if (m_socket < 0) {
+  if (m_socket == kInvalidSocket) {
     std::cerr << "Failed to connect to " << m_host << ":" << m_port
               << "\n";
     return false;
@@ -166,7 +191,7 @@ bool RTLTCPClient::connect() {
     std::cerr << "Failed to read initial rtl_tcp header from " << m_host << ":"
               << m_port << "\n";
     closeSocket(m_socket);
-    m_socket = -1;
+    m_socket = kInvalidSocket;
     return false;
   }
 
@@ -174,7 +199,7 @@ bool RTLTCPClient::connect() {
     std::cerr << "Invalid rtl_tcp header from " << m_host << ":" << m_port
               << "\n";
     closeSocket(m_socket);
-    m_socket = -1;
+    m_socket = kInvalidSocket;
     return false;
   }
 
@@ -185,23 +210,34 @@ bool RTLTCPClient::connect() {
 }
 
 void RTLTCPClient::disconnect() {
-  if (m_socket >= 0) {
+  if (m_socket != kInvalidSocket) {
     closeSocket(m_socket);
-    m_socket = -1;
+    m_socket = kInvalidSocket;
   }
   m_connected = false;
   m_havePendingIqByte = false;
 }
 
 bool RTLTCPClient::sendAll(const uint8_t *data, size_t len) {
-  if (!m_connected || m_socket < 0) {
+  if (!m_connected || m_socket == kInvalidSocket) {
     return false;
   }
 
   size_t sent = 0;
   while (sent < len) {
-    const auto n = send(m_socket, reinterpret_cast<const char *>(data + sent),
-                        static_cast<int>(len - sent), 0);
+    // MSG_NOSIGNAL: a server that vanishes mid-command must surface as a
+    // failed send, not as a SIGPIPE that terminates the tuner process.
+#if defined(MSG_NOSIGNAL)
+    const long n = static_cast<long>(
+        send(nativeSocket(m_socket),
+             reinterpret_cast<const char *>(data + sent),
+             socketLength(len - sent), MSG_NOSIGNAL));
+#else
+    const long n = static_cast<long>(
+        send(nativeSocket(m_socket),
+             reinterpret_cast<const char *>(data + sent),
+             socketLength(len - sent), 0));
+#endif
     if (n <= 0) {
       return false;
     }
@@ -211,7 +247,7 @@ bool RTLTCPClient::sendAll(const uint8_t *data, size_t len) {
 }
 
 bool RTLTCPClient::sendCommand(uint8_t cmd, uint32_t param) {
-  if (!m_connected || m_socket < 0) {
+  if (!m_connected || m_socket == kInvalidSocket) {
     return false;
   }
 
@@ -223,24 +259,26 @@ bool RTLTCPClient::sendCommand(uint8_t cmd, uint32_t param) {
 }
 
 bool RTLTCPClient::readResponse(uint8_t *buffer, size_t len) {
-  if (m_socket < 0) {
+  if (m_socket == kInvalidSocket) {
     return false;
   }
 
   size_t totalRead = 0;
   while (totalRead < len) {
-    const auto n = recv(m_socket, reinterpret_cast<char *>(buffer + totalRead),
-                        static_cast<int>(len - totalRead), 0);
+    const long n = static_cast<long>(
+        recv(nativeSocket(m_socket),
+             reinterpret_cast<char *>(buffer + totalRead),
+             socketLength(len - totalRead), 0));
     if (n <= 0) {
       return false;
     }
-    totalRead += n;
+    totalRead += static_cast<size_t>(n);
   }
   return true;
 }
 
 size_t RTLTCPClient::readIQ(uint8_t *buffer, size_t maxSamples) {
-  if (!m_connected || m_socket < 0) {
+  if (!m_connected || m_socket == kInvalidSocket) {
     return 0;
   }
 
@@ -256,8 +294,10 @@ size_t RTLTCPClient::readIQ(uint8_t *buffer, size_t maxSamples) {
   }
 
   while (totalRead < bytesToRead) {
-    const auto n = recv(m_socket, reinterpret_cast<char *>(buffer + totalRead),
-                        static_cast<int>(bytesToRead - totalRead), 0);
+    const long n = static_cast<long>(
+        recv(static_cast<int>(m_socket),
+             reinterpret_cast<char *>(buffer + totalRead),
+             socketLength(bytesToRead - totalRead), 0));
     if (n > 0) {
       totalRead += static_cast<size_t>(n);
       continue;
@@ -283,6 +323,49 @@ size_t RTLTCPClient::readIQ(uint8_t *buffer, size_t maxSamples) {
   }
 
   return totalRead / 2;
+}
+
+void RTLTCPClient::flushBuffers() {
+  if (!m_connected || m_socket == kInvalidSocket) {
+    return;
+  }
+  // Drain whatever the server has already sent but that has not been read
+  // yet. The bytes belong to the centre frequency the tuner just left, so
+  // keeping them would put the previous band's spectrum into the next
+  // measurement.
+  //
+  // The drain uses a short receive timeout rather than a non-blocking mode:
+  // MSG_DONTWAIT does not exist on Windows, and a 1 ms timeout gives the
+  // same "return what is there, do not wait" behaviour on every platform.
+  // The bound stops a fast server from keeping the drain busy forever.
+  constexpr int kDrainTimeoutMs = 1;
+  constexpr size_t kMaxDrainBytes = 1024 * 1024;
+  uint8_t drain[16384];
+  size_t drained = 0;
+  setRecvTimeoutMs(m_socket, kDrainTimeoutMs);
+  while (drained < kMaxDrainBytes) {
+    const long n = recv(nativeSocket(m_socket),
+                         reinterpret_cast<char *>(drain), sizeof(drain), 0);
+    if (n > 0) {
+      drained += static_cast<size_t>(n);
+      continue;
+    }
+    if (n == 0) {
+      // The server closed the connection.
+      m_connected = false;
+      break;
+    }
+    const int err = lastSocketError();
+    if (socketInterrupted(err)) {
+      continue;
+    }
+    break; // timeout / EAGAIN: nothing left to drain
+  }
+  // A half-byte left over from the previous read no longer has a partner in
+  // the stream, so it cannot be carried over.
+  m_havePendingIqByte = false;
+  m_pendingIqByte = 0;
+  setRecvTimeoutMs(m_socket, 2000);
 }
 
 bool RTLTCPClient::setFrequency(uint32_t freqHz) {

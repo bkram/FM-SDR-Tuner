@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include "socket_compat.h"
+
 class XDRServer {
 public:
   static constexpr uint16_t DEFAULT_PORT = 7373;
@@ -30,6 +32,11 @@ public:
   using ForceMonoCallback = std::function<void(bool forceMono)>;
   using StartCallback = std::function<void()>;
   using StopCallback = std::function<void()>;
+  // Reports whether the tuner is already running. The FM-DX path stops the
+  // tuner when a client disconnects, but only when that client is the one
+  // that started it: a client that connects to a tuner somebody else is
+  // already using must not cut the programme when it goes away.
+  using TunerActiveCallback = std::function<bool()>;
 
   XDRServer(uint16_t port = DEFAULT_PORT);
   ~XDRServer();
@@ -67,6 +74,7 @@ public:
   void setBlendModeCallback(IntCallback cb);
   void setStartCallback(StartCallback cb);
   void setStopCallback(StopCallback cb);
+  void setTunerActiveCallback(TunerActiveCallback cb);
 
   uint32_t getFrequency() const { return m_frequency; }
   int getMode() const { return m_mode; }
@@ -100,36 +108,81 @@ public:
   void pushScanLine(const std::string &line);
 
 private:
-  void addClientSocket(int clientSocket);
-  void removeClientSocket(int clientSocket);
+  void addClientSocket(SocketHandle clientSocket);
+  void removeClientSocket(SocketHandle clientSocket);
   void joinClientThreads();
-  void handleClient(int clientSocket);
-  void handleFmdxClient(int clientSocket);
-  void handleXdrClient(int clientSocket, const char *clientIP);
+  void reapFinishedClientThreads();
+  void handleClient(SocketHandle clientSocket);
+  void handleFmdxClient(SocketHandle clientSocket, const char *clientIP);
+  void handleXdrClient(SocketHandle clientSocket, const char *clientIP);
   std::string processCommand(const std::string &cmd, bool authenticated,
-                             bool guestSession);
+                             bool guestSession,
+                             SocketHandle clientSocket = kInvalidSocket);
   std::string processFmdxCommand(const std::string &cmd);
   std::string generateSalt();
   std::string computeSHA1(const std::string &salt, const std::string &password);
   bool authenticate(const std::string &salt, const std::string &passwordHash);
   std::string buildXdrStateSnapshot() const;
   std::string buildSignalLine() const;
+  void resetPiHistory();
+  // Number of connected clients, split into authenticated and guest. The
+  // "o<auth>,<guest>" line reports these; the reference daemon maintains real
+  // counters and broadcasts the line on connect and disconnect
+  // (research/xdrd/xdrd.c:87, :800, :828).
+  void addOnlineClient(bool authenticated);
+  void removeOnlineClient(bool authenticated);
+  std::string onlineLine() const;
+  // Sends the "o" line to every client whose session is established, except
+  // `exclude`. A client still in its handshake is left out: it is waiting for
+  // its salt, and an "o" line arriving first would be read as the salt.
+  void broadcastOnlineLine(SocketHandle exclude = kInvalidSocket);
+  // Shared use of the tuner by FM-DX clients. The first client to start a
+  // stopped tuner makes the FM-DX clients its owner; it is stopped again only
+  // when the last FM-DX client using it leaves, so one client hanging up does
+  // not stop the station under another.
+  void acquireFmdxTuner();
+  void releaseFmdxTuner(bool stopNow);
 
   uint16_t m_port;
-  int m_serverSocket;
+  // The listening socket. Atomic because stop() reads it (to shutdown) while
+  // the accept thread reads it (to accept and, on exit, to close). Only the
+  // accept thread ever closes it, so the fd can never be closed and reused
+  // underneath a concurrent accept() call.
+  std::atomic<SocketHandle> m_serverSocket;
   std::atomic<bool> m_running;
   std::thread m_acceptThread;
   std::mutex m_clientSocketsMutex;
-  std::vector<int> m_clientSockets;
+  std::vector<SocketHandle> m_clientSockets;
+  // The subset of m_clientSockets whose XDR session is established (salt
+  // sent, hash answered). Only these receive the broadcast "o" line.
+  std::vector<SocketHandle> m_onlineSockets;
+  std::mutex m_fmdxTunerMutex;
+  int m_fmdxTunerUsers = 0;
+  bool m_fmdxStartedTuner = false;
   std::mutex m_clientThreadsMutex;
-  std::vector<std::thread> m_clientThreads;
+  // Each accepted client gets a worker thread. The entry carries a `done` flag
+  // so the accept loop can join and drop the threads of clients that have
+  // already disconnected, rather than letting them accumulate for the
+  // lifetime of the process.
+  struct ClientThread {
+    std::atomic<bool> done{false};
+    std::thread thread;
+  };
+  std::vector<std::shared_ptr<ClientThread>> m_clientThreads;
 
   std::string m_password;
   bool m_guestMode;
   std::atomic<bool> m_verboseLogging;
+  // Connected-client counters backing the "o<auth>,<guest>" line.
+  std::atomic<int> m_onlineAuth{0};
+  std::atomic<int> m_onlineGuest{0};
 
   std::atomic<int> m_mode;
   std::atomic<uint32_t> m_frequency;
+  // The last frequency XDRServer was told about via setFrequencyState(). Kept
+  // separate from m_frequency, which the 'T' command handler publishes
+  // directly — comparing against m_frequency there would never see a change.
+  std::atomic<uint32_t> m_lastAppliedFrequency{0};
   std::atomic<int> m_volume;
   std::atomic<int> m_deemphasis;
   std::atomic<int> m_filter;
@@ -168,6 +221,10 @@ private:
   std::atomic<bool> m_scanContinuous;
   std::atomic<bool> m_scanStartPending;
   std::atomic<bool> m_scanCancelPending;
+  // The socket that armed the running scan. A scan is cancelled on disconnect
+  // only when the client that started it goes away — otherwise any other
+  // client hanging up would abort someone else's sweep.
+  std::atomic<SocketHandle> m_scanOwnerSocket{kInvalidSocket};
   std::deque<std::pair<uint64_t, std::string>> m_scanQueue;
   uint64_t m_scanNextSeq = 1;
   std::mutex m_scanMutex;
@@ -189,6 +246,7 @@ private:
   IntCallback m_blendModeCallback;
   StartCallback m_startCallback;
   StopCallback m_stopCallback;
+  TunerActiveCallback m_tunerActiveCallback;
 
   std::mutex m_callbackMutex;
 

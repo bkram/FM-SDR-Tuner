@@ -1,5 +1,9 @@
 #include "wav_writer.h"
 
+#include "dsp/mpx_resampler.h"
+
+#include "wav_limits.h"
+
 #include <algorithm>
 #include <chrono>
 #include <iostream>
@@ -60,7 +64,8 @@ bool WavWriter::init(const std::string &filename, uint32_t sampleRate,
     const float ratio =
         static_cast<float>(sampleRate) / static_cast<float>(resampleFromHz);
     try {
-      m_resampler.init(ratio);
+      fm_tuner::dsp::initMpxResampler(m_resampler, resampleFromHz,
+                                      sampleRate);
       m_resampleEnabled = true;
       if (m_verboseLogging) {
         std::cout << "[AUDIO] " << m_label << " resample "
@@ -156,10 +161,8 @@ bool WavWriter::writeData(const int16_t *samples, size_t sampleCount) {
   if (m_fatalError.load()) {
     return false;
   }
-  const size_t maxBytes =
-      static_cast<size_t>(UINT32_MAX) - 36u - m_dataSize;
   const size_t wantBytes = sampleCount * sizeof(int16_t);
-  if (wantBytes > maxBytes) {
+  if (!wavDataFits(m_dataSize, wantBytes)) {
     if (m_verboseLogging) {
       std::cerr << "[AUDIO] " << m_label
                 << " reached 4 GiB WAV limit, stopping capture\n";

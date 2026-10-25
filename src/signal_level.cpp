@@ -1,22 +1,12 @@
 #include "signal_level.h"
 
-#include "cpu_features.h"
 #include "dsp/iq_saturation.h"
 #include "dsp/liquid_primitives.h"
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <complex>
+#include <limits>
 #include <vector>
-
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
-    defined(_M_IX86)
-#include <immintrin.h>
-#endif
-
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
-#include <arm_neon.h>
-#endif
 
 namespace {
 
@@ -25,134 +15,15 @@ constexpr double kWindowFloor = 1e-12;
 constexpr double kPowerFloor = 1e-20;
 constexpr double kSignalLevelSnrGateDb = 3.0;
 constexpr double kSignalLevelSnrCeilDb = 30.0;
-
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
-    defined(_M_IX86)
-#if defined(__has_attribute)
-#if __has_attribute(target)
-#define SIGLEV_HAS_AVX2 1
-#define SIGLEV_AVX2_TARGET __attribute__((target("avx2,fma")))
-#endif
-#elif defined(__GNUC__)
-#define SIGLEV_HAS_AVX2 1
-#define SIGLEV_AVX2_TARGET __attribute__((target("avx2,fma")))
-#endif
-#if !defined(SIGLEV_HAS_AVX2) && defined(_MSC_VER) && defined(__AVX2__)
-#define SIGLEV_HAS_AVX2 1
-#define SIGLEV_AVX2_TARGET
-#endif
-#endif
-
-#ifndef SIGLEV_HAS_AVX2
-#define SIGLEV_HAS_AVX2 0
-#define SIGLEV_AVX2_TARGET
-#endif
-
-double computeNormalizedIqPowerSumScalar(const uint8_t *iq, size_t count,
-                                         const float *lut) {
-  double powerSum = 0.0;
-  size_t i = 0;
-  for (; i + 4 <= count; i += 4) {
-    powerSum += lut[iq[i]];
-    powerSum += lut[iq[i + 1]];
-    powerSum += lut[iq[i + 2]];
-    powerSum += lut[iq[i + 3]];
-  }
-  for (; i < count; i++) {
-    powerSum += lut[iq[i]];
-  }
-  return powerSum;
-}
-
-#if SIGLEV_HAS_AVX2
-SIGLEV_AVX2_TARGET double computeNormalizedIqPowerSumAvx2(const uint8_t *iq,
-                                                          size_t count,
-                                                          const float *lut) {
-  __m256 acc = _mm256_setzero_ps();
-  size_t i = 0;
-  for (; i + 8 <= count; i += 8) {
-    const __m128i b8 =
-        _mm_loadl_epi64(reinterpret_cast<const __m128i *>(iq + i));
-    const __m256i idx = _mm256_cvtepu8_epi32(b8);
-    const __m256 vals = _mm256_i32gather_ps(lut, idx, 4);
-    acc = _mm256_add_ps(acc, vals);
-  }
-  alignas(32) float lanes[8];
-  _mm256_store_ps(lanes, acc);
-  double powerSum = lanes[0] + lanes[1] + lanes[2] + lanes[3] + lanes[4] +
-                    lanes[5] + lanes[6] + lanes[7];
-  for (; i < count; i++) {
-    powerSum += lut[iq[i]];
-  }
-  return powerSum;
-}
-#endif
-
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
-double computeNormalizedIqPowerSumNeon(const uint8_t *iq, size_t count) {
-  const float32x4_t vMid = vdupq_n_f32(127.0f);
-  const float32x4_t vInv = vdupq_n_f32(1.0f / 127.5f);
-  float32x4_t acc = vdupq_n_f32(0.0f);
-  size_t i = 0;
-  for (; i + 16 <= count; i += 16) {
-    const uint8x16_t v = vld1q_u8(iq + i);
-    const uint16x8_t lo16 = vmovl_u8(vget_low_u8(v));
-    const uint16x8_t hi16 = vmovl_u8(vget_high_u8(v));
-    const uint32x4_t lo32a = vmovl_u16(vget_low_u16(lo16));
-    const uint32x4_t lo32b = vmovl_u16(vget_high_u16(lo16));
-    const uint32x4_t hi32a = vmovl_u16(vget_low_u16(hi16));
-    const uint32x4_t hi32b = vmovl_u16(vget_high_u16(hi16));
-    float32x4_t f0 = vcvtq_f32_u32(lo32a);
-    float32x4_t f1 = vcvtq_f32_u32(lo32b);
-    float32x4_t f2 = vcvtq_f32_u32(hi32a);
-    float32x4_t f3 = vcvtq_f32_u32(hi32b);
-    f0 = vmulq_f32(vsubq_f32(f0, vMid), vInv);
-    f1 = vmulq_f32(vsubq_f32(f1, vMid), vInv);
-    f2 = vmulq_f32(vsubq_f32(f2, vMid), vInv);
-    f3 = vmulq_f32(vsubq_f32(f3, vMid), vInv);
-    acc = vaddq_f32(acc, vmulq_f32(f0, f0));
-    acc = vaddq_f32(acc, vmulq_f32(f1, f1));
-    acc = vaddq_f32(acc, vmulq_f32(f2, f2));
-    acc = vaddq_f32(acc, vmulq_f32(f3, f3));
-  }
-#if defined(__aarch64__)
-  double powerSum = static_cast<double>(vaddvq_f32(acc));
-#else
-  float tmp[4];
-  vst1q_f32(tmp, acc);
-  double powerSum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
-#endif
-  for (; i < count; i++) {
-    const float norm = (static_cast<float>(iq[i]) - 127.0f) * (1.0f / 127.5f);
-    powerSum += static_cast<double>(norm * norm);
-  }
-  return powerSum;
-}
-#endif
-
-double computeNormalizedIqPowerSum(const uint8_t *iq, size_t samples) {
-  static const std::array<float, 256> kNormSqLut = []() {
-    std::array<float, 256> lut{};
-    for (int v = 0; v < 256; v++) {
-      const float norm = (static_cast<float>(v) - 127.0f) / 127.5f;
-      lut[static_cast<size_t>(v)] = norm * norm;
-    }
-    return lut;
-  }();
-  const size_t count = samples * 2;
-  static const CPUFeatures cpu = detectCPUFeatures();
-#if SIGLEV_HAS_AVX2
-  if (cpu.avx2 && cpu.fma) {
-    return computeNormalizedIqPowerSumAvx2(iq, count, kNormSqLut.data());
-  }
-#endif
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
-  if (cpu.neon) {
-    return computeNormalizedIqPowerSumNeon(iq, count);
-  }
-#endif
-  return computeNormalizedIqPowerSumScalar(iq, count, kNormSqLut.data());
-}
+// The noise reference is taken from a wide annulus around the measured
+// channel. A station's own skirt reaches out to +-100 kHz, so an annulus
+// right next to the channel would measure the station instead of the noise;
+// the wide annulus only holds the noise where the station is weak.
+constexpr int kNoiseAnnulusInnerHz = 60000;
+constexpr int kNoiseAnnulusOuterHz = 90000;
+// Distance between the edge of the channel and the annulus used when the
+// analysed spectrum is too narrow to hold the wide one.
+constexpr int kNoiseBandGuardHz = 6000;
 
 size_t nearestPow2(size_t n) {
   size_t p = 1;
@@ -162,77 +33,59 @@ size_t nearestPow2(size_t n) {
   return p;
 }
 
-struct ChannelPowerEstimate {
-  bool valid = false;
-  double channelDbfs = -120.0;
-  double noiseFloorDbfs = -120.0;
-};
+} // namespace
 
-struct SignalMeterFftCache {
-  ~SignalMeterFftCache() {
-    if (plan != nullptr) {
-      fft_destroy_plan(plan);
-    }
+// The Hann window is applied to the input, so the mean power of the spectrum
+// is sum(|X|^2)/(N * sum(w^2)), not sum(|X|^2)/N^2: sum(w^2) is 0.375*N for a
+// Hann window. Without the window factor the estimate reads about 4.26 dB too
+// low (measured against the time-domain mean power of the same filtered IQ).
+constexpr double kHannWindowPowerFactor = 0.375;
+
+IqSpectrum::IqSpectrum() = default;
+
+IqSpectrum::~IqSpectrum() {
+  if (m_plan != nullptr) {
+    fft_destroy_plan(m_plan);
+    m_plan = nullptr;
+  }
+}
+
+bool IqSpectrum::analyse(const uint8_t *iq, size_t samples,
+                          uint32_t sampleRateHz) {
+  m_valid = false;
+  if (!iq || samples == 0 || sampleRateHz == 0) {
+    return false;
   }
 
-  bool ensureSize(size_t requestedNfft) {
-    if (nfft == requestedNfft && plan != nullptr) {
-      return true;
-    }
-    if (plan != nullptr) {
-      fft_destroy_plan(plan);
-      plan = nullptr;
-    }
-    nfft = requestedNfft;
-    fftIn.assign(nfft, {});
-    fftOut.assign(nfft, {});
-    plan = fft_create_plan(static_cast<unsigned int>(nfft), fftIn.data(),
-                           fftOut.data(), LIQUID_FFT_FORWARD, 0);
-    return plan != nullptr;
-  }
-
-  size_t nfft = 0;
-  std::vector<std::complex<float>> fftIn{};
-  std::vector<std::complex<float>> fftOut{};
-  fftplan plan = nullptr;
-};
-
-ChannelPowerEstimate estimateCenteredChannelPower(const uint8_t *iq,
-                                                  size_t samples,
-                                                  uint32_t sampleRateHz,
-                                                  int channelBandwidthHz) {
-  ChannelPowerEstimate out{};
-  if (!iq || samples == 0 || sampleRateHz == 0 || channelBandwidthHz <= 0) {
-    return out;
-  }
-
-  const size_t nfft = nearestPow2(std::min<size_t>(samples, 8192));
+  const size_t nfft = nearestPow2(std::min<size_t>(samples, 32768));
   if (nfft < 1024) {
-    return out;
+    return false;
+  }
+  if (m_nfft != nfft || m_plan == nullptr) {
+    if (m_plan != nullptr) {
+      fft_destroy_plan(m_plan);
+      m_plan = nullptr;
+    }
+    m_nfft = nfft;
+    m_fftIn.assign(nfft, {});
+    m_fftOut.assign(nfft, {});
+    m_window.assign(nfft, 0.0f);
+    for (size_t i = 0; i < nfft; i++) {
+      m_window[i] = 0.5f - 0.5f * std::cos((2.0f * kPi *
+                                            static_cast<float>(i)) /
+                                           static_cast<float>(nfft - 1));
+    }
+    m_plan = fft_create_plan(static_cast<unsigned int>(nfft), m_fftIn.data(),
+                              m_fftOut.data(), LIQUID_FFT_FORWARD, 0);
+    if (m_plan == nullptr) {
+      m_nfft = 0;
+      return false;
+    }
+    m_planCreations++;
   }
 
-  const float binHz =
-      static_cast<float>(sampleRateHz) / static_cast<float>(nfft);
-  if (binHz <= 0.0f) {
-    return out;
-  }
-
-  const int bandHalf = std::max(
-      1, static_cast<int>(std::lround((channelBandwidthHz * 0.5f) / binHz)));
-  const int dcRejectBins =
-      std::max(1, static_cast<int>(std::lround(4000.0f / binHz)));
-  const int guardBins =
-      std::max(1, static_cast<int>(std::lround(4000.0f / binHz)));
-  const int sideSpanBins = std::max(
-      bandHalf, static_cast<int>(std::lround((channelBandwidthHz * 0.5f) / binHz)));
-  if (bandHalf <= dcRejectBins) {
-    return out;
-  }
-
-  thread_local SignalMeterFftCache cache;
-  if (!cache.ensureSize(nfft)) {
-    return out;
-  }
+  m_sampleRateHz = sampleRateHz;
+  m_binHz = static_cast<double>(sampleRateHz) / static_cast<double>(nfft);
 
   double meanI = 0.0;
   double meanQ = 0.0;
@@ -242,73 +95,142 @@ ChannelPowerEstimate estimateCenteredChannelPower(const uint8_t *iq,
   }
   meanI /= static_cast<double>(nfft);
   meanQ /= static_cast<double>(nfft);
+  if (m_dcRemoval == DcRemoval::Tracked) {
+    // One-pole average of the block means. The first block starts the
+    // estimate at zero rather than at its own mean: starting at the block
+    // mean would remove a carrier at DC from the very first reading.
+    const double blockSeconds =
+        static_cast<double>(nfft) / static_cast<double>(sampleRateHz);
+    const double alpha =
+        std::min(1.0, blockSeconds / kDcTrackingTimeConstantS);
+    if (!m_dcValid) {
+      m_dcI = 0.0;
+      m_dcQ = 0.0;
+      m_dcValid = true;
+    }
+    m_dcI += alpha * (meanI - m_dcI);
+    m_dcQ += alpha * (meanQ - m_dcQ);
+    meanI = m_dcI;
+    meanQ = m_dcQ;
+  }
 
   for (size_t i = 0; i < nfft; i++) {
     const float iRaw = static_cast<float>(
         (static_cast<int>(iq[i * 2]) - 127.5) * (1.0 / 127.5) - meanI);
     const float qRaw = static_cast<float>(
         (static_cast<int>(iq[i * 2 + 1]) - 127.5) * (1.0 / 127.5) - meanQ);
-    const float w = 0.5f - 0.5f * std::cos((2.0f * kPi * static_cast<float>(i)) /
-                                           static_cast<float>(nfft - 1));
-    cache.fftIn[i] = {iRaw * w, qRaw * w};
+    m_fftIn[i] = {iRaw * m_window[i], qRaw * m_window[i]};
   }
 
-  fft_execute(cache.plan);
+  fft_execute(m_plan);
 
-  double channelSum = 0.0;
-  int channelBins = 0;
-  for (int b = -bandHalf; b <= bandHalf; b++) {
-    if (std::abs(b) <= dcRejectBins) {
-      continue;
-    }
-    const size_t idx =
-        static_cast<size_t>((b >= 0) ? b : static_cast<int>(nfft) + b);
-    const float re = cache.fftOut[idx].real();
-    const float im = cache.fftOut[idx].imag();
-    channelSum += static_cast<double>(re) * static_cast<double>(re) +
-                  static_cast<double>(im) * static_cast<double>(im);
-    channelBins++;
+  // The transform output runs from DC up to Nyquist and then wraps to the
+  // negative frequencies. Copy it into an ascending-frequency array so the
+  // band and annulus queries are plain ranges.
+  const size_t half = nfft / 2;
+  m_power.assign(nfft, 0.0);
+  const double norm = 1.0 / (kHannWindowPowerFactor *
+                              static_cast<double>(nfft) *
+                              static_cast<double>(nfft));
+  for (size_t j = 0; j < nfft; j++) {
+    const int64_t offset = (j < half) ? static_cast<int64_t>(j)
+                                       : (static_cast<int64_t>(j) -
+                                          static_cast<int64_t>(nfft));
+    const size_t idx = static_cast<size_t>(offset + static_cast<int64_t>(half));
+    const float re = m_fftOut[j].real();
+    const float im = m_fftOut[j].imag();
+    m_power[idx] = (static_cast<double>(re) * static_cast<double>(re) +
+                     static_cast<double>(im) * static_cast<double>(im)) *
+                    norm;
   }
-
-  double sideSum = 0.0;
-  int sideBins = 0;
-  for (int sign : {-1, 1}) {
-    const int start = sign * (bandHalf + guardBins);
-    const int stop = sign * (bandHalf + guardBins + sideSpanBins);
-    const int step = (start <= stop) ? 1 : -1;
-    for (int b = start; b != stop + step; b += step) {
-      const size_t idx =
-          static_cast<size_t>((b >= 0) ? b : static_cast<int>(nfft) + b);
-      const float re = cache.fftOut[idx].real();
-      const float im = cache.fftOut[idx].imag();
-      sideSum += static_cast<double>(re) * static_cast<double>(re) +
-                 static_cast<double>(im) * static_cast<double>(im);
-      sideBins++;
-    }
+  m_prefix.assign(nfft + 1, 0.0);
+  for (size_t i = 0; i < nfft; i++) {
+    m_prefix[i + 1] = m_prefix[i] + m_power[i];
   }
-
-  if (channelBins <= 0) {
-    return out;
-  }
-
-  const double nfftNorm =
-      static_cast<double>(nfft) * static_cast<double>(nfft);
-  const double channelPower =
-      std::max(kPowerFloor, channelSum / nfftNorm);
-  const double sideMeanPowerPerBin =
-      std::max(kPowerFloor, (sideBins > 0)
-                                ? ((sideSum / static_cast<double>(sideBins)) /
-                                   nfftNorm)
-                                : (channelPower / static_cast<double>(channelBins)));
-  const double sidePower =
-      std::max(kPowerFloor,
-               sideMeanPowerPerBin * static_cast<double>(channelBins));
-
-  out.valid = true;
-  out.channelDbfs = 10.0 * std::log10(channelPower + kWindowFloor);
-  out.noiseFloorDbfs = 10.0 * std::log10(sidePower + kWindowFloor);
-  return out;
+  m_valid = true;
+  return true;
 }
+
+void IqSpectrum::resetDcEstimate() {
+  m_dcValid = false;
+  m_dcI = 0.0;
+  m_dcQ = 0.0;
+}
+
+double IqSpectrum::halfSpanHz() const {
+  if (!m_valid) {
+    return 0.0;
+  }
+  return static_cast<double>(m_nfft / 2) * m_binHz;
+}
+
+size_t IqSpectrum::binIndex(int64_t offsetHz) const {
+  const int64_t half = static_cast<int64_t>(m_nfft / 2);
+  int64_t idx = static_cast<int64_t>(std::llround(static_cast<double>(offsetHz) /
+                                                  m_binHz)) +
+                half;
+  if (idx < 0) {
+    idx = 0;
+  }
+  if (idx > static_cast<int64_t>(m_nfft) - 1) {
+    idx = static_cast<int64_t>(m_nfft) - 1;
+  }
+  return static_cast<size_t>(idx);
+}
+
+double IqSpectrum::rangeMeanDbfs(int64_t lowHz, int64_t highHz) const {
+  if (!m_valid || highHz < lowHz) {
+    return -200.0;
+  }
+  const int64_t lo = std::max<int64_t>(
+      0, static_cast<int64_t>(binIndex(lowHz)));
+  const int64_t hi = std::min<int64_t>(static_cast<int64_t>(m_nfft) - 1,
+                                       static_cast<int64_t>(binIndex(highHz)));
+  if (hi < lo) {
+    return -200.0;
+  }
+  const double sum = m_prefix[static_cast<size_t>(hi + 1)] - m_prefix[static_cast<size_t>(lo)];
+  const double count = static_cast<double>(hi - lo + 1);
+  return 10.0 * std::log10(std::max(kPowerFloor, sum / count) + kWindowFloor);
+}
+
+double IqSpectrum::channelPower(int64_t refHz, int bandwidthHz) const {
+  if (!m_valid || bandwidthHz <= 0) {
+    return 0.0;
+  }
+  const int64_t half = static_cast<int64_t>(bandwidthHz) / 2;
+  // The band is clipped to the analysed spectrum: a band wider than the
+  // capture reads the whole capture, and a band that would reach past
+  // Nyquist is cut off instead of wrapping onto the other side of the band.
+  const int64_t lo = binIndex(refHz - half);
+  const int64_t hi = binIndex(refHz + half);
+  if (hi < lo) {
+    return 0.0;
+  }
+  const double sum = m_prefix[static_cast<size_t>(hi + 1)] -
+                     m_prefix[static_cast<size_t>(lo)];
+  return std::max(0.0, sum);
+}
+
+double IqSpectrum::channelDbfs(int64_t refHz, int bandwidthHz) const {
+  return 10.0 * std::log10(channelPower(refHz, bandwidthHz) + kWindowFloor);
+}
+
+double IqSpectrum::localNoiseDbfs(int64_t refHz, int annInnerHz,
+                                  int annOuterHz) const {
+  if (!m_valid || annOuterHz <= annInnerHz) {
+    return -120.0;
+  }
+  // The mean power per bin of the two annulus halves, averaged together.
+  const double low = std::pow(
+      10.0, rangeMeanDbfs(refHz - annOuterHz, refHz - annInnerHz) / 10.0);
+  const double high = std::pow(
+      10.0, rangeMeanDbfs(refHz + annInnerHz, refHz + annOuterHz) / 10.0);
+  return 10.0 * std::log10(std::max(kPowerFloor, (low + high) * 0.5) +
+                           kWindowFloor);
+}
+
+namespace {
 
 SignalLevelResult computeWidebandSignalLevel(const uint8_t *iq, size_t samples) {
   SignalLevelResult out{};
@@ -334,12 +256,22 @@ SignalLevelResult computeWidebandSignalLevel(const uint8_t *iq, size_t samples) 
     sumII += iNorm * iNorm;
     sumQQ += qNorm * qNorm;
 
-    if (fm_tuner::dsp::isRtlSdrIqByteSaturated(iByte) ||
-        fm_tuner::dsp::isRtlSdrIqByteSaturated(qByte)) {
-      hardClipCount += 2;
+    // The clip ratios are fractions of *bytes* (the denominator below is
+    // samples * 2), so each byte is counted individually. Counting 2 for a
+    // sample whose I byte alone was saturated reported twice the true
+    // fraction, which crossed the 2% auto-gain step-down threshold for a
+    // station that was never actually overloaded.
+    if (fm_tuner::dsp::isRtlSdrIqByteSaturated(iByte)) {
+      hardClipCount += 1;
     }
-    if (iByte <= 8 || iByte >= 247 || qByte <= 8 || qByte >= 247) {
-      nearClipCount += 2;
+    if (fm_tuner::dsp::isRtlSdrIqByteSaturated(qByte)) {
+      hardClipCount += 1;
+    }
+    if (iByte <= 8 || iByte >= 247) {
+      nearClipCount += 1;
+    }
+    if (qByte <= 8 || qByte >= 247) {
+      nearClipCount += 1;
     }
   }
 
@@ -366,36 +298,77 @@ SignalLevelResult computeWidebandSignalLevel(const uint8_t *iq, size_t samples) 
   return out;
 }
 
+// The meter's spectrum. One per thread, kept across blocks so its DC
+// estimate can follow the tuner's offset slowly (see IqSpectrum::DcRemoval).
+thread_local IqSpectrum t_meterSpectrum;
+
+IqSpectrum &meterSpectrum() {
+  t_meterSpectrum.setDcRemoval(IqSpectrum::DcRemoval::Tracked);
+  return t_meterSpectrum;
+}
+
 } // namespace
+
+void resetSignalLevelDcTracking() { meterSpectrum().resetDcEstimate(); }
 
 SignalLevelResult computeSignalLevel(const uint8_t *iq, size_t samples,
                                      int appliedGainDb, double gainCompFactor,
                                      double signalBiasDb, double floorDbfs,
-                                     double ceilDbfs, uint32_t sampleRateHz,
-                                     int channelBandwidthHz) {
+                                     double ceilDbfs, uint32_t sampleRateHz) {
   SignalLevelResult out = computeWidebandSignalLevel(iq, samples);
   if (!iq || samples == 0) {
     return out;
   }
 
-  const ChannelPowerEstimate channel = estimateCenteredChannelPower(
-      iq, samples, sampleRateHz, channelBandwidthHz);
-  if (channel.valid) {
-    out.dbfs = channel.channelDbfs;
-    out.noiseFloorDbfs = channel.noiseFloorDbfs;
-    const double channelPower = std::pow(10.0, out.dbfs / 10.0);
+  // The meter reads the spectrum through the same estimator as the scan
+  // engine. It integrates the whole channel (kTunedMeterWindowHz) for the
+  // displayed strength, so the reading does not pump with the programme; the
+  // noise and SNR estimate below keep the scan's 30 kHz window.
+  IqSpectrum &spectrum = meterSpectrum();
+  if (sampleRateHz > 0 && spectrum.analyse(iq, samples, sampleRateHz)) {
+    const int windowHz = fm_tuner::kSignalChannelWindowHz;
+    const double carrierDbfs = spectrum.channelDbfs(0, windowHz);
+    out.dbfs = spectrum.channelDbfs(0, fm_tuner::kTunedMeterWindowHz);
+    // The noise reference sits outside the channel. It has to be local: the
+    // tuner's analogue response ripples by tens of dB across the band, so a
+    // fixed or far-away reference would report a wildly wrong floor
+    // depending on where in the band we are. It also has to be wide: a
+    // station's own skirt reaches +-100 kHz, so an annulus right next to the
+    // channel would measure the station instead of the noise. The reading is
+    // therefore only meaningful next to a weak or empty channel - the
+    // reception quality of a strong station comes from the demodulator
+    // instead (see processing_runner).
+    int annInner = kNoiseAnnulusInnerHz;
+    int annOuter = kNoiseAnnulusOuterHz;
+    if (spectrum.halfSpanHz() < static_cast<double>(annOuter)) {
+      annInner = windowHz / 2 + kNoiseBandGuardHz;
+      annOuter = annInner + windowHz / 2;
+    }
+    const double noisePerBin = spectrum.localNoiseDbfs(0, annInner, annOuter);
+    const double binCount =
+        static_cast<double>(windowHz) / std::max(1.0, spectrum.binHz());
+    out.noiseFloorDbfs =
+        noisePerBin + 10.0 * std::log10(std::max(1.0, binCount));
+    const double channelPower = std::pow(10.0, carrierDbfs / 10.0);
     const double noisePower = std::pow(10.0, out.noiseFloorDbfs / 10.0);
-    const double signalExcessPower = std::max(kPowerFloor, channelPower - noisePower);
-    out.snrDb = std::max(0.0,
-                         10.0 * std::log10((signalExcessPower + kPowerFloor) /
-                                           (noisePower + kPowerFloor)));
+    const double signalExcessPower =
+        std::max(kPowerFloor, channelPower - noisePower);
+    out.snrDb = std::max(
+        0.0, 10.0 * std::log10((signalExcessPower + kPowerFloor) /
+                               (noisePower + kPowerFloor)));
   }
   out.compensatedDbfs = out.dbfs -
                         (static_cast<double>(appliedGainDb) * gainCompFactor) +
                         signalBiasDb;
+  // The displayed level is the absolute strength of the tuned channel. For an
+  // unmodulated carrier it is the number the scan reports for the same
+  // station; a modulated station reads higher on the meter, which holds the
+  // whole channel, than on the scan, which holds the carrier's 30 kHz. The
+  // reception quality of the channel is a separate figure and comes from the
+  // demodulator.
   out.level120 = computeDisplaySignalLevel120(
       out.dbfs, out.noiseFloorDbfs, appliedGainDb, gainCompFactor, signalBiasDb,
-      floorDbfs, ceilDbfs, channel.valid);
+      floorDbfs, ceilDbfs, false);
   return out;
 }
 
@@ -440,4 +413,13 @@ float smoothSignalLevel(float input, SignalLevelSmoother &state) {
   const float alpha = (input > state.value) ? 0.42f : 0.18f;
   state.value += (input - state.value) * alpha;
   return state.value;
+}
+
+bool suspectOverloadGhosting(const SignalLevelResult &signal,
+                             double clipRatio) {
+  // The overload image only shows up when the front end is driven into
+  // saturation by a strong signal, so the level has to be a genuinely strong
+  // one. The threshold is on the uncompensated band power of the tuned
+  // channel, which is the same figure the scan engine reports.
+  return clipRatio >= 0.01 && signal.level120 >= 70.0f && signal.dbfs >= -20.0;
 }

@@ -1,6 +1,8 @@
 #include "runtime_loop.h"
+#include "signal_level.h"
 
 #include "auto_gain_policy.h"
+#include "retune_policy.h"
 
 #include <algorithm>
 #include <iomanip>
@@ -18,13 +20,14 @@ bool handleControlAndScan(
     std::atomic<uint32_t> &requestedFrequencyHz,
     std::atomic<bool> &pendingFrequency, std::atomic<bool> &pendingGain,
     std::atomic<bool> &pendingAGC, std::atomic<int> &requestedBandwidthHz,
-    std::atomic<bool> &pendingBandwidth, int &appliedBandwidthHz,
+    std::atomic<bool> &pendingBandwidth, std::atomic<int> &appliedBandwidthHz,
     bool rtlConnected, bool verboseLogging, AudioOutput &audioOut,
     fm_tuner::dsp::Runtime &dspRuntime, RdsWorker &rdsWorker,
     DspPipeline &dspPipeline, size_t kRetuneMuteSamples,
     size_t &retuneMuteSamplesRemaining, size_t &retuneMuteTotalSamples,
     const std::function<void(const char *reason)> &applyRtlGainAndAgc,
     const std::function<bool(uint32_t)> &tunerSetFrequency,
+    const std::function<uint32_t()> &currentTunerFrequencyHz,
     const std::function<size_t(uint8_t *, size_t)> &tunerReadIQ,
     const std::function<void(const uint8_t *, size_t)> &writeIqCapture,
     const std::chrono::milliseconds &scanRetrySleep, uint8_t *iqBuffer,
@@ -35,13 +38,31 @@ bool handleControlAndScan(
     const std::function<uint32_t(bool)> &setScanWideMode, bool &scanWideActive,
     uint32_t &scanWideRate, const std::function<void()> &tunerFlush) {
   scanEngine.handleControl(xdrServer, requestedFrequencyHz.load(),
-                           appliedBandwidthHz, rtlConnected, verboseLogging,
-                           requestedBandwidthHz, pendingBandwidth,
+                           appliedBandwidthHz.load(), rtlConnected,
+                           verboseLogging, requestedBandwidthHz, pendingBandwidth,
                            restoreAfterScan);
 
   if (rtlConnected && pendingFrequency.exchange(false)) {
     const uint32_t targetFrequencyHz = requestedFrequencyHz.load();
-    if (tunerSetFrequency(targetFrequencyHz)) {
+    const uint32_t appliedFrequencyHz =
+        currentTunerFrequencyHz ? currentTunerFrequencyHz() : 0U;
+    if (fm_tuner::isRedundantRetune(targetFrequencyHz, appliedFrequencyHz)) {
+      // The tuner is already on the requested frequency. Do NOT retune: a
+      // retune flushes the audio queue, resets the DSP and mutes the output
+      // while the demodulator settles, and the listener hears the programme
+      // restart -- the station "repeats" itself. Clients re-send the
+      // frequency they are already on routinely (xdr-gtk on every click of
+      // the tuned entry, the REST panel on every poll that carries a
+      // frequency), so this is the common case. Re-assert the gain/AGC
+      // registers only: that is inaudible and keeps the "a retune heals
+      // drifted tuner registers" property.
+      xdrServer.setFrequencyState(targetFrequencyHz);
+      applyRtlGainAndAgc("retune/reassert(same frequency)");
+      if (verboseLogging) {
+        std::cout << "[XDR] already tuned to " << (targetFrequencyHz / 1000)
+                  << " kHz; no retune\n";
+      }
+    } else if (tunerSetFrequency(targetFrequencyHz)) {
       // Reflect the applied frequency in the XDR server state regardless of who
       // requested it (XDR command, REST API, scan restore, ...). The XDR/FM-DX
       // command handlers set it themselves, but REST/internal retunes go only
@@ -58,6 +79,9 @@ bool handleControlAndScan(
       applyRtlGainAndAgc("retune/reassert");
       audioOut.clearRealtimeQueue();
       dspRuntime.reset(fm_tuner::dsp::ResetReason::Retune);
+      // The meter tracks the DC offset across blocks; the previous station's
+      // estimate would otherwise linger in the new one's reading.
+      resetSignalLevelDcTracking();
       retuneMuteSamplesRemaining = kRetuneMuteSamples;
       retuneMuteTotalSamples = kRetuneMuteSamples;
       rdsWorker.requestReset();
@@ -79,11 +103,12 @@ bool handleControlAndScan(
 
   if (bandwidthChanged) {
     const int targetBandwidthHz = requestedBandwidthHz.load();
-    if (targetBandwidthHz != appliedBandwidthHz) {
+    const int previousBandwidthHz = appliedBandwidthHz.load();
+    if (targetBandwidthHz != previousBandwidthHz) {
       dspPipeline.setBandwidthHz(targetBandwidthHz);
       if (verboseLogging) {
         std::cout << "[BW] applied W" << targetBandwidthHz << " (previous W"
-                  << appliedBandwidthHz << ")\n";
+                  << previousBandwidthHz << ")\n";
       }
       appliedBandwidthHz = targetBandwidthHz;
     }
@@ -119,8 +144,27 @@ void maybeAdjustAutoGain(
     std::chrono::steady_clock::time_point &lastGainDown,
     std::chrono::steady_clock::time_point &lastGainUp,
     const SignalLevelResult &signal, double clipRatio, float rfLevelFiltered,
-    bool verboseLogging, const std::function<int(int)> &agcModeToGainDb) {
+    bool verboseLogging, const std::function<int(int)> &agcModeToGainDb,
+    const char *fixedGainAdvice) {
   if (useSdrppGainStrategy || cliGain >= 0 || imsAgcEnabled) {
+    // The ladder cannot act on these paths: the gain is pinned by the
+    // strategy, by the command line, or by the tuner AGC. When the front end
+    // is clipping, say so and name the knob, because a clipped front end
+    // mixes a strong station with itself and the IMD product is heard as a
+    // duplicate of that station.
+    if (fixedGainAdvice != nullptr &&
+        (clipRatio > 0.0200 || signal.dbfs > -5.0)) {
+      static uint32_t fixedGainClipWarnCount = 0;
+      const uint32_t warnCount = ++fixedGainClipWarnCount;
+      if (warnCount <= 3 || (warnCount % 50) == 0) {
+        std::cerr << "[GAIN] clip-protect inactive (" << fixedGainAdvice
+                  << "): clip=" << std::fixed << std::setprecision(4)
+                  << clipRatio << " dbfs=" << std::setprecision(2)
+                  << signal.dbfs
+                  << ". The front end is clipping, so a strong station is mixed"
+                     " with itself and heard as a duplicate. Lower the gain.\n";
+      }
+    }
     return;
   }
   // Recovery keys off raw-dbfs headroom (see auto_gain_policy.h), not the
@@ -172,7 +216,8 @@ void maybeAdjustAdaptiveBandwidth(
   if (mode == fm_tuner::AdaptiveBandwidthMode::Off) {
     return;
   }
-  const int proposed = fm_tuner::pickAdaptiveBandwidthHz(mode, signal.snrDb);
+  const int proposed = fm_tuner::pickAdaptiveBandwidthHz(
+      mode, signal.snrDb, currentAppliedBandwidthHz);
   if (proposed <= 0) {
     return;
   }

@@ -59,21 +59,6 @@ bool parseInt(const std::string &raw, int &out) {
   }
 }
 
-bool parseFloat(const std::string &raw, float &out) {
-  try {
-    const std::string t = trim(raw);
-    size_t idx = 0;
-    const float value = std::stof(t, &idx);
-    if (idx != t.size()) {
-      return false;
-    }
-    out = value;
-    return true;
-  } catch (...) {
-    return false;
-  }
-}
-
 bool parseDouble(const std::string &raw, double &out) {
   try {
     const std::string t = trim(raw);
@@ -172,6 +157,21 @@ void parseSdrSection(const std::string &key, const std::string &value,
     double parsed = 0.0;
     if (parseDouble(value, parsed)) {
       sdr.signal_bias_db = std::clamp(parsed, -30.0, 30.0);
+    }
+  } else if (key == "scan_use_client_window") {
+    bool parsed = false;
+    if (parseBool(value, parsed)) {
+      sdr.scan_use_client_window = parsed;
+    }
+  } else if (key == "scan_client_min_level") {
+    double parsed = 0.0;
+    if (parseDouble(value, parsed)) {
+      sdr.scan_client_min_level = parsed;
+    }
+  } else if (key == "scan_client_max_level") {
+    double parsed = 0.0;
+    if (parseDouble(value, parsed)) {
+      sdr.scan_client_max_level = parsed;
     }
   } else if (key == "low_latency_iq") {
     bool parsed = false;

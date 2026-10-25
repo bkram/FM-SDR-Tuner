@@ -1,16 +1,17 @@
 #include "audio_output.h"
+#include "wav_limits.h"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
-#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+#ifdef FM_TUNER_HAS_COREAUDIO
 #include <CoreAudio/CoreAudio.h>
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 
-#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+#ifdef FM_TUNER_HAS_ALSA
 namespace {
 bool parseHwDeviceGlobal(const std::string &selector, int &card, int &device) {
   if (selector.size() < 5 || selector.substr(0, 3) != "hw:") {
@@ -40,7 +41,7 @@ bool parseHwDeviceGlobal(const std::string &selector, int &card, int &device) {
 } // namespace
 #endif
 
-#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+#ifdef FM_TUNER_HAS_COREAUDIO
 namespace {
 std::string trimCoreAudio(const std::string &value) {
   size_t start = 0;
@@ -215,7 +216,7 @@ AudioDeviceID selectOutputDeviceCoreAudio(const std::string &selector) {
 } // namespace
 #endif
 
-#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+#ifdef FM_TUNER_HAS_WINMM
 namespace {
 std::string narrowFromWide(const WCHAR *wide) {
   if (!wide || *wide == L'\0') {
@@ -294,11 +295,11 @@ UINT selectWinMMDevice(const std::string &selector) {
 #endif
 
 bool AudioOutput::listDevices() {
-#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+#ifdef FM_TUNER_HAS_ALSA
   return listAlsaDevices();
-#elif defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+#elif defined(FM_TUNER_HAS_COREAUDIO)
   return listCoreAudioDevices();
-#elif defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+#elif defined(FM_TUNER_HAS_WINMM)
   return listWinMMDevices();
 #else
   std::cerr << "Audio device listing is unavailable in this build\n";
@@ -310,6 +311,14 @@ void AudioOutput::clearSpeakerQueueLocked() {
   m_speakerReadPos = 0;
   m_speakerWritePos = 0;
   m_speakerSize = 0;
+  m_speakerPrimed = false;
+}
+
+bool AudioOutput::primeSpeakerQueueLocked(size_t minimumSamples) {
+  if (!m_speakerPrimed && m_speakerSize >= minimumSamples) {
+    m_speakerPrimed = true;
+  }
+  return m_speakerPrimed;
 }
 
 void AudioOutput::logSpeakerOverflow(const char *backendLabel,
@@ -340,6 +349,18 @@ void AudioOutput::pushSpeakerSamples(const float *left, const float *right,
   if (!left || !right || numSamples == 0 || m_speakerRing.empty()) {
     return;
   }
+#ifdef FM_TUNER_HAS_COREAUDIO
+  if (m_verboseLogging) {
+    const uint32_t count =
+        m_coreAudioUnderflowCount.load(std::memory_order_relaxed);
+    const uint32_t reported = m_coreAudioReportedUnderflowCount.exchange(
+        count, std::memory_order_relaxed);
+    if (count != reported && (count <= 5 || (count % 50) == 0)) {
+      std::cerr << "[AUDIO] CoreAudio underrun (" << count
+                << "); rebuffering 200 ms\n";
+    }
+  }
+#endif
   const size_t incomingSamples = numSamples * CHANNELS;
   const size_t capacity = m_speakerRing.size();
   size_t startSample = 0;
@@ -386,7 +407,7 @@ size_t AudioOutput::popSpeakerSamplesLocked(float *dest, size_t maxSamples) {
   return toRead;
 }
 
-#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+#ifdef FM_TUNER_HAS_WINMM
 bool AudioOutput::listWinMMDevices() {
   const UINT num = waveOutGetNumDevs();
   std::cout << "Available audio output devices:\n";
@@ -402,7 +423,7 @@ bool AudioOutput::listWinMMDevices() {
 }
 #endif
 
-#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+#ifdef FM_TUNER_HAS_COREAUDIO
 bool AudioOutput::listCoreAudioDevices() {
   const auto devices = enumerateOutputDevices();
   std::cout << "Available audio output devices:\n";
@@ -435,8 +456,20 @@ OSStatus AudioOutput::coreAudioRenderCallback(void *inRefCon,
   }
 
   std::lock_guard<std::mutex> lock(self->m_speakerMutex);
-  const size_t samplePairs = std::min(self->m_speakerSize / 2,
-                                      static_cast<size_t>(inNumberFrames));
+  if (!self->primeSpeakerQueueLocked(kCoreAudioPrebufferSamples)) {
+    for (size_t i = 0; i < static_cast<size_t>(inNumberFrames); i++) {
+      if (outB) {
+        outA[i] = 0.0f;
+        outB[i] = 0.0f;
+      } else {
+        outA[i * 2] = 0.0f;
+        outA[i * 2 + 1] = 0.0f;
+      }
+    }
+    return noErr;
+  }
+  const size_t samplePairs =
+      std::min(self->m_speakerSize / 2, static_cast<size_t>(inNumberFrames));
   for (size_t i = 0; i < samplePairs; i++) {
     const float l = self->m_speakerRing[self->m_speakerReadPos];
     self->m_speakerReadPos =
@@ -462,11 +495,15 @@ OSStatus AudioOutput::coreAudioRenderCallback(void *inRefCon,
     }
   }
   self->m_speakerSize -= samplePairs * 2;
+  if (samplePairs < static_cast<size_t>(inNumberFrames)) {
+    self->m_speakerPrimed = false;
+    self->m_coreAudioUnderflowCount.fetch_add(1, std::memory_order_relaxed);
+  }
   return noErr;
 }
 #endif
 
-#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+#ifdef FM_TUNER_HAS_ALSA
 bool AudioOutput::listAlsaDevices() {
   std::cout << "ALSA hardware devices:\n";
   int card = -1;
@@ -715,7 +752,7 @@ void AudioOutput::shutdownAlsa() {
 }
 #endif
 
-#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+#ifdef FM_TUNER_HAS_WINMM
 void AudioOutput::runWinMMOutputThread() {
   // Event-driven WinMM output. The device is opened with CALLBACK_EVENT, so the
   // driver signals m_winmmEvent on every buffer completion and this thread
@@ -825,20 +862,20 @@ void AudioOutput::runWinMMOutputThread() {
 AudioOutput::AudioOutput()
     : m_enableSpeaker(false), m_wavHandle(nullptr), m_running(false),
       m_wavThreadRunning(false), m_wavFatalError(false), m_wavDataSize(0),
-      m_verboseLogging(true),
-      m_requestedVolumePercent(kMaxVolumePercent),
+      m_verboseLogging(true), m_requestedVolumePercent(kMaxVolumePercent),
       m_currentVolumeScale(kDefaultVolumeScale), m_speakerReadPos(0),
-      m_speakerWritePos(0), m_speakerSize(0), m_wavReadPos(0), m_wavWritePos(0),
-      m_wavSize(0)
-#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+      m_speakerWritePos(0), m_speakerSize(0), m_speakerPrimed(false),
+      m_wavReadPos(0), m_wavWritePos(0), m_wavSize(0)
+#ifdef FM_TUNER_HAS_COREAUDIO
       ,
-      m_audioUnit(nullptr)
+      m_audioUnit(nullptr), m_coreAudioUnderflowCount(0),
+      m_coreAudioReportedUnderflowCount(0)
 #endif
-#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+#ifdef FM_TUNER_HAS_WINMM
       ,
       m_waveOut(nullptr), m_winmmEvent(nullptr), m_winmmThreadRunning(false)
 #endif
-#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+#ifdef FM_TUNER_HAS_ALSA
       ,
       m_alsaPcm(nullptr), m_alsaThreadRunning(false)
 #endif
@@ -853,6 +890,13 @@ AudioOutput::~AudioOutput() { shutdown(); }
 
 bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
                        const std::string &deviceSelector, bool verboseLogging) {
+  // The device selector is consumed by whichever native backend this build
+  // has. A build with no backend (and the unit-test build, which compiles
+  // this file without one) has no consumer for it.
+#if !defined(FM_TUNER_HAS_COREAUDIO) && !defined(FM_TUNER_HAS_ALSA) &&         \
+    !defined(FM_TUNER_HAS_WINMM)
+  (void)deviceSelector;
+#endif
   m_enableSpeaker = enableSpeaker;
   m_wavFile = wavFile;
   m_verboseLogging = verboseLogging;
@@ -868,7 +912,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
     }
   }
 
-#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+#ifdef FM_TUNER_HAS_COREAUDIO
   if (enableSpeaker) {
     const std::string normalizedSelector =
         normalizeCoreAudioSelector(deviceSelector);
@@ -965,7 +1009,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
   }
 #endif
 
-#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+#ifdef FM_TUNER_HAS_WINMM
   if (enableSpeaker) {
     const std::string normalizedSelector = trimWinMM(deviceSelector);
     if (verboseLogging) {
@@ -1006,9 +1050,9 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
       return false;
     }
 
-    const MMRESULT wr = waveOutOpen(
-        &m_waveOut, openId, &fmt,
-        reinterpret_cast<DWORD_PTR>(m_winmmEvent), 0, CALLBACK_EVENT);
+    const MMRESULT wr = waveOutOpen(&m_waveOut, openId, &fmt,
+                                    reinterpret_cast<DWORD_PTR>(m_winmmEvent),
+                                    0, CALLBACK_EVENT);
     if (wr != MMSYSERR_NOERROR || !m_waveOut) {
       std::cerr << "WinMM open failed: " << wr << "\n";
       CloseHandle(m_winmmEvent);
@@ -1025,7 +1069,7 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
   }
 #endif
 
-#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+#ifdef FM_TUNER_HAS_ALSA
   if (enableSpeaker) {
     std::string alsaDevice =
         deviceSelector.empty() ? "default" : deviceSelector;
@@ -1046,11 +1090,11 @@ bool AudioOutput::init(bool enableSpeaker, const std::string &wavFile,
 void AudioOutput::shutdown() {
   m_running = false;
 
-#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+#ifdef FM_TUNER_HAS_ALSA
   shutdownAlsa();
 #endif
 
-#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+#ifdef FM_TUNER_HAS_COREAUDIO
   if (m_audioUnit) {
     AudioOutputUnitStop(m_audioUnit);
     AudioUnitUninitialize(m_audioUnit);
@@ -1059,7 +1103,7 @@ void AudioOutput::shutdown() {
   }
 #endif
 
-#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+#ifdef FM_TUNER_HAS_WINMM
   m_winmmThreadRunning = false;
   m_speakerCv.notify_all();
   if (m_winmmEvent) {
@@ -1132,20 +1176,19 @@ bool AudioOutput::writeWAVHeader() {
     return false;
   }
 
-  const bool ok =
-      fwrite("RIFF", 1, 4, m_wavHandle) == 4 &&
-      fwrite(&fileSize, 4, 1, m_wavHandle) == 1 &&
-      fwrite("WAVE", 1, 4, m_wavHandle) == 4 &&
-      fwrite("fmt ", 1, 4, m_wavHandle) == 4 &&
-      fwrite(&fmtSize, 4, 1, m_wavHandle) == 1 &&
-      fwrite(&audioFormat, 2, 1, m_wavHandle) == 1 &&
-      fwrite(&numChannels, 2, 1, m_wavHandle) == 1 &&
-      fwrite(&sampleRate, 4, 1, m_wavHandle) == 1 &&
-      fwrite(&byteRate, 4, 1, m_wavHandle) == 1 &&
-      fwrite(&blockAlign, 2, 1, m_wavHandle) == 1 &&
-      fwrite(&bitsPerSample, 2, 1, m_wavHandle) == 1 &&
-      fwrite("data", 1, 4, m_wavHandle) == 4 &&
-      fwrite(&dataSize, 4, 1, m_wavHandle) == 1;
+  const bool ok = fwrite("RIFF", 1, 4, m_wavHandle) == 4 &&
+                  fwrite(&fileSize, 4, 1, m_wavHandle) == 1 &&
+                  fwrite("WAVE", 1, 4, m_wavHandle) == 4 &&
+                  fwrite("fmt ", 1, 4, m_wavHandle) == 4 &&
+                  fwrite(&fmtSize, 4, 1, m_wavHandle) == 1 &&
+                  fwrite(&audioFormat, 2, 1, m_wavHandle) == 1 &&
+                  fwrite(&numChannels, 2, 1, m_wavHandle) == 1 &&
+                  fwrite(&sampleRate, 4, 1, m_wavHandle) == 1 &&
+                  fwrite(&byteRate, 4, 1, m_wavHandle) == 1 &&
+                  fwrite(&blockAlign, 2, 1, m_wavHandle) == 1 &&
+                  fwrite(&bitsPerSample, 2, 1, m_wavHandle) == 1 &&
+                  fwrite("data", 1, 4, m_wavHandle) == 4 &&
+                  fwrite(&dataSize, 4, 1, m_wavHandle) == 1;
   if (!ok && m_verboseLogging) {
     std::cerr << "[AUDIO] failed to write WAV header\n";
   }
@@ -1158,10 +1201,8 @@ bool AudioOutput::writeWAVData(const int16_t *samples, size_t sampleCount) {
   if (m_wavFatalError.load())
     return false;
 
-  const size_t maxBytes =
-      static_cast<size_t>(UINT32_MAX) - 36u - m_wavDataSize;
   const size_t wantBytes = sampleCount * sizeof(int16_t);
-  if (wantBytes > maxBytes) {
+  if (!wavDataFits(m_wavDataSize, wantBytes)) {
     if (m_verboseLogging) {
       std::cerr << "[AUDIO] reached 4 GiB WAV limit, stopping capture\n";
     }
@@ -1319,18 +1360,18 @@ bool AudioOutput::write(const float *left, const float *right,
     (void)enqueueWavSamples(writeLeft, writeRight, numSamples);
   }
 
-#if defined(__linux__) && defined(FM_TUNER_HAS_ALSA)
+#ifdef FM_TUNER_HAS_ALSA
   if (m_enableSpeaker && m_alsaPcm) {
     pushSpeakerSamples(writeLeft, writeRight, numSamples, "ALSA");
   }
 #endif
 
-#if defined(__APPLE__) && defined(FM_TUNER_HAS_COREAUDIO)
+#ifdef FM_TUNER_HAS_COREAUDIO
   if (m_enableSpeaker && m_audioUnit) {
     pushSpeakerSamples(writeLeft, writeRight, numSamples, "CoreAudio");
   }
 #endif
-#if defined(_WIN32) && defined(FM_TUNER_HAS_WINMM)
+#ifdef FM_TUNER_HAS_WINMM
   if (m_enableSpeaker && m_waveOut) {
     pushSpeakerSamples(writeLeft, writeRight, numSamples, "WinMM");
   }

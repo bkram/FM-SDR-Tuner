@@ -42,6 +42,10 @@ void TunerController::setLowLatencyMode(bool enable) {
   }
 }
 
+void TunerController::setVerboseLogging(bool enable) {
+  m_sdrplayDevice.setVerboseLogging(enable);
+}
+
 bool TunerController::connect() {
   switch (m_kind) {
   case SourceKind::SdrPlay: {
@@ -66,6 +70,8 @@ bool TunerController::connect() {
 }
 
 void TunerController::disconnect() {
+  // The source is gone: its frequency is no longer known.
+  m_currentFrequencyHz.store(0, std::memory_order_relaxed);
   switch (m_kind) {
   case SourceKind::SdrPlay:
     m_sdrplayDevice.disconnect();
@@ -81,15 +87,21 @@ void TunerController::disconnect() {
 }
 
 bool TunerController::setFrequency(uint32_t freqHz) {
-  switch (m_kind) {
-  case SourceKind::SdrPlay:
-    return m_sdrplayDevice.setFrequency(freqHz);
-  case SourceKind::RtlTcp:
-    return m_rtlTcpClient.setFrequency(freqHz);
-  case SourceKind::RtlSdr:
-  default:
-    return m_rtlSdrDevice.setFrequency(freqHz);
+  const bool ok = [&]() {
+    switch (m_kind) {
+    case SourceKind::SdrPlay:
+      return m_sdrplayDevice.setFrequency(freqHz);
+    case SourceKind::RtlTcp:
+      return m_rtlTcpClient.setFrequency(freqHz);
+    case SourceKind::RtlSdr:
+    default:
+      return m_rtlSdrDevice.setFrequency(freqHz);
+    }
+  }();
+  if (ok) {
+    m_currentFrequencyHz.store(freqHz, std::memory_order_relaxed);
   }
+  return ok;
 }
 
 bool TunerController::setSampleRate(uint32_t sampleRate) {
@@ -183,8 +195,22 @@ uint32_t TunerController::setScanWideMode(bool wide) {
 }
 
 void TunerController::flushBuffers() {
-  if (m_kind == SourceKind::RtlSdr) {
+  switch (m_kind) {
+  case SourceKind::RtlSdr:
     m_rtlSdrDevice.flushBuffers();
+    break;
+  case SourceKind::RtlTcp:
+    // A network source cannot have its server-side buffer emptied, but the
+    // stale IQ still sitting in the socket belongs to the previous centre
+    // frequency, so it is dropped here. Without this the spectral scan
+    // measures the band the tuner just left.
+    m_rtlTcpClient.flushBuffers();
+    break;
+  case SourceKind::SdrPlay:
+  default:
+    // The SDRplay source raises its own reset flag on a scan retune and
+    // flushes the ring itself.
+    break;
   }
 }
 

@@ -10,12 +10,14 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #define CLOSESOCKET closesocket
+using SocketDataLen = int;
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #define CLOSESOCKET ::close
+using SocketDataLen = size_t;
 #endif
 
 #include "rest_server.h"
@@ -63,11 +65,11 @@ std::string httpRequest(uint16_t port, const std::string &raw) {
     CLOSESOCKET(s);
     return {};
   }
-  ::send(s, raw.data(), static_cast<int>(raw.size()), 0);
+  ::send(s, raw.data(), static_cast<SocketDataLen>(raw.size()), 0);
   std::string resp;
   char buf[1024];
   for (;;) {
-    const auto n = ::recv(s, buf, static_cast<int>(sizeof(buf)), 0);
+    const auto n = ::recv(s, buf, static_cast<SocketDataLen>(sizeof(buf)), 0);
     if (n <= 0) break;
     resp.append(buf, static_cast<size_t>(n));
   }
@@ -152,4 +154,105 @@ TEST_CASE("RestServer applies query-string params and reports status",
   }
 
   server.stop();
+}
+
+TEST_CASE("RestServer serves other clients while one connection stalls",
+          "[rest]") {
+  RestServer::Controls c;
+  c.statusJson = [&]() { return std::string("{\"ok\":true}"); };
+
+  const uint16_t port = pickFreePort();
+  RestServer server("127.0.0.1", port, c);
+  REQUIRE(server.start());
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // A client that connects and then sends an incomplete request must not deny
+  // the API to anyone else. Before connections were served on their own
+  // threads, this stalled every other client for the whole receive timeout.
+  int idle = ::socket(AF_INET, SOCK_STREAM, 0);
+  REQUIRE(idle >= 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons(port);
+  REQUIRE(::connect(idle, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+  const char partial[] = "GET /api/status HTTP/1.1\r\n";
+  ::send(idle, partial, static_cast<int>(sizeof(partial) - 1), 0);
+
+  // The second client must be served promptly.
+  const auto start = std::chrono::steady_clock::now();
+  const std::string resp = httpRequest(
+      port, "GET /api/status HTTP/1.1\r\nConnection: close\r\n\r\n");
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+  REQUIRE(resp.find("200 OK") != std::string::npos);
+  REQUIRE(elapsed < 2000);
+
+  CLOSESOCKET(idle);
+  server.stop();
+}
+
+TEST_CASE("RestServer clamps an out-of-range bandwidth", "[rest]") {
+  std::atomic<int> bandwidth{0};
+  RestServer::Controls c;
+  c.setBandwidthHz = [&](int hz) {
+    bandwidth.store(hz);
+    return true;
+  };
+  c.statusJson = [&]() { return "{}"; };
+
+  const uint16_t port = pickFreePort();
+  RestServer server("127.0.0.1", port, c);
+  REQUIRE(server.start());
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // A bandwidth_khz large enough to overflow a 32-bit int multiply must be
+  // clamped, not wrapped.
+  const std::string resp = httpRequest(
+      port, "GET /api/control?bandwidth_khz=3000000 HTTP/1.1\r\n"
+            "Connection: close\r\n\r\n");
+  REQUIRE(resp.find("200 OK") != std::string::npos);
+  REQUIRE(bandwidth.load() <= 256000);
+  REQUIRE(bandwidth.load() >= 0);
+
+  // A normal bandwidth passes through unchanged.
+  const std::string resp2 = httpRequest(
+      port, "GET /api/control?bandwidth_khz=194 HTTP/1.1\r\n"
+            "Connection: close\r\n\r\n");
+  REQUIRE(resp2.find("200 OK") != std::string::npos);
+  REQUIRE(bandwidth.load() == 194000);
+
+  server.stop();
+}
+
+TEST_CASE("RestServer stops promptly while a client is still connected",
+          "[rest]") {
+  RestServer::Controls c;
+  c.statusJson = [&]() { return "{}"; };
+
+  const uint16_t port = pickFreePort();
+  RestServer server("127.0.0.1", port, c);
+  REQUIRE(server.start());
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // A connected but idle client. stop() must not wait out the full receive
+  // timeout for it.
+  int idle = ::socket(AF_INET, SOCK_STREAM, 0);
+  REQUIRE(idle >= 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons(port);
+  REQUIRE(::connect(idle, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const auto start = std::chrono::steady_clock::now();
+  server.stop();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+  REQUIRE(elapsed < 1000);
+
+  CLOSESOCKET(idle);
 }

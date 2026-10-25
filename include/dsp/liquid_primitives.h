@@ -52,8 +52,10 @@ public:
   // classic mathematical bound: |y| = |Σ h·x| ≤ Σ|h|·max|x| ≤ max|x|).
   // Without this, a non-monotonic Kaiser FIR can ring past unit envelope
   // under ADC-rail saturation, producing post-filter samples whose power
-  // exceeds the input dBFS — confusing the meter and gain policy. The
-  // bandpass-centered path is always L1-normalized as a side-effect of
+  // exceeds the input dBFS — confusing the meter and gain policy. The bound
+  // costs passband gain: 3-7 dB for the channel filter's cutoffs (see
+  // dcGain()), so a power measured after the filter must be corrected by it.
+  // The bandpass-centered path is always L1-normalized as a side-effect of
   // the centering step and ignores this flag.
   void init(std::uint32_t length, float cutoff, float stopBandAtten = 60.0f,
             float center = 0.0f, bool l1Normalize = false);
@@ -62,6 +64,9 @@ public:
   void push(std::complex<float> sample) const;
   std::complex<float> execute() const;
   std::size_t length() const;
+  // Gain of a lowpass filter at DC (its passband gain): 1 for the plain
+  // Kaiser design, below 1 when the L1 bound lowered the scale.
+  float dcGain() const;
   bool ready() const { return m_object != nullptr; }
 
 private:
@@ -75,6 +80,12 @@ private:
   bool m_useDirectTaps = false;
   float m_scale = 1.0f;
 };
+
+// Kaiser-window low-pass taps, scaled to the given DC gain. cutoff is a
+// fraction of the sample rate (f/Fs). Used as the prototype for filters that
+// work on a band mixed down to DC.
+std::vector<float> designKaiserLowpass(std::uint32_t length, float cutoff,
+                                       float stopBandAtten, float dcGain);
 
 class NCO {
 public:

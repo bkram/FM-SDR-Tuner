@@ -25,14 +25,33 @@ struct Config {
     bool sdrpp_rtl_agc = false;
     int sdrpp_rtl_agc_gain_db = 18;
     // Meter calibration window: maps (compensated dBFS) → 0..120 linearly.
-    // Old defaults (-50/-18) covered only 32 dB and saturated at both ends on
-    // a typical mixed band (strong locals → 120, fringe → 0). The wider 60 dB
-    // window below leaves headroom: strong locals settle near 90-100, fringe
-    // stations register meaningfully around 20-40. Override per site in the
-    // INI; the active values are logged at startup as [METER].
-    double signal_floor_dbfs = -65.0;
-    double signal_ceil_dbfs = -5.0;
+    // The measured power is the band power of the whole 200 kHz channel
+    // around the tuned carrier (kTunedMeterWindowHz), so the values are the
+    // power of that band: an empty band reads about -45 dBFS and a strong
+    // local station about -3 dBFS at 18 dB of gain. The
+    // default window below puts the noise floor at 0 and a strong local
+    // station near 115. Override per site in the INI; the active values are
+    // logged at startup as [METER] and the observed range is reported as
+    // [METER] session observed.
+    double signal_floor_dbfs = -45.0;
+    double signal_ceil_dbfs = -1.0;
     double signal_bias_db = 0.0;
+    // The spectral-scan plot window of the reference client. xdr-gtk draws
+    // the scan in a FIXED 3..84 window (SCAN_DEFAULT_MIN_LEVEL/MAX_LEVEL)
+    // and clips everything outside it, so a scale that runs to 120 pins every
+    // strong station flat against the top of the plot. When enabled, the
+    // scan line is remapped from the meter's 0..120 onto this window; the
+    // "S" line and the REST status keep the 0..120 scale, because the
+    // clients that read those convert it themselves (the webserver's dBm
+    // mode subtracts 120, the plugin shows it out of 120).
+    //
+    // Disabled by default: the scan then reports the very same 0..120 number
+    // the meter shows for the same station, so the two can be read against
+    // each other. A client that draws the scan in a fixed window should
+    // switch to its relative scale.
+    bool scan_use_client_window = false;
+    double scan_client_min_level = 3.0;
+    double scan_client_max_level = 84.0;
     bool low_latency_iq = false;
   } sdr;
 
@@ -77,7 +96,11 @@ struct Config {
     int dsp_block_samples = 8192;
     int w0_bandwidth_hz = 194000;
     std::string dsp_agc = "off"; // off|fast|slow
-    std::string stereo_blend = "aggressive";
+    // soft|normal|aggressive. "normal" holds the stereo image steady on a
+    // station whose quality estimate dips: measured here on two back-to-back
+    // captures of the same station, "aggressive" left the image 8 dB weaker
+    // and swinging over 22 dB, while "normal" held it steady.
+    std::string stereo_blend = "normal";
     bool stereo = true;
     bool pilot_canceller = true;
     std::string hicut = "off"; // off|gentle|strong

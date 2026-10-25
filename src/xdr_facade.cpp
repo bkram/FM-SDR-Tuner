@@ -56,7 +56,18 @@ void XdrFacade::installCallbacks(
     }
     const int rf = ((newGain / 10) % 10) ? 1 : 0;
     const int ifv = (newGain % 10) ? 1 : 0;
-    m_state.requestedCustomGain = rf * 10 + ifv;
+    const int flags = rf * 10 + ifv;
+    // A client that changes the gain flags takes the gain over: a manual gain
+    // pinned by the profile or by another client (the fm-dx-webserver plugin
+    // over REST) would otherwise win over the flags this command sets. A G
+    // that repeats the current flags changes nothing and leaves a manual gain
+    // alone - xdr-gtk replays its saved G on every connect
+    // (research/xdr-gtk/src/ui-connect.c:439), and that replay must not
+    // discard the profile's fixed gain.
+    if (flags != m_state.requestedCustomGain.load()) {
+      m_state.requestedGainDb = -1;
+    }
+    m_state.requestedCustomGain = flags;
     if (m_options.verboseLogging) {
       std::cout << "[XDR] G" << formatCustomGainCb(newGain)
                 << " received -> rf=" << rf << " if=" << ifv << "\n";
@@ -85,6 +96,12 @@ void XdrFacade::installCallbacks(
       return false;
     }
     const int clipped = std::clamp(agcMode, 0, 3);
+    // The AGC mode is a setting of the automatic gain ladder. It is stored,
+    // and takes effect whenever the gain is automatic, but it does not
+    // release a manual gain: xdr-gtk sends its saved A on every connect
+    // (research/xdr-gtk/src/ui-connect.c:436), and that alone used to replace
+    // the profile's fixed gain with the ladder. A client releases a manual
+    // gain by changing the G flags, or through the REST auto_gain control.
     m_state.requestedAGCMode = clipped;
     if (m_options.verboseLogging) {
       std::cout << "[XDR] A" << clipped << " received\n";
@@ -133,4 +150,8 @@ void XdrFacade::installCallbacks(
     }
     onStopCb();
   });
+}
+
+void XdrFacade::setTunerActiveCallback(std::function<bool()> isTunerActive) {
+  m_server.setTunerActiveCallback(std::move(isTunerActive));
 }

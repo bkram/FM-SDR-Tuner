@@ -127,7 +127,10 @@ TEST_CASE("XDR processCommand updates state and invokes callbacks", "[xdr_unit]"
   REQUIRE(xdr.processCommand("T101700000", true, false) == "T101700");
   REQUIRE(tuned.load() == 101700000u);
 
-  REQUIRE(xdr.processCommand("T14900", true, false).empty());
+  // An out-of-band tune is rejected and answered with the *current*
+  // frequency, so the client can tell "rejected" from "not yet applied"
+  // (the server used to answer with silence).
+  REQUIRE(xdr.processCommand("T14900", true, false) == "T101700");
   REQUIRE(tuned.load() == 101700000u);
   REQUIRE(xdr.getFrequency() == 101700000u);
 
@@ -135,6 +138,17 @@ TEST_CASE("XDR processCommand updates state and invokes callbacks", "[xdr_unit]"
   REQUIRE(volume.load() == 77);
   REQUIRE(xdr.getVolume() == 77);
 
+  REQUIRE(xdr.processCommand("W250000", true, false) == "W250000");
+  REQUIRE(xdr.getBandwidth() == 250000);
+
+  // 'W' is clamped to the widest bandwidth the tuner can actually measure.
+  // Beyond the sample rate the signal-meter estimator's side-band window
+  // wraps back over the channel and the meter measures the signal as its own
+  // noise floor.
+  REQUIRE(xdr.processCommand("W999999999", true, false) == "W256000");
+  REQUIRE(xdr.getBandwidth() == 256000);
+  REQUIRE(xdr.processCommand("W-1", true, false) == "W0");
+  REQUIRE(xdr.getBandwidth() == 0);
   REQUIRE(xdr.processCommand("W250000", true, false) == "W250000");
   REQUIRE(xdr.getBandwidth() == 250000);
 
@@ -194,6 +208,93 @@ TEST_CASE("XDR scan commands are clamped and exposed via consumeScanStart",
   REQUIRE(cfg.continuous);
 }
 
+TEST_CASE("XDR guest sessions cannot change tuner state", "[xdr_unit]") {
+  XDRServer xdr;
+  xdr.setVerboseLogging(false);
+
+  std::atomic<uint32_t> tuned{0};
+  std::atomic<int> volume{0};
+  std::atomic<int> startCalls{0};
+  xdr.setFrequencyCallback([&](uint32_t f) { tuned = f; });
+  xdr.setVolumeCallback([&](int v) { volume = v; });
+  xdr.setStartCallback([&]() { startCalls++; });
+
+  // A guest is not authenticated: every state-changing command is refused
+  // with "a0" and never reaches the tuner.
+  const char *forbidden[] = {"T101700", "Y77", "A3", "B1", "I250,1",
+                             "x",     "X",   "W60000", "G20", "M1"};
+  for (const char *cmd : forbidden) {
+    REQUIRE(xdr.processCommand(cmd, false, true) == "a0");
+  }
+  REQUIRE(tuned.load() == 0u);
+  REQUIRE(volume.load() == 0);
+  REQUIRE(startCalls.load() == 0);
+
+  // The spectral scan retunes the radio across the band, so a guest may not
+  // start one — same rule as any other tuner command, and the same rule the
+  // reference daemon applies (research/xdrd/xdrd.c:585). This costs the
+  // default configuration nothing: with no password the challenge/response
+  // accepts SHA1(salt), which is exactly what the reference client sends for
+  // an empty password, so such a client is fully authenticated rather than a
+  // guest.
+  REQUIRE(xdr.processCommand("Sa87500", false, true) == "a0");
+  REQUIRE(xdr.processCommand("S", false, true) == "a0");
+  REQUIRE(xdr.processCommand("Sm", false, true) == "a0");
+  // A guest still cannot reconfigure the tuner.
+  REQUIRE(xdr.processCommand("T101700", false, true) == "a0");
+
+  // Read-only queries still answer.
+  REQUIRE(xdr.processCommand("N", false, true).rfind("N", 0) == 0);
+  // The "o" line reports the real number of connected clients. This test
+  // drives processCommand() directly without a socket, so nobody is
+  // connected.
+  REQUIRE(xdr.processCommand("o", false, true) == "o0,0");
+  REQUIRE(xdr.processCommand("I", false, true).rfind("I", 0) == 0);
+
+  // An authenticated session gets the same commands through.
+  REQUIRE(xdr.processCommand("T101700", true, false) == "T101700");
+  REQUIRE(tuned.load() == 101700000u);
+}
+
+TEST_CASE("XDR tune resets the RDS PI history", "[xdr_unit]") {
+  XDRServer xdr;
+  xdr.setVerboseLogging(false);
+
+  // Feed enough clean groups for the PI to be reported.
+  for (int i = 0; i < 8; i++) {
+    xdr.updateRDS(0x1234, 0xABCD, 0x1111, 0x2222, 0x00);
+  }
+  {
+    std::lock_guard<std::mutex> lock(xdr.m_rdsMutex);
+    REQUIRE(xdr.m_piLastValue == 0x1234);
+    REQUIRE(xdr.m_piFill > 0);
+  }
+
+  // A tune must clear the previous station's PI history.
+  REQUIRE(xdr.processCommand("T101700", true, false) == "T101700");
+  {
+    std::lock_guard<std::mutex> lock(xdr.m_rdsMutex);
+    REQUIRE(xdr.m_piLastValue == 0xFFFF);
+    REQUIRE(xdr.m_piFill == 0);
+  }
+
+  // setFrequencyState() must also reset when it is told about a new
+  // frequency, even though m_frequency was already updated by the command.
+  for (int i = 0; i < 8; i++) {
+    xdr.updateRDS(0x5678, 0xABCD, 0x1111, 0x2222, 0x00);
+  }
+  {
+    std::lock_guard<std::mutex> lock(xdr.m_rdsMutex);
+    REQUIRE(xdr.m_piLastValue == 0x5678);
+  }
+  xdr.setFrequencyState(90900000u);
+  {
+    std::lock_guard<std::mutex> lock(xdr.m_rdsMutex);
+    REQUIRE(xdr.m_piLastValue == 0xFFFF);
+    REQUIRE(xdr.m_piFill == 0);
+  }
+}
+
 TEST_CASE("XDR updateRDS suppresses groups with block B errors", "[xdr_unit]") {
   XDRServer xdr;
   xdr.setVerboseLogging(false);
@@ -240,4 +341,55 @@ TEST_CASE("XDR stop joins client threads and clears thread registry",
   REQUIRE(xdr.m_clientSockets.empty());
 
   closeSock(sock);
+}
+
+TEST_CASE("XDR empty line cancels a scan only for an authenticated session",
+          "[xdr_unit]") {
+  XDRServer xdr;
+  xdr.setVerboseLogging(false);
+
+  // A guest is read-only: its empty line must not abort the owner's sweep.
+  REQUIRE(xdr.processCommand("", false, true).empty());
+  REQUIRE_FALSE(xdr.consumeScanCancel());
+
+  REQUIRE(xdr.processCommand("", true, false).empty());
+  REQUIRE(xdr.consumeScanCancel());
+}
+
+TEST_CASE("XDR scan start clears a cancel left over from an earlier sweep",
+          "[xdr_unit]") {
+  XDRServer xdr;
+  xdr.setVerboseLogging(false);
+
+  REQUIRE(xdr.processCommand("", true, false).empty());
+  REQUIRE(xdr.processCommand("S", true, false).empty());
+  XDRServer::ScanConfig cfg{};
+  REQUIRE(xdr.consumeScanStart(cfg));
+  REQUIRE_FALSE(xdr.consumeScanCancel());
+}
+
+TEST_CASE("XDR R line carries the legacy error byte layout", "[xdr_unit]") {
+  XDRServer xdr;
+  xdr.setVerboseLogging(false);
+
+  // The decoder reports errors as A<<6 | B<<4 | C<<2 | D. The 3-block R line
+  // must carry B in bits 0-1, C in bits 2-3 and D in bits 4-5, the layout the
+  // FM-DX-Tuner firmware sends and xdr-gtk's legacy parser expects.
+  xdr.updateRDS(0x1111, 0xAAAA, 0xBBBB, 0xCCCC, 0x03); // D uncorrectable
+  xdr.updateRDS(0x1111, 0xAAAA, 0xBBBB, 0xDDDD, 0x04); // C corrected
+  xdr.updateRDS(0x1111, 0xAAAA, 0xBBBB, 0xEEEE, 0xC1); // A missing, D corrected
+
+  std::vector<std::string> lines;
+  {
+    std::lock_guard<std::mutex> lock(xdr.m_rdsMutex);
+    for (const auto &entry : xdr.m_rdsQueue) {
+      if (!entry.second.empty() && entry.second[0] == 'R') {
+        lines.push_back(entry.second);
+      }
+    }
+  }
+  REQUIRE(lines.size() == 3);
+  REQUIRE(lines[0] == "RAAAABBBBCCCC30");
+  REQUIRE(lines[1] == "RAAAABBBBDDDD04");
+  REQUIRE(lines[2] == "RAAAABBBBEEEE10");
 }

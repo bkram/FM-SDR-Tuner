@@ -30,7 +30,8 @@ What a bare run does:
 - **Auto-loads `fm-sdr-tuner.ini`** from the current directory if present (see
   §3). The release archive ships a ready-to-use one, so this just works.
 - Turns on **audio output** (default).
-- Opens the **XDR control server** on `127.0.0.1:7373` and **waits for a
+- Opens the **XDR control server** on port 7373 on all network interfaces
+  (set `[xdr] password` if other hosts can reach it) and **waits for a
   client** (xdr-gtk / FM-DX-Webserver) to press start — it does not begin
   receiving on its own.
 
@@ -127,7 +128,7 @@ is optional and falls back to the default shown.
 ### `[tuner]` — source & RF
 | Key | Default | Meaning |
 |---|---|---|
-| `source` | `rtl_sdr` | `rtl_sdr` (USB), `rtl_tcp` (network), or `sdrplay` (RSP). macOS/Linux prebuilts are SDRplay-capable (install the SDRplay API service); Windows is RTL-only. |
+| `source` | `rtl_sdr` | `rtl_sdr` (USB), `rtl_tcp` (network), or `sdrplay` (RSP). Prebuilt binaries are RTL-only; SDRplay requires a local macOS/Linux source build with the vendor SDK. |
 | `rtl_device` | `0` | RTL-SDR device index when `source=rtl_sdr`. |
 | `default_freq` | `87500` | Startup frequency in kHz. |
 | `deemphasis` | `0` | `0`=50 µs (EU), `1`=75 µs (US/KR), `2`=off. |
@@ -155,8 +156,8 @@ is optional and falls back to the default shown.
 | `freq_correction_ppm` | `0` | Crystal correction, ppm. |
 | `default_custom_gain_flags` | `0` | Packed TEF flags: tens=RF, ones=IF (e.g. `11`). |
 | `sdrpp_rtl_agc` / `sdrpp_rtl_agc_gain_db` | `false` / `18` | SDR++-strategy IF AGC + gain. |
-| `signal_floor_dbfs` | `-65.0` | Compensated dBFS mapped to meter level **0** (absolute term). |
-| `signal_ceil_dbfs` | `-5.0` | Compensated dBFS mapped to meter level **120** (absolute term). |
+| `signal_floor_dbfs` | `-45.0` | Compensated dBFS mapped to meter level **0** (absolute term). |
+| `signal_ceil_dbfs` | `-1.0` | Compensated dBFS mapped to meter level **120** (absolute term). |
 | `signal_bias_db` | `0.0` | Overall meter offset (absolute term). |
 | `low_latency_iq` | `false` | Drop stale IQ backlog rather than buffer it — set `true` for scanning to avoid retune audio bursts. |
 
@@ -184,7 +185,7 @@ is optional and falls back to the default shown.
 | `dsp_block_samples` | `8192` | IQ samples per processing block. |
 | `w0_bandwidth_hz` | `194000` | Channel bandwidth for WFM stereo. |
 | `dsp_agc` | `off` | Pre-discriminator IQ AGC: `off`/`fast`/`slow`. |
-| `stereo_blend` | `aggressive` | `soft`/`normal`/`aggressive`. |
+| `stereo_blend` | `normal` | `soft`/`normal`/`aggressive`. |
 | `stereo` | `true` | Enable the stereo decoder. |
 | `pilot_canceller` | `true` | Subtract residual 19 kHz pilot from mono. |
 | `hicut` | `off` | Adaptive de-emphasis: `off`/`gentle`/`strong`. |
@@ -356,12 +357,10 @@ curl  http://127.0.0.1:9090/api/status
 - **Config seems ignored:** check for the `[Config] auto-loading …` line at
   startup. If it's missing, no `fm-sdr-tuner.ini` was found in the working
   directory — `cd` into the folder that has it, or pass `-c <file>`.
-- **`--source sdrplay` does nothing:** the **macOS and Linux** prebuilt
-  binaries are SDRplay-capable, but you must install the **SDRplay API service**
-  (from <https://www.sdrplay.com/>) for the binary to talk to an RSP — install
-  it and retry. The **Windows** prebuilt is RTL-only (no SDRplay loader).
-  Building from source for SDRplay needs `-DFM_TUNER_ENABLE_SDRPLAY=ON`
-  (macOS/Linux only).
+- **`--source sdrplay` does nothing:** prebuilt binaries are RTL-only because
+  CI cannot reliably download the vendor SDK headers. Install the SDRplay SDK
+  and build locally with `-DFM_TUNER_ENABLE_SDRPLAY=ON` on macOS or Linux.
+  Windows SDRplay builds are unsupported.
 
 ---
 

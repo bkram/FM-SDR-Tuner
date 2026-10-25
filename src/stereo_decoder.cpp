@@ -1,6 +1,10 @@
 #include "stereo_decoder.h"
 #include <algorithm>
 #include <complex>
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <utility>
 
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
@@ -15,22 +19,62 @@ constexpr float kPilotReleaseTauSec = 0.25f;
 constexpr float kPilotAcquireConfidence = 0.80f;
 constexpr float kPilotHoldConfidence = 0.20f;
 
-constexpr float kPilotRatioAcquire = 0.040f;
-constexpr float kPilotRatioHold = 0.022f;
+// The ratio and coherence thresholds are expressed for the analytic pilot
+// filter, whose output magnitude is the pilot amplitude. They were first tuned
+// on a real-tap filter whose mean |output| was 0.500 of the amplitude and
+// whose coherent magnitude was 0.393 of it, so the ratio thresholds are the
+// old values x2 and the coherence thresholds x1.273 (0.785 used to be the
+// ceiling a perfect pilot could reach; it is now 1.0).
+constexpr float kPilotRatioAcquire = 0.080f;
+constexpr float kPilotRatioHold = 0.044f;
 constexpr float kMpxMinAcquire = 0.005f;
 constexpr float kMpxMinHold = 0.0028f;
-constexpr float kPilotCoherenceAcquire = 0.18f;
-constexpr float kPilotCoherenceHold = 0.11f;
-constexpr float kPilotResidualAcquire = 0.95f;
-constexpr float kPilotResidualHold = 1.05f;
-constexpr float kPllLockAcquireHz = 180.0f;
+constexpr float kPilotCoherenceAcquire = 0.23f;
+constexpr float kPilotCoherenceHold = 0.14f;
+// Residual: mean |sin(phase error)| relative to the coherent magnitude. With a
+// clean phasor it sits near 0 when locked; noise the PLL cannot follow pushes
+// it up.
+constexpr float kPilotResidualAcquire = 0.30f;
+constexpr float kPilotResidualHold = 0.40f;
 constexpr float kPllLockHoldHz = 320.0f;
-constexpr float kPilotRatioQualityFloor = 0.080f;
-constexpr float kPilotRatioQualityCeil = 0.110f;
-constexpr float kPilotCoherenceQualityFloor = 0.55f;
-constexpr float kPilotCoherenceQualityCeil = 0.70f;
+constexpr float kPilotRatioQualityFloor = 0.160f;
+constexpr float kPilotRatioQualityCeil = 0.220f;
+constexpr float kPilotCoherenceQualityFloor = 0.70f;
+constexpr float kPilotCoherenceQualityCeil = 0.89f;
 constexpr float kPllQualityBestHz = 40.0f;
 constexpr float kPllQualityWorstHz = 700.0f;
+// Pilot-to-noise ratio inside the pilot band. A real pilot is a spectral line
+// and stands far above the noise beside it; noise the acquire-bandwidth PLL
+// tracks does not (a dead channel measures -6 to -8 dB, a station at 9 dB C/N
+// about 12 dB). Stereo is declared only above the acquire level. The blend
+// quality rises from the floor to the ceiling so that a noisy station blends
+// towards mono: measured through the demodulator, the stereo audio SNR (50 us
+// de-emphasis, 15 kHz) is the pilot SNR + 8 dB, so the floor is ~18 dB and the
+// ceiling ~34 dB of stereo audio SNR.
+constexpr float kPilotSnrAcquireDb = 12.0f;
+constexpr float kPilotSnrHoldDb = 8.0f;
+constexpr float kPilotSnrQualityFloorDb = 10.0f;
+constexpr float kPilotSnrQualityCeilDb = 26.0f;
+// Guard-band noise probes. 17 and 21 kHz sit 2 kHz either side of the pilot,
+// inside the guard band between the audio (15 kHz) and the lower edge of the
+// L-R sidebands (23 kHz); the smaller of the two noise estimates is used, so a
+// stray product in one of them does not pass for noise. 64 kHz sits above the
+// RDS band (57 kHz +- 2.4 kHz) and below the hiss estimator's 65 kHz corner.
+// 400 Hz is the probes' low-pass corner, so each measures a ~800 Hz band and
+// rejects the pilot 2 kHz away by ~56 dB.
+constexpr float kPilotProbeLowHz = 17000.0f;
+constexpr float kPilotProbeHighHz = 21000.0f;
+constexpr float kRdsProbeHz = 64000.0f;
+constexpr float kProbeCutoffHz = 400.0f;
+// Above this blend the hi-blend low-pass is crossfaded out; at
+// kHiBlendBypassFull and above L-R is unfiltered.
+constexpr float kHiBlendBypassStart = 0.85f;
+constexpr float kHiBlendBypassFull = 0.95f;
+// Scale of the pilot level reported to XDR clients ("N" and the [ST] line).
+// It was calibrated as 8*750 times the old filter's coherent magnitude,
+// which was 0.393 of the pilot amplitude; the factor keeps the reported
+// numbers unchanged now that the coherent magnitude is the amplitude itself.
+constexpr float kPilotLevelScale = 0.3927f * 8.0f * 750.0f;
 constexpr float kPilotEnvSmooth = 0.9995f;
 constexpr float kPilotEnvInject = 1.0f - kPilotEnvSmooth;
 constexpr float kPilotIqSmooth = 0.9995f;
@@ -144,7 +188,7 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
   // 19 kHz pilot is a single narrow tone with nothing immediately adjacent
   // to discriminate against — L+R audio ends at 15 kHz, L-R DSB-SC starts
   // near 23 kHz — so 4 kHz still rejects both with margin. Tap count drops
-  // to ~243 (~25% fewer complex MACs/sec). Tried 5 kHz first but it lets
+  // to ~245 (~25% fewer MACs/sec). Tried 5 kHz first but it lets
   // enough broadband noise leak in that the quality metric (which uses
   // pilotBand/mpx ratio) starts over-reporting on noisy signals. 4 kHz is
   // the sweet spot.
@@ -156,16 +200,38 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
   if ((pilotTapCount % 2) == 0) {
     pilotTapCount++;
   }
-  const float pilotCenterNorm = std::clamp(
-      pilotCenterHz / static_cast<float>(m_inputRate), 0.001f, 0.49f);
   const float pilotCutoffNorm = std::clamp(
       pilotHalfBandwidthHz / static_cast<float>(m_inputRate), 0.0005f, 0.45f);
-  m_liquidPilotBandFilter.init(static_cast<std::uint32_t>(pilotTapCount),
-                               pilotCutoffNorm, 60.0f, pilotCenterNorm);
-  // Calibrate the band-pass gain at 19 kHz: feed a unit-amplitude 19 kHz
-  // cosine and measure the steady-state output magnitude. The centered FIR is
-  // L1-normalized (sub-unity gain), so this factor converts the smoothed pilot
-  // magnitude to a true deviation in getPilotDeviationKHz().
+  // The narrow bands are filtered at ~32 kHz: the pilot band ends at 4.25 kHz
+  // and the RDS band at 8.4 kHz, both well inside the decimated Nyquist, and
+  // what folds back from above it lies in the prototypes' 60 dB stop band.
+  const int bandDecim = std::max(1, m_inputRate / 32000);
+  const float fsIn = static_cast<float>(m_inputRate);
+  // Pilot: the analytic band-pass around 19 kHz, computed as its Kaiser
+  // prototype on the band mixed down to DC. The PLL's atan2 phase detector
+  // needs a phasor; a real-tap band-pass hands it a real sinusoid instead,
+  // whose magnitude passes through zero twice a cycle, and the loop sat
+  // pinned at its +-250 Hz clamp. A prototype DC gain of 2 makes the phasor's
+  // magnitude equal the amplitude of the real pilot tone.
+  m_pilotBand.init(
+      fm_tuner::dsp::liquid::designKaiserLowpass(
+          static_cast<std::uint32_t>(pilotTapCount), pilotCutoffNorm, 60.0f,
+          2.0f),
+      pilotCenterHz, fsIn, bandDecim);
+  // The rebuilt phasor is the band-pass output delayed by the prototype's
+  // group delay plus the interpolation delay; the L+R delay line matches it.
+  m_delaySamples = ((pilotTapCount - 1) / 2) + bandDecim;
+  {
+    const double rot = -2.0 * static_cast<double>(kPi) *
+                       static_cast<double>(pilotCenterHz) /
+                       static_cast<double>(m_inputRate) *
+                       static_cast<double>(m_delaySamples);
+    m_pilotRotation = std::complex<float>(static_cast<float>(std::cos(rot)),
+                                          static_cast<float>(std::sin(rot)));
+  }
+  // Calibrate the pilot gain at 19 kHz: feed a unit-amplitude 19 kHz cosine
+  // and measure the steady-state phasor magnitude. It lands at ~1.0;
+  // measuring it keeps getPilotDeviationKHz() exact whatever the tap count.
   {
     const double w = 2.0 * static_cast<double>(kPi) *
                      static_cast<double>(pilotCenterHz) /
@@ -174,11 +240,11 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
     double accum = 0.0;
     int counted = 0;
     for (int k = 0; k < warm; k++) {
-      const float s = static_cast<float>(std::cos(w * static_cast<double>(k)));
-      m_liquidPilotBandFilter.push(std::complex<float>(s, 0.0f));
-      const std::complex<float> o = m_liquidPilotBandFilter.execute();
+      float mixPhase = 0.0f;
+      (void)m_pilotBand.push(
+          static_cast<float>(std::cos(w * static_cast<double>(k))), mixPhase);
       if (k >= pilotTapCount * 2) {
-        accum += static_cast<double>(std::abs(o));
+        accum += static_cast<double>(std::abs(m_pilotBand.interpolated()));
         counted++;
       }
     }
@@ -187,22 +253,20 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
     if (m_pilotFilterGain < 1e-4f) {
       m_pilotFilterGain = 0.5f;
     }
-    m_liquidPilotBandFilter.reset();
+    m_pilotBand.reset();
   }
 
-  // 57 kHz RDS subcarrier band-pass + gain calibration, for the RDS deviation
-  // meter (mirrors the pilot path). RDS occupies 57 kHz ± ~2.4 kHz.
+  // 57 kHz RDS subcarrier band + gain calibration, for the RDS deviation
+  // meter (mirrors the pilot path). RDS occupies 57 kHz +- ~2.4 kHz.
   {
     constexpr float rdsCenterHz = 57000.0f;
-    // RDS biphase mainlobe is 57 kHz ± ~2.4 kHz. Keep the band tight and the
+    // RDS biphase mainlobe is 57 kHz +- ~2.4 kHz. Keep the band tight and the
     // skirt sharp so the 38 kHz L-R subcarrier (upper edge ~53 kHz) and
     // broadband noise don't leak in and inflate the measured deviation.
     constexpr float rdsHalfBandwidthHz = 2400.0f;
     // 6 kHz transition -> ~163 taps at 256 kHz. The lower skirt still has to
     // reject the 38 kHz L-R subcarrier's upper edge (~53 kHz, 1.6 kHz below the
-    // 54.6 kHz passband edge), so we don't widen this further; a sharper edge
-    // would only add taps for marginal selectivity the deviation meter doesn't
-    // need. The self-calibrated m_rdsFilterGain absorbs the passband-gain shift.
+    // 54.6 kHz passband edge), so we don't widen this further.
     constexpr float rdsTransitionHz = 6000.0f;
     int rdsTapCount = static_cast<int>(
         std::ceil(3.8 * static_cast<double>(m_inputRate) /
@@ -211,12 +275,20 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
     if ((rdsTapCount % 2) == 0) {
       rdsTapCount++;
     }
-    const float rdsCenterNorm = std::clamp(
-        rdsCenterHz / static_cast<float>(m_inputRate), 0.001f, 0.49f);
     const float rdsCutoffNorm = std::clamp(
         rdsHalfBandwidthHz / static_cast<float>(m_inputRate), 0.0005f, 0.45f);
-    m_liquidRdsBandFilter.init(static_cast<std::uint32_t>(rdsTapCount),
-                               rdsCutoffNorm, 60.0f, rdsCenterNorm);
+    m_rdsBand.init(fm_tuner::dsp::liquid::designKaiserLowpass(
+                       static_cast<std::uint32_t>(rdsTapCount), rdsCutoffNorm,
+                       60.0f, 2.0f),
+                   rdsCenterHz, fsIn, bandDecim);
+    m_rdsEnvSmoothDecim =
+        std::pow(kPilotEnvSmooth, static_cast<float>(bandDecim));
+    // The meter's scale was set on a real-tap band-pass, whose output for a
+    // tone of amplitude A is a real sinusoid: its mean square is A^2/2 and
+    // the calibration measured its mean |.|, 2A/pi. The baseband band gives
+    // the envelope A itself, so the same two statistics are formed from it
+    // (|b|^2/2 per output, 2/pi of the measured gain) and the reading - and
+    // the 1.64 crest factor validated on it - stay as they were.
     const double w = 2.0 * static_cast<double>(kPi) *
                      static_cast<double>(rdsCenterHz) /
                      static_cast<double>(m_inputRate);
@@ -224,19 +296,22 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
     double accum = 0.0;
     int counted = 0;
     for (int k = 0; k < warm; k++) {
-      const float s = static_cast<float>(std::cos(w * static_cast<double>(k)));
-      m_liquidRdsBandFilter.push(std::complex<float>(s, 0.0f));
-      const std::complex<float> o = m_liquidRdsBandFilter.execute();
-      if (k >= rdsTapCount * 2) {
-        accum += static_cast<double>(std::abs(o));
+      float mixPhase = 0.0f;
+      if (m_rdsBand.push(
+              static_cast<float>(std::cos(w * static_cast<double>(k))),
+              mixPhase) &&
+          k >= rdsTapCount * 2) {
+        accum += static_cast<double>(std::abs(m_rdsBand.cur));
         counted++;
       }
     }
-    m_rdsFilterGain = (counted > 0) ? static_cast<float>(accum / counted) : 0.5f;
+    const float envelopeGain =
+        (counted > 0) ? static_cast<float>(accum / counted) : 0.0f;
+    m_rdsFilterGain = (2.0f / kPi) * envelopeGain;
     if (m_rdsFilterGain < 1e-4f) {
       m_rdsFilterGain = 0.5f;
     }
-    m_liquidRdsBandFilter.reset();
+    m_rdsBand.reset();
   }
 
   // Noise-triangle hiss estimate for the demod-domain SNR/quality figure. A
@@ -249,12 +324,17 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
   // so the metric reads optimistically — but those are mono/weak cases anyway.
   m_liquidHissBandFilter.initHighpass(
       6, 65000.0f / static_cast<float>(m_inputRate), 60.0f);
+
+  m_pilotNoiseProbeLow.init(kPilotProbeLowHz, kProbeCutoffHz, fsIn);
+  m_pilotNoiseProbeHigh.init(kPilotProbeHighHz, kProbeCutoffHz, fsIn);
+  m_rdsNoiseProbe.init(std::min(kRdsProbeHz, 0.45f * fsIn), kProbeCutoffHz,
+                       fsIn);
+  calibrateNoiseScales();
   // No dedicated audio LPF at the input rate. The 19 kHz pilot / 38 kHz
   // L-R subcarrier / 57 kHz RDS subcarrier are all rejected by the
   // anti-aliasing filter in AFPostProcessor's resampler; the residual
   // pilot leakage is mopped up by the LMS pilot canceller above.
 
-  m_delaySamples = std::max(0, (pilotTapCount - 1) / 2);
   m_delayLine.assign(static_cast<size_t>(std::max(1, m_delaySamples + 1)),
                      std::complex<float>(0.0f, 0.0f));
   const float nominalPllFreq =
@@ -264,6 +344,187 @@ StereoDecoder::StereoDecoder(int inputRate, int /*outputRate*/)
 }
 
 StereoDecoder::~StereoDecoder() = default;
+
+void StereoDecoder::NoiseProbe::init(float centerHz, float cutoffHz,
+                                     float sampleRate) {
+  step = 2.0f * kPi * centerHz / sampleRate;
+  // 4th-order Butterworth low-pass as two biquads (Q = 0.5412 and 1.3066).
+  const float omega = std::tan(kPi * cutoffHz / sampleRate);
+  const float omega2 = omega * omega;
+  constexpr float kQ[2] = {0.54119610f, 1.30656296f};
+  for (int k = 0; k < 2; k++) {
+    const float invNorm = 1.0f / (1.0f + omega / kQ[k] + omega2);
+    b0[k] = omega2 * invNorm;
+    b1[k] = 2.0f * b0[k];
+    b2[k] = b0[k];
+    a1[k] = 2.0f * (omega2 - 1.0f) * invNorm;
+    a2[k] = (1.0f - omega / kQ[k] + omega2) * invNorm;
+  }
+  reset();
+}
+
+void StereoDecoder::NoiseProbe::reset() {
+  phase = 0.0f;
+  for (int k = 0; k < 2; k++) {
+    z1[k] = {0.0f, 0.0f};
+    z2[k] = {0.0f, 0.0f};
+  }
+}
+
+float StereoDecoder::NoiseProbe::process(float x) {
+  float s;
+  float c;
+  fast_sincosf(phase, s, c);
+  phase += step;
+  if (phase >= kTwoPi) {
+    phase -= kTwoPi;
+  }
+  std::complex<float> y(x * c, -x * s);
+  for (int k = 0; k < 2; k++) {
+    const std::complex<float> out = b0[k] * y + z1[k];
+    z1[k] = b1[k] * y - a1[k] * out + z2[k];
+    z2[k] = b2[k] * y - a2[k] * out;
+    y = out;
+  }
+  return std::norm(y);
+}
+
+void StereoDecoder::BasebandBand::init(const std::vector<float> &taps,
+                                       float centerHz, float sampleRate,
+                                       int decimation) {
+  lowpass.initWithTaps(taps);
+  step = 2.0f * kPi * centerHz / sampleRate;
+  decim = std::max(1, decimation);
+  reset();
+}
+
+void StereoDecoder::BasebandBand::reset() {
+  lowpass.reset();
+  phase = 0.0f;
+  count = 0;
+  prev = {0.0f, 0.0f};
+  cur = {0.0f, 0.0f};
+}
+
+bool StereoDecoder::BasebandBand::push(float x, float &mixPhase) {
+  mixPhase = phase;
+  float s;
+  float c;
+  fast_sincosf(phase, s, c);
+  phase += step;
+  if (phase >= kTwoPi) {
+    phase -= kTwoPi;
+  }
+  lowpass.push(std::complex<float>(x * c, -x * s));
+  if (++count < decim) {
+    return false;
+  }
+  count = 0;
+  prev = cur;
+  cur = lowpass.execute();
+  return true;
+}
+
+std::complex<float> StereoDecoder::BasebandBand::interpolated() const {
+  // Evaluations happen at t_k; this sample is t_k + count. The value
+  // `decim` samples back lies between the last two evaluations.
+  const float frac = static_cast<float>(count) / static_cast<float>(decim);
+  return prev + (cur - prev) * frac;
+}
+
+void StereoDecoder::calibrateNoiseScales() {
+  // The probes measure noise in a band of a different width (and at a
+  // slightly different frequency) than the pilot and RDS filters. The ratio of
+  // the two noise powers is measured once per sample rate by feeding them all
+  // the same noise shaped like FM demodulator noise above threshold (density
+  // rising with f^2, here the first difference of white noise). It is cached:
+  // the measurement runs the long pilot and RDS FIRs over 2^17 samples.
+  struct Scales {
+    float pilotLow;
+    float pilotHigh;
+    float rds;
+  };
+  static std::mutex cacheMutex;
+  static std::map<int, Scales> cache;
+  {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    const auto it = cache.find(m_inputRate);
+    if (it != cache.end()) {
+      m_pilotNoiseScaleLow = it->second.pilotLow;
+      m_pilotNoiseScaleHigh = it->second.pilotHigh;
+      m_rdsNoiseScale = it->second.rds;
+      return;
+    }
+  }
+  constexpr int kSamples = 1 << 17;
+  constexpr int kWarm = 4096;
+  uint32_t lcg = 0x12345678u;
+  float prev = 0.0f;
+  double pilotMs = 0.0;
+  double pilotProbeLowMs = 0.0;
+  double pilotProbeHighMs = 0.0;
+  double rdsMs = 0.0;
+  int rdsOutputs = 0;
+  double rdsProbeMs = 0.0;
+  for (int n = 0; n < kSamples + kWarm; n++) {
+    lcg = lcg * 1664525u + 1013904223u;
+    const float white =
+        (static_cast<float>(lcg >> 8) / 16777216.0f) - 0.5f;
+    const float x = white - prev;
+    prev = white;
+    float mixPhase = 0.0f;
+    (void)m_pilotBand.push(x, mixPhase);
+    const float pp = std::norm(m_pilotBand.interpolated());
+    const float pql = m_pilotNoiseProbeLow.process(x);
+    const float pqh = m_pilotNoiseProbeHigh.process(x);
+    // The RDS band is read at its decimated rate, as processAudio() does,
+    // with the same |b|^2/2 statistic.
+    const bool rdsOut = m_rdsBand.push(x, mixPhase);
+    const float rq = m_rdsNoiseProbe.process(x);
+    if (n >= kWarm) {
+      pilotMs += pp;
+      pilotProbeLowMs += pql;
+      pilotProbeHighMs += pqh;
+      if (rdsOut) {
+        rdsMs += 0.5 * static_cast<double>(std::norm(m_rdsBand.cur));
+        rdsOutputs++;
+      }
+      rdsProbeMs += rq;
+    }
+  }
+  m_pilotNoiseScaleLow = (pilotProbeLowMs > 1e-20)
+                             ? static_cast<float>(pilotMs / pilotProbeLowMs)
+                             : 1.0f;
+  m_pilotNoiseScaleHigh = (pilotProbeHighMs > 1e-20)
+                              ? static_cast<float>(pilotMs / pilotProbeHighMs)
+                              : 1.0f;
+  // rdsMs is a mean over the decimated outputs, the probe a mean over every
+  // sample: compare means.
+  const double rdsMean = (rdsOutputs > 0) ? rdsMs / rdsOutputs : 0.0;
+  const double rdsProbeMean = rdsProbeMs / kSamples;
+  m_rdsNoiseScale = (rdsProbeMean > 1e-20)
+                        ? static_cast<float>(rdsMean / rdsProbeMean)
+                        : 1.0f;
+  m_pilotBand.reset();
+  m_rdsBand.reset();
+  m_pilotNoiseProbeLow.reset();
+  m_pilotNoiseProbeHigh.reset();
+  m_rdsNoiseProbe.reset();
+  std::lock_guard<std::mutex> lock(cacheMutex);
+  cache[m_inputRate] = {m_pilotNoiseScaleLow, m_pilotNoiseScaleHigh,
+                        m_rdsNoiseScale};
+}
+
+void StereoDecoder::updatePilotSnr() {
+  const float noiseMs =
+      std::min(m_pilotNoiseScaleLow * m_pilotProbeLowMs,
+               m_pilotNoiseScaleHigh * m_pilotProbeHighMs);
+  m_pilotSignalMs = std::max(0.0f, m_pilotBandMs - noiseMs);
+  const float ratio = m_pilotSignalMs / std::max(noiseMs, 1e-14f);
+  m_pilotSnrDb = (ratio > 1e-2f)
+                     ? std::clamp(10.0f * std::log10(ratio), -20.0f, 60.0f)
+                     : -20.0f;
+}
 
 void StereoDecoder::reset() {
   m_stereoDetected = false;
@@ -290,8 +551,17 @@ void StereoDecoder::reset() {
             std::complex<float>(0.0f, 0.0f));
   m_rdsBandMs = 0.0f;
   m_hissNoiseMs = 0.0f;
-  m_liquidPilotBandFilter.reset();
-  m_liquidRdsBandFilter.reset();
+  m_pilotBandMs = 0.0f;
+  m_pilotProbeLowMs = 0.0f;
+  m_pilotProbeHighMs = 0.0f;
+  m_rdsProbeMs = 0.0f;
+  m_pilotSignalMs = 0.0f;
+  m_pilotSnrDb = -20.0f;
+  m_pilotNoiseProbeLow.reset();
+  m_pilotNoiseProbeHigh.reset();
+  m_rdsNoiseProbe.reset();
+  m_pilotBand.reset();
+  m_rdsBand.reset();
   m_liquidHissBandFilter.reset();
   m_liquidPilotPll.reset();
   m_liquidPilotPll.setPLLBandwidth(kPilotPllBwAcquire);
@@ -352,14 +622,18 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
                      1e-4f),
         0.0f, 1.0f);
     const float cleanQ =
-        std::clamp((1.10f - pilotResidualRatio) / 0.40f, 0.0f, 1.0f);
+        std::clamp((0.45f - pilotResidualRatio) / 0.30f, 0.0f, 1.0f);
     const float pllQ =
         std::clamp((kPllQualityWorstHz - pllErrHz) /
                        std::max(kPllQualityWorstHz - kPllQualityBestHz, 1e-3f),
                    0.0f, 1.0f);
     (void)pilotMag;
-    const float quality =
-        std::pow(std::max(0.0f, ratioQ * cohQ * cleanQ * pllQ), 0.40f);
+    const float snrQ = std::clamp(
+        (m_pilotSnrDb - kPilotSnrQualityFloorDb) /
+            (kPilotSnrQualityCeilDb - kPilotSnrQualityFloorDb),
+        0.0f, 1.0f);
+    const float quality = std::pow(
+        std::max(0.0f, ratioQ * cohQ * cleanQ * pllQ * snrQ), 0.40f);
     m_stereoQuality = quality;
     float qualityShaped = quality;
     if (m_blendMode == BlendMode::Soft) {
@@ -415,18 +689,46 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
   for (size_t i = 0; i < numSamples; i++) {
     const float mpx = mono[i];
 
-    m_liquidPilotBandFilter.push(std::complex<float>(mpx, 0.0f));
-    const std::complex<float> pilot = m_liquidPilotBandFilter.execute();
+    // The pilot phasor, rebuilt from the baseband band: rotate it back up to
+    // 19 kHz with the mixer phase of this sample, corrected by the band's
+    // delay (see m_pilotRotation).
+    float pilotMixPhase = 0.0f;
+    (void)m_pilotBand.push(mpx, pilotMixPhase);
+    float mixSin;
+    float mixCos;
+    fast_sincosf(pilotMixPhase, mixSin, mixCos);
+    const std::complex<float> pilot = m_pilotBand.interpolated() *
+                                      std::complex<float>(mixCos, mixSin) *
+                                      m_pilotRotation;
+    // sqrt(norm) rather than std::abs: the complex abs goes through hypotf,
+    // whose overflow-safe scaling cost ~2% of the chain, and the pilot is
+    // nowhere near the range where it matters.
+    const float pilotNorm = std::norm(pilot);
     m_pilotBandMagnitude = (m_pilotBandMagnitude * kPilotEnvSmooth) +
-                           (std::abs(pilot) * kPilotEnvInject);
+                           (std::sqrt(pilotNorm) * kPilotEnvInject);
+    m_pilotBandMs = (m_pilotBandMs * kPilotEnvSmooth) +
+                    (pilotNorm * kPilotEnvInject);
+    m_pilotProbeLowMs =
+        (m_pilotProbeLowMs * kPilotEnvSmooth) +
+        (m_pilotNoiseProbeLow.process(mpx) * kPilotEnvInject);
+    m_pilotProbeHighMs =
+        (m_pilotProbeHighMs * kPilotEnvSmooth) +
+        (m_pilotNoiseProbeHigh.process(mpx) * kPilotEnvInject);
+    m_rdsProbeMs = (m_rdsProbeMs * kPilotEnvSmooth) +
+                   (m_rdsNoiseProbe.process(mpx) * kPilotEnvInject);
 
     // 57 kHz RDS subcarrier envelope, decaying peak hold (~0.1 s) for the RDS
     // deviation meter. DSB-SC, so the envelope tracks the data; the peak is the
     // reported deviation.
-    m_liquidRdsBandFilter.push(std::complex<float>(mpx, 0.0f));
-    const float rdsEnv = std::abs(m_liquidRdsBandFilter.execute());
-    m_rdsBandMs =
-        (m_rdsBandMs * kPilotEnvSmooth) + (rdsEnv * rdsEnv * kPilotEnvInject);
+    // Read at the decimated rate, so the EMA steps by kPilotEnvSmooth^decim
+    // and keeps its time constant. |b|^2/2 is the mean square the meter was
+    // calibrated on (see the constructor).
+    float rdsMixPhase = 0.0f;
+    if (m_rdsBand.push(mpx, rdsMixPhase)) {
+      m_rdsBandMs = (m_rdsBandMs * m_rdsEnvSmoothDecim) +
+                    (0.5f * std::norm(m_rdsBand.cur) *
+                     (1.0f - m_rdsEnvSmoothDecim));
+    }
     m_mpxMagnitude =
         (m_mpxMagnitude * kPilotEnvSmooth) + (std::abs(mpx) * kPilotEnvInject);
 
@@ -453,7 +755,12 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
       dphi += 2.0f * kPi;
     }
     m_pllPhase = phaseNext;
-    m_pllFreq = std::clamp(dphi, m_pllMinFreq, m_pllMaxFreq);
+    // The per-sample phase step is noisy (it carries the loop's response to
+    // every phase-detector sample), so the frequency used for the lock and
+    // quality decisions is smoothed with the same time constant as the other
+    // pilot metrics.
+    m_pllFreq = (m_pllFreq * kPilotEnvSmooth) +
+                (std::clamp(dphi, m_pllMinFreq, m_pllMaxFreq) * kPilotEnvInject);
 
     m_pilotI =
         (m_pilotI * kPilotIqSmooth) + (mixedPilot.real() * kPilotIqInject);
@@ -539,6 +846,7 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     // noise cleanly during weak reception.
     const float blendClamped = std::clamp(m_stereoBlend, 0.0f, 1.0f);
     if ((static_cast<uint32_t>(i) & kHiBlendCoeffRefreshMask) == 0U) {
+      updatePilotSnr();
       const float cutoffHz = 200.0f + 14800.0f * blendClamped * blendClamped;
       const float omega = std::tan(kPiOverFs * cutoffHz);
       const float omega2 = omega * omega;
@@ -555,7 +863,13 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     m_hiBlendZ1 =
         m_hiBlendB1 * lrScaled - m_hiBlendA1 * biquadOut + m_hiBlendZ2;
     m_hiBlendZ2 = m_hiBlendB2 * lrScaled - m_hiBlendA2 * biquadOut;
-    const float lrAdapted = biquadOut;
+    // Crossfade the low-pass out near full blend (see the member comment):
+    // both paths run continuously, so the crossfade is click-free.
+    const float bypass = std::clamp(
+        (blendClamped - kHiBlendBypassStart) /
+            (kHiBlendBypassFull - kHiBlendBypassStart),
+        0.0f, 1.0f);
+    const float lrAdapted = biquadOut + bypass * (lrScaled - biquadOut);
 
     const float leftRaw = 0.5f * (monoRaw + lrAdapted);
     const float rightRaw = 0.5f * (monoRaw - lrAdapted);
@@ -585,11 +899,15 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
       m_stereoDetected ? kPilotCoherenceHold : kPilotCoherenceAcquire;
   const float residualThreshold =
       m_stereoDetected ? kPilotResidualHold : kPilotResidualAcquire;
+  updatePilotSnr();
+  const float snrThreshold =
+      m_stereoDetected ? kPilotSnrHoldDb : kPilotSnrAcquireDb;
   const bool pilotPresent =
       (m_mpxMagnitude > mpxThreshold) &&
       (pilotRatio > ratioThreshold) &&
       (pilotCoherence > coherenceThreshold) &&
-      (pilotResidualRatio < residualThreshold);
+      (pilotResidualRatio < residualThreshold) &&
+      (m_pilotSnrDb > snrThreshold);
   if (!m_forceStereo) {
     const float blockSec = static_cast<float>(numSamples) /
                            std::max(1.0f, static_cast<float>(m_inputRate));
@@ -615,8 +933,11 @@ size_t StereoDecoder::processAudio(const float *mono, float *left, float *right,
     }
   }
 
-  const float calibrated = m_pilotMagnitude * 8.0f;
   m_pilotLevelTenthsKHz =
-      std::clamp(static_cast<int>(std::round(calibrated * 750.0f)), 0, 750);
+      (m_pilotSnrDb < kPilotSnrReportDb)
+          ? 0
+          : std::clamp(static_cast<int>(std::round(m_pilotMagnitude *
+                                                   kPilotLevelScale)),
+                       0, 750);
   return outCount;
 }

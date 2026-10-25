@@ -23,6 +23,14 @@ struct AdaptiveBandwidthState {
 //   stereo image and HF response.
 int pickAdaptiveBandwidthHz(AdaptiveBandwidthMode mode, double snrDb);
 
+// The same policy with an SNR hysteresis band around each threshold, given
+// the bandwidth currently applied. Staying at (or above) a band needs the SNR
+// to fall hysteresisDb/2 below its threshold before narrowing; moving up to
+// it needs the SNR hysteresisDb/2 above. An SNR hovering at a threshold then
+// holds the current bandwidth instead of toggling every rate-limit interval.
+int pickAdaptiveBandwidthHz(AdaptiveBandwidthMode mode, double snrDb,
+                            int currentAppliedHz, double hysteresisDb = 3.0);
+
 // Applies hysteresis: only allows changes every minIntervalMs ms, and only
 // when the target differs from the previous target by at least minStepHz.
 // Returns the bandwidth to apply (or 0 if no change should be made).

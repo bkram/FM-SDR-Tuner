@@ -22,6 +22,11 @@ struct XdrCommandState {
   std::atomic<uint32_t> requestedFrequencyHz;
   std::atomic<int> requestedCustomGain;
   std::atomic<int> requestedAGCMode;
+  // The runtime manual gain in dB (-1 = no manual gain, the ladder decides).
+  // A client (the fm-dx-webserver plugin over REST, an XDR client over the
+  // XDR protocol) that sets the gain writes it here, so the setting survives
+  // a retune and the periodic gain re-assert.
+  std::atomic<int> requestedGainDb{-1};
   std::atomic<int> requestedBandwidthHz;
   std::atomic<int> requestedVolume;
   std::atomic<int> requestedDeemphasis;
@@ -54,6 +59,10 @@ public:
       const std::function<void(int)> &setVolumePercent,
       const std::function<void()> &onStart, const std::function<void()> &onStop,
       const std::function<std::string(int)> &formatCustomGain);
+
+  // Reports whether the tuner is already running, so the server can tell a
+  // client that started the tuner from one that merely attached to it.
+  void setTunerActiveCallback(std::function<bool()> isTunerActive);
 
 private:
   XDRServer &m_server;

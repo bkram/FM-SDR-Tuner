@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <string>
 
+#include "socket_compat.h"
+
 class RTLTCPClient {
 public:
   RTLTCPClient(const std::string &host, uint16_t port);
@@ -18,6 +20,12 @@ public:
   bool isConnected() const { return m_connected; }
 
   size_t readIQ(uint8_t *buffer, size_t maxSamples);
+
+  // Drop the IQ that is still in flight from the previous centre frequency.
+  // A USB dongle can have its ring emptied; a network source cannot, so the
+  // stale bytes sitting in the socket buffer are drained instead. Without
+  // this a retune measures the spectrum of the band that was just left.
+  void flushBuffers();
 
   bool setFrequency(uint32_t freqHz);
   bool setSampleRate(uint32_t rate);
@@ -36,7 +44,7 @@ private:
 
   std::string m_host;
   uint16_t m_port;
-  int m_socket;
+  SocketHandle m_socket;
   std::atomic<bool> m_connected;
   std::atomic<uint32_t> m_frequency;
   std::atomic<uint32_t> m_sampleRate;

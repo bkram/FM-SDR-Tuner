@@ -1,12 +1,51 @@
 #include "adaptive_bandwidth.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 
 namespace fm_tuner {
 
+namespace {
+
+struct BandwidthStep {
+  double minSnrDb; // the SNR must exceed this to select the step
+  int hz;
+};
+
+// Widest first; the last step is the floor and has no threshold.
+constexpr BandwidthStep kAggressiveSteps[] = {
+    {25.0, 200000}, {15.0, 130000}, {8.0, 95000}, {3.0, 56000}, {0.0, 36000}};
+// Conservative: stay wide for as long as the SNR allows.
+constexpr BandwidthStep kConservativeSteps[] = {
+    {20.0, 194000}, {10.0, 142000}, {0.0, 95000}};
+
+template <std::size_t N>
+int pickStep(const BandwidthStep (&steps)[N], double snrDb,
+             int currentAppliedHz, double halfBandDb) {
+  for (std::size_t i = 0; i + 1 < N; i++) {
+    // Already at this step or wider: narrow only once the SNR falls below
+    // the band. Narrower: widen only once it rises above it.
+    const double threshold = (currentAppliedHz >= steps[i].hz)
+                                 ? steps[i].minSnrDb - halfBandDb
+                                 : steps[i].minSnrDb + halfBandDb;
+    if (snrDb > threshold) {
+      return steps[i].hz;
+    }
+  }
+  return steps[N - 1].hz;
+}
+
+} // namespace
+
 int pickAdaptiveBandwidthHz(AdaptiveBandwidthMode mode, double snrDb) {
+  return pickAdaptiveBandwidthHz(mode, snrDb, 0, 0.0);
+}
+
+int pickAdaptiveBandwidthHz(AdaptiveBandwidthMode mode, double snrDb,
+                            int currentAppliedHz, double hysteresisDb) {
   if (mode == AdaptiveBandwidthMode::Off) {
     return 0;
   }
@@ -14,17 +53,11 @@ int pickAdaptiveBandwidthHz(AdaptiveBandwidthMode mode, double snrDb) {
     // No usable channel-power estimate — leave bandwidth alone.
     return 0;
   }
+  const double halfBandDb = std::max(0.0, hysteresisDb) / 2.0;
   if (mode == AdaptiveBandwidthMode::Aggressive) {
-    if (snrDb > 25.0) return 200000;
-    if (snrDb > 15.0) return 130000;
-    if (snrDb > 8.0)  return 95000;
-    if (snrDb > 3.0)  return 56000;
-    return 36000;
+    return pickStep(kAggressiveSteps, snrDb, currentAppliedHz, halfBandDb);
   }
-  // Conservative: stay wide for as long as the SNR allows.
-  if (snrDb > 20.0) return 194000;
-  if (snrDb > 10.0) return 142000;
-  return 95000;
+  return pickStep(kConservativeSteps, snrDb, currentAppliedHz, halfBandDb);
 }
 
 int applyAdaptiveBandwidthHysteresis(

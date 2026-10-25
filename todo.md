@@ -1,10 +1,9 @@
 # FM-SDR-Tuner Issues and Improvements
 
-Last verified against current source: 2026-06-17 (post v1.6.2, on v1.6.3)
+Last verified against current source: 2026-10-25 (on v1.8.0, branch `v1.8`)
 
-This file is a short-form punch list of open work — see `plan.md` for the
-fuller analysis with rationale and validation strategy. Closed tickets are
-not retained; consult `git log` and merged PR descriptions for history.
+This is the canonical punch list of open work. Closed tickets are not
+retained; consult `git log` and merged PR descriptions for history.
 
 ## Verified Open Issues
 
@@ -16,19 +15,14 @@ not retained; consult `git log` and merged PR descriptions for history.
   that owns connect/tune/gain/capabilities — see `src/tuner_session.cpp`
   and `src/tuner_controller.cpp`. Blocks any future Soapy / HackRF / Airspy
   work.
-- **Drop the pilot bandpass FIR (P18)**: today `StereoDecoder` runs a 243-tap
-  complex bandpass on every IQ sample at 256 kHz — the biggest remaining
-  hotspot in the post-v1.6.0 profile (`dotprod_crcf_execute_neon4`). Reference
-  implementation in `research/sdr-j-fm/src/fm/pilot-recover.cpp` uses a bare
-  product-detector PLL on the raw MPX float and relies on the loop bandwidth
-  itself to provide the bandpass behavior. Estimated **5-10 pp of one core
-  saved** plus a simpler architecture (no FIR group delay to compensate in
-  the L-R recovery delay line). Trade-off: less out-of-band rejection on the
-  PLL input, must validate on stations with strong adjacent splatter.
+
+### Medium
+
 - **ADC-rail-aware gain policy refusal (P17b)**: the L1 normalization on the
   IQ FIR is wired (`processing.iq_fir_l1_normalize`, default off — see v1.6.2)
   so post-filter envelope can be hard-bounded. Still open: the gain policy
-  in `src/runtime_loop.cpp` accepts `G01` / `G11` requests that would push
+  accepts `G01` / `G11` requests (parsed in `src/xdr_server.cpp`, applied
+  through `src/xdr_facade.cpp` and `src/application.cpp`) that would push
   the front end into chronic ADC saturation. Add a refusal path that
   reports the chronic-clip ratio back through the XDR meter rather than
   silently mis-representing the level.
@@ -37,55 +31,57 @@ not retained; consult `git log` and merged PR descriptions for history.
   reconnect, and the main DSP loop in one large function. Structural debt
   that makes backend work and future runtime fixes harder than they need to
   be.
-
-### Medium
-
-- **Adaptive L-R phase alignment (P19)**: replace the current
-  `2·Re(MPX·conj(PLL)²)` L-R recovery (sensitive to pilot phase error) with
-  a Costas-style adaptive separator that drives the cos/sin cross-coupling
-  to zero. Reference: `PerfectStereoSeparation` in
-  `research/sdr-j-fm/src/fm/stereo-separation.cpp` by Thomas Neder. Improves
-  measured stereo separation on stations with marginal pilot quality
-  (where our current chain has 5-10° pilot phase error → ~3% crosstalk).
-  Self-contained ~150 lines; uses the existing pilot PLL as the phase
-  reference and adds a small integrator + LPF + error-witness path.
-- **`m_demodScratch` growth check on every call** (`src/fm_demod.cpp`):
-  reserve-and-reuse strategy can be tightened. Cheap, mechanical, isolated.
-- **Mixed newline style** between `std::endl` and `"\n"` across
-  `src/audio_output.cpp`, `src/application.cpp`. Logging consistency only.
-- **`#if defined(...)` vs `#ifdef` style** in `src/audio_output.cpp`.
-  Cosmetic.
+- **Adaptive L-R phase alignment (P19)**: a Costas-style adaptive
+  separator (`PerfectStereoSeparation` in
+  `research/sdr-j-fm/src/fm/stereo-separation.cpp` by Thomas Neder) that
+  drives the cos/sin cross-coupling to zero. Since the pilot filter became
+  analytic, separation is 33 dB flat from 1 to 14 kHz on a clean signal; the
+  remaining limit is that L+R and L-R are aligned only to the nearest whole
+  sample. A fractional-delay alignment, or this separator, is the next step.
+- **rtl_tcp flush byte parity** (`RTLTCPClient::flushBuffers`): the drain
+  discards an arbitrary byte count and the pending half-sample without
+  tracking parity. An odd total would swap I and Q until the next flush,
+  mirroring the spectrum. Not seen in practice (rtl_tcp sends even-sized
+  blocks), but a two-line fix.
+- **SDRplay partial settle drop** (`src/application.cpp`): on a partial
+  drop of the burst after a connect, only the 8-bit buffer is shifted; the
+  complex pointer the demodulator reads still starts at the burst.
+- **REST request bodies over 64 KiB** are silently truncated rather than
+  rejected (`src/rest_server.cpp`).
+- **XDR pilot level** (`N`, `[ST] pilot=`) reads about 21 kHz for a 6.75 kHz
+  pilot. Left unchanged so clients keep displaying the scale they know.
+- **Protocol detection under load**: when 50 clients connect at once, some
+  FM-DX clients are classified as XDR. They are still closed by the XDR
+  handshake limit.
 
 ### Low / cross-cutting
 
+- **Drop the pilot bandpass FIR (P18)**: the CPU case is mostly gone. Since
+  `a8c777d` the pilot band (245-tap prototype) and the RDS band (163 taps)
+  run on the band mixed down to DC at 32 kHz, an eighth of their former cost;
+  see `PERFORMANCE.md`. What remains is the simpler architecture:
+  `research/sdr-j-fm/src/fm/pilot-recover.cpp` uses a bare product-detector
+  PLL on the raw MPX and relies on the loop bandwidth for the band-pass, with
+  no FIR group delay to compensate in the L-R delay line. The noise-gated
+  stereo detection and pilot SNR depend on the band power the filter measures,
+  so both need replacements before this filter can be removed safely.
 - **Subsystem-grouped include layout**: `research/sdr-j-fm` organizes
   `includes/fm/`, `includes/rds/`, `includes/various/` by subsystem. We
   do this partially in `include/dsp/` but most headers are flat. As the
   codebase grows this matters; defer until P5 refactor naturally surfaces
   the grouping.
-- **WinMM socket-handle truncation**: `int m_socket` / `int m_serverSocket`
-  in `rtl_tcp_client.cpp` and `xdr_server.cpp` hold `SOCKET` (UINT_PTR) on
-  Win64. In practice fits in 32 bits and `< 0` check works, but it's a
-  long-standing portability wart.
-- **`WSAStartup` without `WSACleanup`** in `xdr_server.cpp` and
-  `rtl_tcp_client.cpp`. Process exit reclaims; cosmetic.
+- **Meter calibration of the site profile**: the tuned meter integrates the
+  whole 200 kHz channel since v1.8 and reads about 10 dB higher. The shipped
+  window moved from `-43 / -19` to `-33 / -10` by the offset measured on
+  another antenna; confirm it with `--calibrate` on the site's own antenna.
 
-## Future CPU work (deferred from v1.6.0)
+## Future CPU work
 
-The v1.6.0 perf pass closed out Tier 1 (atan2 polynomial, gated biquad
-redesign) and Tier 2A/B (pilot bandpass widening, sincos LUT). The Tier 3
-ideas were documented but deferred because the M1 measurement noise
-floor exceeded the expected gain:
-
-- **Block-batched FIR convolution**: replace per-sample push+execute with
-  64-sample blocks so liquid's NEON kernel stays hot. Estimated ~3-5 pp
-  on M1. Significant code change.
-- **Custom phase accumulator for the pilot PLL**: skip liquid's NCO step +
-  `nco_crcf_constrain` and use a tiny `uint32_t` modulo accumulator.
-  Estimated ~1-2 pp.
-- **Fixed-rate polyphase 256→48 resampler**: liquid's `resamp_rrrf` has
-  per-call ratio handling that a fixed-ratio design can skip. Estimated
-  ~1-2 pp.
+See `PERFORMANCE.md` for the measured profile (x86 and M1) and the options,
+with the expected gain for each: an own SIMD dot-product kernel, a two-stage
+audio resampler, building liquid-dsp with SIMD, block-batched filtering and a
+fast discriminator `atan2`. The pilot and RDS bands already run at 32 kHz
+(`a8c777d`).
 
 Worth revisiting only if a real CPU-bound deployment (e.g. Raspberry Pi 4)
 needs the headroom — see the README "Running On Low-CPU Devices" section.
@@ -95,29 +91,38 @@ needs the headroom — see the README "Running On Low-CPU Devices" section.
 These would catch regressions that current CI can't:
 
 - ALSA enumeration failure path (`AudioOutput::listAlsaDevices`).
-- Off-thread WAV writer shutdown-flush.
-- High-IQ-rate (`--iq-rate 1024000` / `2048000`) decimation-path
-  behaviour test.
-- Scan FFT plan / buffer reuse across retunes (the fallback retune-count
-  bound and the post-retune buffer flush are already covered in
-  `test_scan_engine`).
-- `recvLine()` overflow + auth truncation directly.
-- `WavWriter` / `AudioOutput::writeWAVData` 4 GiB boundary saturation
-  + fatal-error propagation.
-- Analog-de-emphasis response-reference regression.
 - IF-AGC refusal path under chronic clip (depends on P17b).
+- Scan cancel latency: the fallback-pass skip after a cancel is verified on
+  hardware only.
+- `AudioOutput`'s own WAV drain loop (`runWavWriterThread`); the shutdown
+  flush test covers `WavWriter` only.
+- The decimation test uses a clean in-band carrier, so it cannot detect a
+  missing anti-alias filter; it needs an out-of-band interferer.
+- Scan FFT plan reuse through `thread_local IqSpectrum` in `scan_engine.cpp`.
+- Multipath equalizer behavior on a moving multi-ray channel; only a static
+  two-ray channel is covered now.
+- HiCut crossfade audibility and MPX-audio reconnect after an output device
+  disappears.
 
-## Future Milestones
+(`recvLine()` overflow and auth truncation are covered end to end in
+`test_protocol` — oversized XDR and FM-DX lines, oversized handshakes and
+oversized auth lines are all exercised. A direct unit test of the static
+helper would need it exported, which is why it is not listed here.)
 
-- **1.6.x** further patch releases for the remaining gain-policy refusal
-  work (P17b) if it comes up before the SoapySDR work.
-- **1.7** — Broad SDR backend support. Backend capability interface (P6)
-  → `SoapySDR` implementation → contract tests → CLI/config/XDR
-  integration cleanup. Stretch goals if time allows: the pilot-FIR
-  removal (P18) and adaptive L-R alignment (P19), since both are
-  architectural-shape changes that pair naturally with the backend
-  refactor.
-- **1.8** — Runtime structural cleanup. Decompose `Application::run`
-  (P5) into smaller responsibilities now that the backend layer is
-  abstracted. Pick up the mixed-newline / preprocessor-style sweep
-  alongside the affected subsystems.
+## Roadmap
+
+- **Broad SDR backend support:** backend capability interface (P6), then a
+  `SoapySDR` implementation, fake-backend contract tests, and CLI/config/XDR
+  integration cleanup.
+- **Runtime structural cleanup:** decompose `Application::run()` (P5) into
+  session bootstrap, command/control application, scan coordination, and the
+  main DSP/audio loop, with behavior-preserving tests around the affected
+  lifecycle paths.
+
+## References
+
+The P18 and P19 ideas come from
+[`sdr-j-fm`](https://github.com/JvanKatwijk/sdr-j-fm) by Jan van Katwijk
+(GPL-3.0); Thomas Neder contributed the adaptive stereo separator used as the
+P19 reference. A comparison clone may be kept under the untracked `research/`
+directory.

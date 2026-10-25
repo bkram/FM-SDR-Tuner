@@ -12,11 +12,6 @@ namespace processing_runner {
 
 namespace {
 
-bool suspectGhostingFromOverload(const SignalLevelResult &signal,
-                                 double clipRatio) {
-  return clipRatio >= 0.01 && signal.level120 >= 70.0f && signal.dbfs >= -35.0;
-}
-
 std::string formatMaybeDouble(double value, int precision) {
   if (!std::isfinite(value)) {
     return "n/a";
@@ -30,7 +25,7 @@ std::string formatMaybeDouble(double value, int precision) {
 
 bool processAudioBlock(
     const uint8_t *iqBuffer, size_t samples, int outputRate,
-    uint32_t iqSampleRate, int channelBandwidthHz,
+    uint32_t iqSampleRate,
     int effectiveAppliedGainDb, double signalGainCompFactor,
     const Config &config, bool verboseLogging,
     SignalLevelSmoother &rfLevelSmoother,
@@ -46,7 +41,7 @@ bool processAudioBlock(
   SignalLevelResult signal = computeSignalLevel(
       iqBuffer, samples, effectiveAppliedGainDb, signalGainCompFactor,
       config.sdr.signal_bias_db, config.sdr.signal_floor_dbfs,
-      config.sdr.signal_ceil_dbfs, iqSampleRate, channelBandwidthHz);
+      config.sdr.signal_ceil_dbfs, iqSampleRate);
   SignalLevelResult displaySignal = signal;
 
   const bool effectiveForceMono = targetForceMono;
@@ -91,30 +86,13 @@ bool processAudioBlock(
     return false;
   }
 
-  if (std::isfinite(dspOut.channelPowerDbfs)) {
-    displaySignal.dbfs = dspOut.channelPowerDbfs;
-    displaySignal.compensatedDbfs =
-        displaySignal.dbfs - (static_cast<double>(effectiveAppliedGainDb) *
-                              signalGainCompFactor) +
-        config.sdr.signal_bias_db;
-    displaySignal.noiseFloorDbfs = std::numeric_limits<double>::quiet_NaN();
-    displaySignal.snrDb = std::numeric_limits<double>::quiet_NaN();
-    displaySignal.level120 = computeDisplaySignalLevel120(
-        displaySignal.dbfs, displaySignal.noiseFloorDbfs, effectiveAppliedGainDb,
-        signalGainCompFactor, config.sdr.signal_bias_db,
-        config.sdr.signal_floor_dbfs, config.sdr.signal_ceil_dbfs, false);
-    // The demodulator channel-power estimate above is smooth and accurate for
-    // the tuned channel but is an absolute-power term with no noise reference:
-    // at high auto-gain the RTL front-end saturates it near full scale for
-    // empty spectrum and strong stations alike, so an absolute-only mapping
-    // pegs the meter on noise (field reports: "signal reads max even on an
-    // empty frequency"). Cap it by the gain-invariant demod-domain (noise-
-    // triangle) SNR -- always available here, unlike the FFT channel SNR -- so
-    // empty channels read low and only genuine received signal climbs the
-    // scale, restoring the min(absolute, SNR) semantics the channel-aware path
-    // already applies.
-    displaySignal.level120 = std::min(
-        displaySignal.level120, snrLevel120FromSnrDb(dspOut.demodSnrDb));
+  // The demodulator's noise-triangle SNR is the reception quality of the
+  // tuned channel: it is gain-invariant, it is always available, and it is
+  // the only figure that says how clean the audio is. The strength of the
+  // channel stays the spectrum-based one, measured through the same
+  // estimator the scan engine uses.
+  if (std::isfinite(dspOut.demodSnrDb)) {
+    displaySignal.snrDb = dspOut.demodSnrDb;
   }
 
   const bool stereoDetected = dspOut.stereoDetected;
@@ -150,7 +128,8 @@ bool processAudioBlock(
                 << " dB), bias=" << config.sdr.signal_bias_db << " dB\n";
       meterIntroLogged = true;
     }
-    if (std::isfinite(displaySignal.compensatedDbfs)) {
+    if (std::isfinite(displaySignal.compensatedDbfs) &&
+        clipRatio < fm_tuner::kCalibrationClipRatio) {
       meterMinCompensated =
           std::min(meterMinCompensated, displaySignal.compensatedDbfs);
       meterMaxCompensated =
@@ -189,25 +168,36 @@ bool processAudioBlock(
       std::cout << "\n";
     }
 
+  }
+
+  // Overload diagnosis for the receive path. A front end driven into
+  // saturation by a strong station mixes that station with itself and with
+  // its neighbours; the IMD products land at other frequencies and are heard
+  // (and plotted) as a duplicate of the station. This hint is NOT verbose-only:
+  // it is the one diagnostic that explains a duplicate the user is hearing
+  // while tuned, so it has to be visible at the default log level. The rate
+  // limit keeps it quiet when the condition persists.
+  {
     static bool overloadGhostHintActive = false;
     static uint32_t overloadGhostHintCount = 0;
     const bool overloadGhostSuspected =
-        suspectGhostingFromOverload(displaySignal, clipRatio);
+        suspectOverloadGhosting(displaySignal, clipRatio);
     if (overloadGhostSuspected) {
-      const uint32_t count = ++overloadGhostHintCount;
-      if (!overloadGhostHintActive || count <= 3 || (count % 50) == 0) {
-        std::cerr << "[RF] overload/image ghosting suspected: clip="
-                  << std::fixed << std::setprecision(4) << clipRatio
-                  << " level=" << std::setprecision(1) << displaySignal.level120
-                  << " dbfs=" << std::setprecision(2) << displaySignal.dbfs
-                  << ". Lower gain first; if all stations remain shifted equally,"
-                     " then check freq_correction_ppm.\n";
+      const uint32_t hintCount = ++overloadGhostHintCount;
+      if (!overloadGhostHintActive || hintCount <= 3 || (hintCount % 50) == 0) {
+        std::cerr
+            << "[RF] overload/image ghosting suspected: clip=" << std::fixed
+            << std::setprecision(4) << clipRatio
+            << " level=" << std::setprecision(1) << displaySignal.level120
+            << " dbfs=" << std::setprecision(2) << displaySignal.dbfs
+            << ". Lower gain first; if all stations remain shifted equally,"
+               " then check freq_correction_ppm.\n";
       }
     }
     overloadGhostHintActive = overloadGhostSuspected;
   }
 
-  autoGainHook(signal, clipRatio, rfLevelFiltered);
+  autoGainHook(displaySignal, clipRatio, rfLevelFiltered);
 
   const size_t outSamples = dspOut.outSamples;
   float *audioLeft = dspOut.left;

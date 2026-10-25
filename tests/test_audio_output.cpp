@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "wav_limits.h"
+
 #define private public
 #include "audio_output.h"
 #undef private
@@ -20,8 +22,8 @@ uint32_t readLe32(const std::vector<uint8_t> &b, size_t off) {
 }
 
 uint16_t readLe16(const std::vector<uint8_t> &b, size_t off) {
-  return static_cast<uint16_t>(b[off]) |
-         (static_cast<uint16_t>(b[off + 1]) << 8);
+  return static_cast<uint16_t>(static_cast<uint16_t>(b[off]) |
+                               (static_cast<uint16_t>(b[off + 1]) << 8));
 }
 } // namespace
 
@@ -35,10 +37,10 @@ TEST_CASE("AudioOutput WAV path writes valid header and PCM payload",
   REQUIRE(out.isRunning());
 
   constexpr size_t n = 8;
-  const std::array<float, n> left = {0.0f, 0.25f, -0.25f, 0.5f, -0.5f, 1.2f,
-                                     -1.2f, 0.1f};
-  const std::array<float, n> right = {0.0f, -0.25f, 0.25f, -0.5f, 0.5f, -1.2f,
-                                      1.2f, -0.1f};
+  const std::array<float, n> left = {0.0f,  0.25f, -0.25f, 0.5f,
+                                     -0.5f, 1.2f,  -1.2f,  0.1f};
+  const std::array<float, n> right = {0.0f, -0.25f, 0.25f, -0.5f,
+                                      0.5f, -1.2f,  1.2f,  -0.1f};
   REQUIRE(out.write(left.data(), right.data(), n));
   out.shutdown();
   REQUIRE_FALSE(out.isRunning());
@@ -64,8 +66,8 @@ TEST_CASE("AudioOutput WAV path writes valid header and PCM payload",
   REQUIRE(readLe16(bytes, 34) == AudioOutput::BITS_PER_SAMPLE);
 
   const uint32_t dataSize = readLe32(bytes, 40);
-  REQUIRE(dataSize == static_cast<uint32_t>(n * AudioOutput::CHANNELS *
-                                            sizeof(int16_t)));
+  REQUIRE(dataSize ==
+          static_cast<uint32_t>(n * AudioOutput::CHANNELS * sizeof(int16_t)));
   REQUIRE(bytes.size() == static_cast<size_t>(44 + dataSize));
 
   std::remove(path.c_str());
@@ -81,7 +83,8 @@ TEST_CASE("AudioOutput write fails when not running and volume clamps",
   out.setVolumePercent(-100);
   REQUIRE(out.m_requestedVolumePercent.load() == 0);
   out.setVolumePercent(250);
-  REQUIRE(out.m_requestedVolumePercent.load() == AudioOutput::kMaxVolumePercent);
+  REQUIRE(out.m_requestedVolumePercent.load() ==
+          AudioOutput::kMaxVolumePercent);
 }
 
 TEST_CASE("AudioOutput speaker ring keeps newest samples and clears cleanly",
@@ -102,7 +105,8 @@ TEST_CASE("AudioOutput speaker ring keeps newest samples and clears cleanly",
   std::vector<float> popped(out.m_speakerRing.size(), 0.0f);
   {
     std::lock_guard<std::mutex> lock(out.m_speakerMutex);
-    const size_t copied = out.popSpeakerSamplesLocked(popped.data(), popped.size());
+    const size_t copied =
+        out.popSpeakerSamplesLocked(popped.data(), popped.size());
     REQUIRE(copied == popped.size());
   }
   const std::vector<float> expected = {3.0f, 30.0f, 4.0f, 40.0f,
@@ -116,4 +120,57 @@ TEST_CASE("AudioOutput speaker ring keeps newest samples and clears cleanly",
     REQUIRE(out.m_speakerReadPos == 0);
     REQUIRE(out.m_speakerWritePos == 0);
   }
+}
+
+TEST_CASE("AudioOutput waits for a playback reserve and reprimes after clear",
+          "[audio_output]") {
+  AudioOutput out;
+  out.m_speakerRing.assign(16, 0.0f);
+
+  const float left[2] = {1.0f, 2.0f};
+  const float right[2] = {10.0f, 20.0f};
+  out.pushSpeakerSamples(left, right, 2, "test");
+  {
+    std::lock_guard<std::mutex> lock(out.m_speakerMutex);
+    REQUIRE_FALSE(out.primeSpeakerQueueLocked(8));
+  }
+
+  out.pushSpeakerSamples(left, right, 2, "test");
+  {
+    std::lock_guard<std::mutex> lock(out.m_speakerMutex);
+    REQUIRE(out.primeSpeakerQueueLocked(8));
+    out.clearSpeakerQueueLocked();
+    REQUIRE_FALSE(out.m_speakerPrimed);
+    REQUIRE_FALSE(out.primeSpeakerQueueLocked(8));
+  }
+}
+
+TEST_CASE(
+    "AudioOutput WAV path refuses a write that would cross the 4 GiB limit",
+    "[audio_output]") {
+  const std::string path = "test_audio_output_limit.wav";
+  std::remove(path.c_str());
+
+  AudioOutput out;
+  REQUIRE(out.init(false, path, "", false));
+
+  const int16_t samples[5] = {1, 2, 3, 4, 5};
+  // Pretend the file already holds everything but the last 10 bytes: five
+  // samples still fit, a sixth does not.
+  out.m_wavDataSize = static_cast<uint32_t>(kWavMaxDataBytes - 10);
+  REQUIRE(out.writeWAVData(samples, 5));
+  REQUIRE(out.m_wavDataSize == kWavMaxDataBytes);
+  REQUIRE_FALSE(out.m_wavFatalError.load());
+
+  // One sample too many: the write is refused and the capture stops.
+  REQUIRE_FALSE(out.writeWAVData(samples, 1));
+  REQUIRE(out.m_wavFatalError.load());
+
+  // The latched error is what refuses the write, not the size: with room
+  // again, a later write is still refused.
+  out.m_wavDataSize = 0;
+  REQUIRE_FALSE(out.writeWAVData(samples, 1));
+
+  out.shutdown();
+  std::remove(path.c_str());
 }

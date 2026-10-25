@@ -1,6 +1,16 @@
 # FM-SDR-Tuner configuration file
 # Run with: ./build/fm-sdr-tuner -c fm-sdr-tuner.ini
 # CLI flags override values here.
+#
+# This profile is the one that works on this site: an RTL-SDR (R820T) with the
+# indoor telescopic antenna, and the fm-dx-webserver plugin as the control
+# surface. The [rest] section below is therefore enabled and points at the
+# plugin's default URL (http://127.0.0.1:9090).
+#
+# The values that are not the generic defaults are marked "measured": they come
+# from the real hardware, and the numbers behind them are in the README's
+# "Setup And Tuning Guide". Re-measure them after a change of antenna or
+# cable - ./build/fm-sdr-tuner --calibrate prints the meter window to use.
 
 # =========================
 # SDR Input / RF Tuning
@@ -19,8 +29,9 @@ source = rtl_sdr
 # RTL-SDR device index when source=rtl_sdr
 rtl_device = 0
 
-# Startup frequency in kHz (88600 = 88.6 MHz)
-default_freq = 88600
+# Startup frequency in kHz (96200 = 96.2 MHz) - the local station measured
+# here.
+default_freq = 96200
 
 # De-emphasis: 0=50us, 1=75us, 2=off
 deemphasis = 0
@@ -55,25 +66,44 @@ sample_rate = 256000
 gain_strategy = tef
 
 # Manual tuner gain in dB.
-#   -1 = strategy-managed gain (auto / TEF table; default and best for indoor
-#        telescopic antennas where the AGC needs to climb on weak signals)
-#   >=0 = force fixed manual gain (overrides strategy + disables IF AGC)
+#   -1 = strategy-managed gain (the auto-gain ladder picks the level)
+#   >=0 = a fixed manual gain (overrides the ladder + switches the front
+#        end's own AGC off)
 #
-# Default -1 (auto) suits the common indoor-telescopic case. When using a
-# high-gain outdoor antenna, auto-mode can overload the R820T LNA on strong
-# locals (multiple stations at -3 dBFS produce IMD splatter into adjacent
-# channels — symptoms: AGC pumping, blend instability, momentary pilot-quality
-# drops); in that case force a fixed value (e.g. 6 dB) that keeps strong locals
-# clean while still receiving fringe stations. --calibrate's clip indicator
-# helps spot the right setting.
-rtl_gain_db = -1
+# Measured on this site (R820T, indoor antenna, the local station on 96.2):
+#   10 dB  -> the station sits at -19 dBFS, its peaks 9.7 dB below the
+#             converter's ceiling, and the meter reads 91-100 of 120.
+#   12 dB  -> peaks 7.3 dB below the ceiling, the meter pegs at the top.
+#   14 dB  -> peaks 5.4 dB below the ceiling.
+#   auto   -> the ladder climbs to 18 dB on this station: peaks only 3.4 dB
+#             below the ceiling, which is one strong neighbour away from
+#             clipping.
+# So: a fixed 10 dB. It leaves the most headroom, it does not pump, and the
+# meter stays off the top of the scale.
+#
+# The gain in this file is the STARTING point: the plugin's gain control (and
+# an XDR client that changes its G flags) may move it while the tuner runs,
+# and the setting then survives a retune. An XDR A command, or a G that
+# repeats the current flags - which xdr-gtk sends on every connect - leaves
+# it alone. A -g on the command line pins the gain instead - no client may
+# change it after that.
+rtl_gain_db = 10
 
 # RTL frequency correction in ppm (set from known dongle offset)
 freq_correction_ppm = 0
 
 # Packed custom gain flags (tef strategy): tens=RF, ones=IF
 # Example: 11 => RF=1, IF=1
-default_custom_gain_flags = 1
+#
+# The IF flag turns the dongle's OWN AGC on. That AGC sets the level by
+# itself, so the software auto-gain ladder has to stand down and can no
+# longer protect the front end: the level it targets is an average, while an
+# FM station's peaks sit several dB above it. Leave the IF flag off (0) and
+# the software ladder stays in charge, with its clip-protect. The plugin's
+# "RTL digital AGC" button switches this flag at runtime; the switch costs a
+# short silence (~600 ms) because the front end's own AGC overshoots into the
+# clipper for that long, and the tuner drops that burst instead of playing it.
+default_custom_gain_flags = 0
 
 # SDR++ strategy options (used when gain_strategy=sdrpp)
 sdrpp_rtl_agc = false
@@ -84,7 +114,7 @@ sdrpp_rtl_agc_gain_db = 18
 # Preset A: TEF (stable, auto clip-protect)
 #   gain_strategy = tef
 #   rtl_gain_db = -1
-#   default_custom_gain_flags = 1
+#   default_custom_gain_flags = 0
 #   agc_mode = 2
 #
 # Preset B: SDR++ (predictable/manual-like)
@@ -94,23 +124,57 @@ sdrpp_rtl_agc_gain_db = 18
 #   sdrpp_rtl_agc_gain_db = 18
 #   agc_mode = 2   ; ignored by sdrpp strategy
 
-# Signal meter. The displayed 0..120 level is the LOWER of two terms:
-#   min( absolute floor/ceil mapping , gain-invariant demod-SNR cap )
-# The three keys below set only the ABSOLUTE term (compensated dBFS → 0..120):
+# Signal meter. The displayed 0..120 level is the ABSOLUTE mapping of the
+# compensated dBFS onto the window below:
+#   level = (compensated dBFS - floor) / (ceil - floor) * 120
+# The compensation takes half of the applied gain out of the reading, so the
+# level of a station stays comparable when the gain strategy changes.
+# The three keys below set that window:
 #   - too narrow → strong locals hit the top AND weak stations clamp to 0
 #   - too wide  → mid-strength stations look smaller than they are
-# The SNR cap is independent of these keys: an empty/weak channel reads ~0
-# regardless of the window or auto-gain, and a signal needs high demod SNR
-# (~30 dB) to approach 120 — so the window mainly positions strong/mid stations.
 # Easiest workflow: run `./fm-sdr-tuner --calibrate` once with your antenna
 # connected — it sweeps the band and prints copy-paste-ready values for the
-# three keys below (it calibrates the absolute term only). Alternative: leave the
-# wide defaults (-65 / -5) and let the [METER] session log line guide you.
-# These wide defaults are safe everywhere; narrow them to position strong/mid
-# stations on the scale.
-signal_floor_dbfs = -65.0
-signal_ceil_dbfs = -5.0
+# three keys below. Alternative: leave the shipped values and let the
+# [METER] session log line guide you.
+#
+# The values below are MEASURED on this site with the indoor antenna and the
+# 10 dB gain above: the empty band reads 0.0 and the local station on 96.2
+# reads 91-100 of 120. Widen the window if your site is quieter, narrow it if
+# your stations are stronger.
+#
+# The window belongs to the gain setting: the dongle's own AGC puts the same
+# station ~5 dB higher, so with the AGC on the meter pegs at 120 until the
+# window is moved up (floor=-21, ceil=-9 was measured here). The [METER]
+# session line prints the window that fits the session it saw.
+#
+# The meter integrates the whole 200 kHz channel, so its reading does not move
+# with the programme. The spectral scan integrates 30 kHz around each grid
+# point: both read the same number for an unmodulated carrier, and the meter
+# reads a modulated station higher than the scan does.
+#
+# The window was measured as -43 / -19 with the earlier 30 kHz meter. The
+# whole-channel meter reads about 10 dB higher at the floor and 9 dB higher at
+# the top, so the window moved by that much. Re-run --calibrate on the site's
+# own antenna to confirm it.
+signal_floor_dbfs = -33.0
+signal_ceil_dbfs = -10.0
 signal_bias_db = 0.0
+
+# Spectral-scan plot scale. The scan line is the spectrum of the band: every
+# grid point reports the level of the signal meter at that frequency, so the
+# plot reads like a spectrum display and a signal that is not a station stays
+# a bump in the noise floor.
+#
+# The reference client (xdr-gtk) draws the scan in a FIXED 3..84 window and
+# clips everything outside it, so a scan reported on the meter's 0..120 scale
+# pins every strong station flat against the top of the plot. When enabled,
+# the scan line is remapped onto this window; the "S" line and the REST status
+# keep the 0..120 scale, because the clients that read those convert it
+# themselves (the webserver's dBm mode subtracts 120, the plugin shows it out
+# of 120).
+scan_use_client_window = true
+scan_client_min_level = 3.0
+scan_client_max_level = 84.0
 
 # Drop stale IQ backlog when overloaded
 low_latency_iq = false
@@ -130,10 +194,14 @@ startup_volume = 80
 device =
 
 [processing]
-# TEF AGC profile (0..3). Used by gain_strategy=tef.
+# TEF AGC profile (0..3). Used by gain_strategy=tef. It only matters when the
+# gain is automatic: with the fixed rtl_gain_db above, the ladder stands down.
 agc_mode = 2
 
-# Allow client-issued gain commands (XDR)
+# Allow a client to change the gain (the plugin's gain control over REST, an
+# XDR client over the XDR protocol). true is what the plugin needs. Set it to
+# false to freeze the gain - and with it the meter calibration - against a
+# client that would otherwise move it.
 client_gain_allowed = true
 
 # DSP block size (IQ samples per processing cycle)
@@ -146,6 +214,17 @@ w0_bandwidth_hz = 194000
 dsp_agc = off
 
 # Stereo blend profile: soft, normal, aggressive
+#
+# Measured on this site (2026-10-22, the local station on 96.2): the station's
+# stereo quality estimate dips regularly, and the "aggressive" profile follows
+# every dip. Two back-to-back captures of the same station, 52 s each, measured
+# as the RMS of the L-R difference over the RMS of L+R:
+#   aggressive -> -25.2 dB, swinging over 22 dB, 6% of the seconds fully muted
+#   normal    -> -16.9 dB, swinging over  6 dB, no muted seconds at all
+# So the aggressive profile leaves the image 8 dB weaker and makes it collapse
+# and come back - that is the "bad sound" on a clean local station. "normal"
+# is the default. "aggressive" is still worth it on a station whose stereo is
+# noisy rather than clean.
 stereo_blend = normal
 
 # Enable stereo decoder
@@ -235,6 +314,12 @@ guest_mode = false
 # design — keep bind_address on localhost or a trusted network only.
 # Endpoints: GET /api/status, GET|POST /api/control (query-string or JSON body).
 # Test UI: scripts/run_rest_panel.sh
+#
+# The port and the address below are the plugin's defaults: its backend falls
+# back to http://127.0.0.1:9090 when the webserver's config.json has no
+# fmSdrTuner.restUrl. The plugin's panel drives the gain, the front end's own
+# AGC and the SDRplay LNA/antenna/bias-tee from here; the gain it sets is the
+# tuner's own state, so it survives a retune and a reconnect.
 enabled = true
 port = 9090
 bind_address = 127.0.0.1

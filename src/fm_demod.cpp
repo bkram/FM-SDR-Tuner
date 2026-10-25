@@ -9,7 +9,10 @@
 #include <limits>
 
 namespace {
-constexpr float kPi = 3.14159265358979323846f;
+// Starting step of the IQ DC tracker: a 20 Hz corner at 256 kHz, the corner
+// the former fixed DC blocker used throughout.
+constexpr double kIqDcAlphaFast = 0.0005;
+
 constexpr std::array<int, 30> kXdrFmBwHz = {
     309000, 298000, 281000, 263000, 246000, 229000, 211000, 194000,
     177000, 159000, 142000, 125000, 108000, 95000,  90000,  83000,
@@ -36,12 +39,34 @@ FMDemod::FMDemod(int inputRate, int outputRate)
       m_filteredChannelPowerDbfs(-120.0) {
   const float iqCutoffNorm =
       std::clamp(110000.0f / static_cast<float>(m_inputRate), 0.01f, 0.45f);
-  m_liquidIqFilter.init(81, iqCutoffNorm, 60.0f, 0.0f, m_iqFirL1Normalize);
-  m_liquidIqDcBlockI.initDCBlocker(0.0005f);
-  m_liquidIqDcBlockQ.initDCBlocker(0.0005f);
+  designIqFilter(81, iqCutoffNorm, 60.0f);
+  // The IQ DC tracker settles to a 0.1 Hz corner over the first half second
+  // after a reset (see removeIqDc()).
+  constexpr double kIqDcSlowCornerHz = 0.1;
+  constexpr double kIqDcGlideSeconds = 0.5;
+  m_iqDcAlphaSlow = 2.0 * 3.14159265358979323846 * kIqDcSlowCornerHz /
+                    static_cast<double>(m_inputRate);
+  m_iqDcAlphaDecay =
+      std::pow(m_iqDcAlphaSlow / kIqDcAlphaFast,
+               1.0 / (kIqDcGlideSeconds * static_cast<double>(m_inputRate)));
+  resetIqDc();
   const float ratio =
       static_cast<float>(m_outputRate) / static_cast<float>(m_inputRate);
-  m_liquidMonoResampler.init(ratio);
+  // The mono path (stereo = false) feeds the raw multiplex - pilot 19 kHz,
+  // L-R subcarrier 23-53 kHz, RDS 57 kHz - into this resampler, so it is also
+  // the audio anti-alias filter. liquid's default cutoff does not band-limit a
+  // 5.33x downsample at all: the L-R sidebands folded to 9-11 kHz and the
+  // pilot passed at full level. The filter is flat to 15 kHz and rejects the
+  // pilot by 78 dB and everything above it by 90 dB. It is computed only at
+  // the output rate, so the long filter costs ~15 M multiply-adds a second.
+  constexpr float kMonoAudioCutoffHz = 17000.0f;
+  constexpr std::uint32_t kMonoResampHalfLen = 160;
+  constexpr float kMonoResampStopBandDb = 80.0f;
+  constexpr std::uint32_t kMonoResampPolyphase = 64;
+  const float monoCutoffNorm = std::min(
+      0.45f, kMonoAudioCutoffHz / static_cast<float>(m_inputRate));
+  m_liquidMonoResampler.init(ratio, kMonoResampHalfLen, monoCutoffNorm,
+                             kMonoResampStopBandDb, kMonoResampPolyphase);
   m_liquidMonoDcBlock.initDCBlocker(0.0008f);
   setDeviation(75000.0);
   setDeemphasis(50);
@@ -59,12 +84,17 @@ void FMDemod::setDeemphasis(int tau_us) {
     return;
   }
   m_deemphasisEnabled = true;
+  // Pre-warped bilinear one-pole (the AF stage's design), run at the input
+  // rate ahead of the resampler. At 256 kHz the bilinear transform's
+  // frequency warping is negligible across the audio band, so the response
+  // tracks the analog RC curve to within 0.1 dB up to 15 kHz. The former
+  // Euler one-pole at 48 kHz was 0.7-1.0 dB low from 3 to 10 kHz.
   const float tau = static_cast<float>(tau_us) * 1e-6f;
-  const float dt = 1.0f / static_cast<float>(m_outputRate);
-  const float alpha = dt / (tau + dt);
-  const std::vector<float> b = {alpha};
-  const std::vector<float> a = {1.0f, -(1.0f - alpha)};
-  m_liquidMonoDeemphasis.init(b, a);
+  const float fs = static_cast<float>(m_inputRate);
+  const float wpp = std::tan(1.0f / (2.0f * fs * tau));
+  const float b0 = wpp / (wpp + 1.0f);
+  const float a1 = (wpp - 1.0f) / (wpp + 1.0f);
+  m_liquidMonoDeemphasis.init({b0, b0}, {1.0f, a1});
 }
 
 void FMDemod::setDeviation(double deviation) {
@@ -81,9 +111,10 @@ void FMDemod::reset() {
   m_clippingRatio = 0.0f;
   m_filteredChannelPowerDbfs = -120.0;
   m_liquidIqFilter.reset();
+  m_iqHistory.fill(std::complex<float>(0.0f, 0.0f));
+  m_iqHistoryPos = 0;
   m_liquidFreqDemod.reset();
-  m_liquidIqDcBlockI.reset();
-  m_liquidIqDcBlockQ.reset();
+  resetIqDc();
   if (m_deemphasisEnabled) {
     m_liquidMonoDeemphasis.reset();
   }
@@ -136,12 +167,43 @@ void FMDemod::setBandwidthHz(int bwHz) {
       static_cast<float>(iqCutoffHz / static_cast<double>(m_inputRate)), 0.01f,
       0.45f);
   const std::uint32_t filterLen =
-      (selectedBwHz > 0 && selectedBwHz <= 73000) ? 121U : 81U;
+      (selectedBwHz > 0 && selectedBwHz <= 73000) ? kIqFirMaxLength : 81U;
   const float stopBandAtten =
       (selectedBwHz > 0 && selectedBwHz <= 42000) ? 70.0f : 60.0f;
-  m_liquidIqFilter.init(filterLen, cutoffNorm, stopBandAtten, 0.0f,
+  // Only the channel filter changes. Resetting the whole demodulator here
+  // (and, in DspPipeline, the stereo decoder) dropped stereo for ~200 ms and
+  // dipped the programme level by 5 dB on every W command and on every
+  // adaptive-bandwidth step.
+  designIqFilter(filterLen, cutoffNorm, stopBandAtten);
+}
+
+void FMDemod::designIqFilter(std::uint32_t length, float cutoffNorm,
+                             float stopBandAtten) {
+  m_liquidIqFilter.init(length, cutoffNorm, stopBandAtten, 0.0f,
                         m_iqFirL1Normalize);
-  reset();
+  // The L1 bound lowers the filter's passband gain by 3-7 dB, depending on
+  // the cutoff. The channel power drives the meter, the squelch and the
+  // fade-mute, so it is measured as if the filter had unity gain.
+  const double gain = std::max(1e-6, static_cast<double>(m_liquidIqFilter.dcGain()));
+  m_iqFirPowerCorrection = 1.0 / (gain * gain);
+  m_iqFirDelay = (kIqFirMaxLength - std::min(length, kIqFirMaxLength)) / 2;
+  // Prime the new filter with the samples it would hold had it been running
+  // all along: the last `length` inputs, each delayed by m_iqFirDelay.
+  const std::size_t newest = m_iqHistoryPos + kIqHistorySize - 1;
+  for (std::size_t j = length; j-- > 0;) {
+    m_liquidIqFilter.push(
+        m_iqHistory[(newest - m_iqFirDelay - j) % kIqHistorySize]);
+  }
+}
+
+std::complex<float> FMDemod::filterIq(std::complex<float> sample) {
+  m_iqHistory[m_iqHistoryPos] = sample;
+  const std::complex<float> delayed =
+      m_iqHistory[(m_iqHistoryPos + kIqHistorySize - m_iqFirDelay) %
+                  kIqHistorySize];
+  m_iqHistoryPos = (m_iqHistoryPos + 1) % kIqHistorySize;
+  m_liquidIqFilter.push(delayed);
+  return m_liquidIqFilter.execute();
 }
 
 void FMDemod::setIqFirL1Normalize(bool enabled) {
@@ -197,13 +259,8 @@ void FMDemod::demodulate(const uint8_t *iq, float *audio, size_t len) {
       clipCount++;
     }
 
-    const float iRaw = kIqNorm[iByte];
-    const float qRaw = kIqNorm[qByte];
-    const float iDc = m_liquidIqDcBlockI.execute(iRaw);
-    const float qDc = m_liquidIqDcBlockQ.execute(qRaw);
-
-    m_liquidIqFilter.push(std::complex<float>(iDc, qDc));
-    std::complex<float> iqFiltered = m_liquidIqFilter.execute();
+    const std::complex<float> iqFiltered = filterIq(
+        removeIqDc(std::complex<float>(kIqNorm[iByte], kIqNorm[qByte])));
     powerSum += static_cast<double>(iqFiltered.real()) * iqFiltered.real() +
                 static_cast<double>(iqFiltered.imag()) * iqFiltered.imag();
     std::complex<float> iqDemodIn = iqFiltered;
@@ -226,7 +283,8 @@ void FMDemod::demodulate(const uint8_t *iq, float *audio, size_t len) {
       (len > 0)
           ? std::min(0.0,
                      10.0 *
-                         std::log10((powerSum / static_cast<double>(len)) +
+                         std::log10((powerSum * m_iqFirPowerCorrection /
+                                     static_cast<double>(len)) +
                                     1e-20))
           : -120.0;
 }
@@ -243,11 +301,7 @@ void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
       clipCount++;
     }
 
-    const float iDc = m_liquidIqDcBlockI.execute(iRaw);
-    const float qDc = m_liquidIqDcBlockQ.execute(qRaw);
-
-    m_liquidIqFilter.push(std::complex<float>(iDc, qDc));
-    std::complex<float> iqFiltered = m_liquidIqFilter.execute();
+    const std::complex<float> iqFiltered = filterIq(removeIqDc(iq[i]));
     powerSum += static_cast<double>(iqFiltered.real()) * iqFiltered.real() +
                 static_cast<double>(iqFiltered.imag()) * iqFiltered.imag();
     std::complex<float> iqDemodIn = iqFiltered;
@@ -266,75 +320,101 @@ void FMDemod::demodulateComplex(const std::complex<float> *iq, float *audio,
       (len > 0)
           ? std::min(0.0,
                      10.0 *
-                         std::log10((powerSum / static_cast<double>(len)) +
+                         std::log10((powerSum * m_iqFirPowerCorrection /
+                                     static_cast<double>(len)) +
                                     1e-20))
           : -120.0;
+}
+
+void FMDemod::resetIqDc() {
+  m_iqDcMean = {0.0, 0.0};
+  m_iqDcAlpha = kIqDcAlphaFast;
+}
+
+std::complex<float> FMDemod::removeIqDc(std::complex<float> sample) {
+  // The station is tuned to the centre of the band, so the front end's DC
+  // offset sits on top of the carrier. A fixed 20 Hz DC blocker also removed
+  // a carrier tuned within ~20 Hz of the centre: on a quiet passage an
+  // unmodulated carrier became discriminator noise, and a modulated one was
+  // distorted. The offset itself is static, so after a reset the tracker
+  // starts at the old 20 Hz corner (the offset is gone within milliseconds
+  // of a retune) and then glides to a 0.1 Hz corner in half a second, which
+  // leaves a carrier even 2 Hz off centre untouched.
+  const std::complex<double> x(sample.real(), sample.imag());
+  m_iqDcMean += m_iqDcAlpha * (x - m_iqDcMean);
+  if (m_iqDcAlpha > m_iqDcAlphaSlow) {
+    m_iqDcAlpha = std::max(m_iqDcAlphaSlow, m_iqDcAlpha * m_iqDcAlphaDecay);
+  }
+  return {static_cast<float>(x.real() - m_iqDcMean.real()),
+          static_cast<float>(x.imag() - m_iqDcMean.imag())};
+}
+
+float *FMDemod::ensureScratch(size_t numSamples) {
+  if (m_demodScratch.size() < numSamples) {
+    // Grow with headroom: a caller whose block size rises a little must not
+    // reallocate (and copy) the whole buffer on every call. Reserving before
+    // resizing also keeps the vector from moving its data twice.
+    const size_t wanted = std::max(m_demodScratch.capacity() * 2, numSamples);
+    m_demodScratch.reserve(wanted);
+    m_demodScratch.resize(numSamples);
+  }
+  return m_demodScratch.data();
 }
 
 size_t FMDemod::downsampleAudio(const float *demod, float *audio,
                                 size_t numSamples) {
   size_t outCount = 0;
   for (size_t i = 0; i < numSamples; i++) {
+    const float in = m_deemphasisEnabled
+                         ? m_liquidMonoDeemphasis.execute(demod[i])
+                         : demod[i];
     const uint32_t produced =
-        m_liquidMonoResampler.execute(demod[i], m_liquidResampleTmp);
+        m_liquidMonoResampler.execute(in, m_liquidResampleTmp);
     for (uint32_t p = 0; p < produced; p++) {
-      float sample = m_liquidResampleTmp[p];
-      if (m_deemphasisEnabled) {
-        sample = m_liquidMonoDeemphasis.execute(sample);
-      }
-      sample = m_liquidMonoDcBlock.execute(sample);
-      audio[outCount++] = sample;
+      audio[outCount++] = m_liquidMonoDcBlock.execute(m_liquidResampleTmp[p]);
     }
   }
   return outCount;
 }
 
 void FMDemod::process(const uint8_t *iq, float *audio, size_t numSamples) {
-  if (m_demodScratch.size() < numSamples) {
-    m_demodScratch.resize(numSamples);
-  }
-  demodulate(iq, m_demodScratch.data(), numSamples);
-  downsampleAudio(m_demodScratch.data(), audio, numSamples);
+  float *scratch = ensureScratch(numSamples);
+  demodulate(iq, scratch, numSamples);
+  downsampleAudio(scratch, audio, numSamples);
 }
 
 void FMDemod::processComplex(const std::complex<float> *iq, float *audio,
                              size_t numSamples) {
-  if (m_demodScratch.size() < numSamples) {
-    m_demodScratch.resize(numSamples);
-  }
-  demodulateComplex(iq, m_demodScratch.data(), numSamples);
-  downsampleAudio(m_demodScratch.data(), audio, numSamples);
+  float *scratch = ensureScratch(numSamples);
+  demodulateComplex(iq, scratch, numSamples);
+  downsampleAudio(scratch, audio, numSamples);
 }
 
 size_t FMDemod::processSplit(const uint8_t *iq, float *mpxOut, float *monoOut,
                              size_t numSamples) {
-  if (m_demodScratch.size() < numSamples) {
-    m_demodScratch.resize(numSamples);
-  }
-  demodulate(iq, m_demodScratch.data(), numSamples);
+  float *scratch = ensureScratch(numSamples);
+  demodulate(iq, scratch, numSamples);
   if (mpxOut) {
-    std::memcpy(mpxOut, m_demodScratch.data(), numSamples * sizeof(float));
+    std::memcpy(mpxOut, scratch, numSamples * sizeof(float));
   }
   if (!monoOut) {
     return 0;
   }
-  return downsampleAudio(m_demodScratch.data(), monoOut, numSamples);
+  return downsampleAudio(scratch, monoOut, numSamples);
 }
 
 size_t FMDemod::processSplitComplex(const std::complex<float> *iq,
                                     float *mpxOut, float *monoOut,
                                     size_t numSamples) {
-  if (m_demodScratch.size() < numSamples) {
-    m_demodScratch.resize(numSamples);
-  }
-  demodulateComplex(iq, m_demodScratch.data(), numSamples);
+  float *scratch = ensureScratch(numSamples);
+  demodulateComplex(iq, scratch, numSamples);
   if (mpxOut) {
-    std::memcpy(mpxOut, m_demodScratch.data(), numSamples * sizeof(float));
+    std::memcpy(mpxOut, scratch, numSamples * sizeof(float));
   }
   if (!monoOut) {
     return 0;
   }
-  return downsampleAudio(m_demodScratch.data(), monoOut, numSamples);
+  return downsampleAudio(scratch, monoOut, numSamples);
 }
 
 void FMDemod::processNoDownsample(const uint8_t *iq, float *audio,

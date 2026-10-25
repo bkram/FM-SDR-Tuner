@@ -353,6 +353,7 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
         result.outcome = AppParseOutcome::ExitFailure;
         return result;
       }
+      opts.gainPinned = true;
       continue;
     }
     if (arg == "-w" || arg == "--wav" || arg.rfind("--wav=", 0) == 0) {
@@ -539,8 +540,10 @@ AppParseResult parseAppOptions(int argc, char *argv[], int inputRate) {
     result.outcome = AppParseOutcome::ExitFailure;
     return result;
   }
-  const size_t iqDecimation = static_cast<size_t>(opts.iqSampleRate / inputRate);
-  if (iqDecimation == 0 || (opts.iqSampleRate % inputRate) != 0) {
+  const size_t iqDecimation =
+      static_cast<size_t>(opts.iqSampleRate / static_cast<uint32_t>(inputRate));
+  if (iqDecimation == 0 ||
+      (opts.iqSampleRate % static_cast<uint32_t>(inputRate)) != 0) {
     std::cerr << "[SDR] iq sample rate must be an integer multiple of "
               << inputRate << "\n";
     result.outcome = AppParseOutcome::ExitFailure;

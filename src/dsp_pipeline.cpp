@@ -108,10 +108,11 @@ DspPipeline::DspPipeline(int inputRate, int outputRate,
   if (fadeMute == "gentle" || fadeMute == "strong") {
     // Adaptive fade-mute bridges the demod noise burst when the RF signal
     // drops out and fades back in on recovery. updatesPerSec = one updateGate()
-    // per processing block.
+    // per demodulated block: m_blockSamples at the demod rate. The
+    // undecimated block (sdrBlockSamples()) made the reference decay 4x / 8x
+    // too fast at --iq-rate 1024000 / 2048000.
     const float updatesPerSec =
-        static_cast<float>(m_inputRate) /
-        static_cast<float>(std::max<size_t>(1, sdrBlockSamples()));
+        static_cast<float>(m_inputRate) / static_cast<float>(m_blockSamples);
     const bool strong = (fadeMute == "strong");
     m_squelch.configureFadeMute(/*dropDb=*/strong ? 9.0f : 14.0f,
                                 /*hysteresisDb=*/strong ? 3.0f : 4.0f,
@@ -147,8 +148,10 @@ void DspPipeline::reset() {
 }
 
 void DspPipeline::setBandwidthHz(int bandwidthHz) {
+  // A bandwidth change swaps only the channel filter (FMDemod keeps its
+  // state and its group delay), so the stereo decoder and the AF stage keep
+  // running: resetting them dropped stereo for ~200 ms on every change.
   m_demod.setBandwidthHz(bandwidthHz);
-  m_pendingAudioReset = true;
 }
 
 void DspPipeline::setDeemphasisMode(int deemphasisMode) {

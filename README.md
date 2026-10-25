@@ -41,7 +41,7 @@ Current architecture:
 - Continuous-quality blend gate (no mono pops on marginal signals)
 - Soft-knee audio limiter with metered clip ratio
 - RDS decode in dedicated worker thread (redsea-port: 171 kHz, 57 kHz PLL, RRC symbol sync, BPSK, block-sync state machine)
-- XDR protocol compatibility for FM-DX clients on port 7373
+- XDR protocol compatibility for FM-DX clients on port 7373. Two wire protocols are served on the same port and told apart by the client's first byte: the XDR-GTK protocol (server sends a 16-char salt, client answers with the SHA-1 hash) and the FM-DX-Tuner protocol (client sends `x`, server answers `\nOK\n`). Both are subject to the configured password.
 - Audio output at 48 kHz (native Core Audio / ALSA / WinMM)
 - Output to speaker (`-s`), WAV (`-w`), MPX WAV (`--mpx-wav`, with configurable rate via `--mpx-rate` for downstream RDS / spectrum / decoder analysis or feeding an FM exciter that accepts raw MPX), live MPX → audio device (`--mpx-audio` on macOS/Linux, typically into BlackHole / snd-aloop for re-encoding or directly into a TX accepting line-in MPX), and/or raw IQ capture (`-i`)
 - Self-documenting signal meter: startup `[METER]` log reports the active calibration window and periodically suggests narrower floor/ceil based on observed session min/max
@@ -54,7 +54,7 @@ With an RTL-SDR connected, the binary works with no CLI flags and no config file
 ./build/fm-sdr-tuner
 ```
 
-This opens the XDR server on `127.0.0.1:7373` and waits for a client (xdr-gtk, FM-DX-Webserver, etc.) to send the start command. To skip the wait and hear audio immediately:
+This opens the XDR server on port 7373 on all network interfaces (set `[xdr] password` if the machine is reachable from other hosts) and waits for a client (xdr-gtk, FM-DX-Webserver, etc.) to send the start command. To skip the wait and hear audio immediately:
 
 ```bash
 ./build/fm-sdr-tuner --auto-start
@@ -204,18 +204,10 @@ vcpkg install openssl librtlsdr liquid-dsp
 
 ## SDRplay (RSP) support
 
-The prebuilt **macOS and Linux** release binaries are **SDRplay-capable** — CI
-builds them with SDRplay support by fetching the vendor's public API *headers*
-at build time; the library itself is `dlopen`'d at runtime and never linked or
-bundled, so nothing proprietary is redistributed and the binary still runs on
-RTL-only systems. To use an RSP with a prebuilt binary, just install the
-**SDRplay API service** from <https://www.sdrplay.com/> and set
-`source = sdrplay`. The **Windows** build is RTL-only (no SDRplay loader).
-RTL-SDR users need none of this.
-
-Building it yourself is only needed for Windows SDRplay (unsupported) or custom
-builds; SDRplay support is off by default in a plain source build and enabled
-with the flag below.
+Prebuilt release binaries are RTL-only. CI does not build SDRplay support
+because the vendor SDK headers are no longer reliably downloadable in an
+unattended build. SDRplay remains available for local macOS and Linux builds
+when the SDK is already installed; Windows SDRplay remains unsupported.
 
 ### Building with SDRplay support
 
@@ -280,6 +272,112 @@ mode for the duration of a scan — it drops the hardware decimation (256 kHz �
 drops from ~13 s to under 2 s, then the 256 kHz audio rate is restored
 automatically. This is transparent (no config) and a no-op on RTL.
 
+## XDR Spectral Scan (band overview)
+
+The XDR protocol carries a band-scan command that the XDR-GTK client turns
+into its spectrum plot. The tuner sweeps the requested range, measures each
+channel, and reports the result as `U<freq_kHz>=<level>,…` lines.
+
+```text
+Sa87500     sweep starts at 87.5 MHz
+Sb108000    sweep stops at 108.0 MHz
+Sc500       channel step in kHz (minimum 5)
+Sw56000     measurement bandwidth in Hz
+S           start the sweep
+Sm          start the sweep in continuous mode
+```
+
+The sweep runs on the IQ path, so it owns the tuner while it lasts: audio is
+interrupted and the signal meter freezes until the sweep ends. The tuner is
+restored to the frequency and bandwidth it had before, and the DSP chain is
+reset (`[DSP] reset reason=scan_restore`).
+
+**The plot fills in progressively.** A line is published after every retune, so
+the client shows the spectrum growing instead of an empty graph for the whole
+sweep. Each line describes the *same* grid — the same start frequency, the same
+step, the same channel count — because the reference client replaces its
+dataset on every line rather than merging. Channels not yet measured are
+reported as `0.0` (the client's "no signal" floor), so the x-axis does not
+shrink as the sweep advances. The trailing comma is mandatory: the client's
+parser sizes its array from the comma count and drops the last entry without
+it.
+
+**The plot is a spectrum, not a list of stations.** Every grid point reports
+the level of the band at that frequency, measured with the same estimator as the
+signal meter over a 30 kHz window. The meter integrates the whole channel, so
+the two read the same number for an unmodulated carrier and the meter reads a
+modulated station higher than the plot. A signal that is not a station stays a
+bump in the noise floor, the way a spectrum display shows it, instead of
+turning into a station of its own. That is the difference between this plot
+and a sparse "stations only" scan, where a single noise maximum is drawn like
+a station on a frequency nobody broadcasts on — the "ghost stations" a
+spectrum display does not have. A grid point that holds a station reports the
+station's peak instead, so the station is drawn exactly on its own grid point
+and shows its real strength.
+
+**The step is widened when the grid would not fit.** The whole spectrum travels
+in a single line, and the reference client reads into a 10000-byte buffer and
+silently drops whatever exceeds it — a truncated line loses its trailing comma
+and the client then discards the last entry, ending the plot short of the
+requested stop frequency. The client also refuses more than 700 samples
+outright. A request that would need more channels than that (a 5 kHz step
+across the full band is 4101) is therefore widened automatically to fit, with
+a note in the log:
+
+```text
+[SCAN] warning: 4101 channels requested exceeds the 700 the protocol carries
+in one line; widening the step from 5 to 30 kHz
+```
+
+**Authorization.** The scan retunes the radio, so it is a tuner command, and a
+guest session (a client that failed the challenge/response) may not run one —
+it gets `a0`, the protocol's "not authorized" reply. This costs the default
+configuration nothing: with no password the server accepts `SHA1(salt)`, which
+is exactly what the reference client sends for an empty password, so such a
+client is fully authenticated rather than a guest.
+
+**Stations are reported on their own frequency.** The European FM plan
+allocates channels every 200 kHz starting at 87.6 MHz, but the client's
+default sweep starts at 87.5 MHz. A grid anchored there lands on the
+*midpoints* between the stations, so a station on 96.2 MHz would be reported
+on the 96.1 grid point and clicking the plot would tune to the wrong
+frequency. The grid is therefore aligned with the station raster whenever the
+requested step divides it — a 100 kHz step from 87.5 MHz already contains
+87.6, 87.8, …, so the requested start is kept as-is, while a 200 kHz step
+cannot hold every station and the grid is shifted onto the raster. A step that
+does not divide the 200 kHz raster is reported in the log:
+
+```text
+[SCAN] warning: a 300 kHz step does not divide the 200 kHz CCIR channel
+raster, so some stations are reported at the nearest grid point instead of
+their own frequency
+```
+
+The station's own frequency is measured, not assumed: a station that sits
+between two grid points is reported on the one it belongs to. A station
+measured on 96.188 MHz — 12 kHz off the 96.2 grid point — is reported on
+96.2.
+
+**Levels are on the client's plot scale.** The reference client draws the scan
+in a fixed 3..84 window and clips everything outside it, so the scan line is
+remapped onto that window — on the meter's raw 0..120 scale every station
+above −23 dBFS would be pinned flat against the top of the plot and the plot
+would stop telling strong stations apart. The "S" line and the REST status
+keep the 0..120 scale, because the clients that read them do the conversion
+themselves (the webserver's dBm mode subtracts 120, the plugin shows the value
+out of 120) and the client writes the meter's value straight into the scan
+plot, so the two scales have to stay comparable. The window is configurable:
+
+```ini
+[sdr]
+scan_use_client_window = true   # false keeps the raw 0..120 scale
+scan_client_min_level = 3.0
+scan_client_max_level = 84.0
+```
+
+A channel that has not been swept yet keeps its `0.0` "no signal" marker
+rather than being lifted to the bottom of the window.
+
 ## REST control API (fm-dx-webserver plugin)
 
 An optional anonymous HTTP API exposes the SDR settings on a dedicated port,
@@ -310,7 +408,9 @@ Endpoints:
   plus live telemetry:
   - `signal` (0–120 meter level), `dbfs` (tuned-channel power), `clip` (0–1 IQ
     clip ratio), `overload` (bool — front-end/ADC overloading; reduce gain or
-    LNA when true).
+    LNA when true), `ghost_risk` (bool — the front end is clipping *while the
+    tuned station is strong*, so its intermodulation products are heard as a
+    duplicate of a station; lower the gain).
   - `stereo` (bool, decoder locked), `stereo_quality` (0–1), `pilot_khz` (19 kHz
     pilot deviation), `blend` (applied stereo blend).
   - `snr` (dB) — demod-domain SNR from the noise-triangle band above the
@@ -331,6 +431,15 @@ Recognised keys: `freq_hz` / `freq_khz`, `gain_db`, `agc` (bool), `bandwidth_hz`
 / `bandwidth_khz`, `lna`, `antenna`, `bias_tee` (bool), `ppm`, `rtl_agc` (bool),
 `deemphasis` (0=50µs,1=75µs,2=off), `force_mono` (bool), `volume` (0–100),
 `action` (`start`/`stop`).
+
+The gain keys drive the **tuner's own gain state**, not the hardware
+registers: `gain_db` pins a manual gain, `agc` hands the gain back to the
+tuner's auto-gain ladder, and `rtl_agc` switches the front end's own IF AGC.
+A gain set here therefore survives a retune, a reconnect and the periodic
+gain re-assert — and the software ladder never fights the hardware AGC over
+the same register. The gain keys are refused when `client_gain_allowed` is
+false in the profile, or when the gain was pinned on the command line with
+`-g`.
 
 Examples:
 
@@ -358,6 +467,28 @@ Run the normal test suite:
 ```bash
 ctest --test-dir build --output-on-failure --no-tests=error
 ```
+
+### Testing Without An SDR (fake rtl_tcp server)
+
+`scripts/fake_rtl_tcp.py` is a fake `rtl_tcp` server that plays a synthetic
+FM band, so the whole path — the XDR handshake, the scan engine, the wire
+format — can be exercised without a dongle. It reproduces the reference
+server's behaviour exactly: the 12-byte `RTL0` greeting, **no** per-command
+acknowledgements, the commands read on a separate thread from the IQ stream,
+a stream paced at the sample rate, and an NCO that restarts on a retune.
+
+```bash
+# A synthetic band with carriers on 96.2 and 101.2 MHz
+python3 -I scripts/fake_rtl_tcp.py --port 12345 --stations 96200000,101200000
+
+# Point the tuner at it
+./build/fm-sdr-tuner --source rtl_tcp -t 127.0.0.1:12345 --iq-rate 256000 \
+                     --auto-start -w /tmp/wire.wav --no-audio -P test123
+```
+
+A carrier is only present in a read when it falls inside the captured band,
+exactly like a real front end, so the tuner has to sweep to find it — the
+scan is genuinely exercised rather than handed the answer.
 
 ### RTL-SDR Live Hardware Tests
 
@@ -525,17 +656,61 @@ A future Windows backend (WASAPI exclusive mode) could lift the 48 kHz limit; no
 - Default startup frequency is `87500 kHz` (EU bottom of band — unlikely to hit a strong local on first run).
 - Audio output sample rate is fixed at `48000 Hz`.
 - Device/buffer latency is backend-specific (Core Audio / ALSA / WinMM). The
-  Windows WinMM output is event-driven (`CALLBACK_EVENT`, ~170 ms of device
-  buffering). If you ever see `[AUDIO] WinMM output can't keep up with 48 kHz`,
-  the selected device/driver can't sustain the stream — switch to the system
-  default device (`-d` / `[audio] device`).
+  macOS CoreAudio path keeps a 200 ms playback reserve to absorb short SDR
+  control/USB stalls; after an underrun it rebuilds that reserve before
+  resuming. Windows WinMM is event-driven (`CALLBACK_EVENT`, ~170 ms of device
+  buffering). If you ever see `[AUDIO] CoreAudio underrun` or `[AUDIO] WinMM
+  output can't keep up with 48 kHz`, the selected device/driver could not
+  sustain the stream.
 - Diagnostic logging (`[SIG]`, `[ST]`, `[AUDIO]`, …) follows `[debug] log_level`
   in the INI (default on). Override per-run with `-v`/`--verbose` or
-  `-q`/`--quiet`.
-- XDR server listens on port `7373`. If `xdr.password` is empty and no `-P` is passed, the server automatically enters guest mode (no auth).
+  `-q`/`--quiet`. The SDRplay source's own connect trace (`[SDRplay] …`) follows
+  the same switch — it is silent under `-q` unless the connect actually fails.
+- XDR server listens on port `7373`. If `xdr.password` is empty and no `-P` is passed, the server automatically enters guest mode (no auth). The password guards **both** wire protocols on that port: a guest may read the tuner state but not change it.
+- The `o<auth>,<guest>` line reports how many clients are actually connected, and is re-sent to every client whenever one joins or leaves.
 - The tuner does not auto-start by default; an XDR client start command activates it. Use `--auto-start` to begin playback without a client.
+- A tune request for the frequency that is **already** tuned does not retune:
+  the tuner only re-asserts the gain/AGC registers. A retune flushes the audio
+  queue, resets the DSP and mutes the output while the demodulator settles, and
+  the listener hears that as the programme restarting. Clients re-send the
+  current frequency routinely (xdr-gtk on every click of the tuned entry, the
+  REST panel on every poll that carries a frequency), so this is the common
+  case.
+- A control client that disconnects does **not** stop a tuner it did not start.
+  On the FM-DX path the tuner is stopped when the client that started it goes
+  away; a client that attaches to an already-running tuner (`--auto-start`, or
+  a tuner another client is using) no longer cuts the programme when it
+  disconnects. Without this, a reconnecting control client restarted the
+  tuner — and the listener heard the station start over.
+- The first ~250 ms of IQ after a **connect** is dropped before it reaches the
+  DSP. An RTL-SDR delivers a loud, narrowband settling burst at the LO centre
+  in that window (measured: 12 dB above the settled level, clipping ~8% of
+  the samples). It is not programme: left in, it reached the audio as a burst
+  of noise, polluted the signal statistics and the meter calibration, and
+  triggered the front-end overload warnings on a perfectly healthy front end.
+  The raw IQ capture (`-i`) still contains it, because the capture is the
+  tuner's raw output.
+- Engaging the front end's **own AGC** costs a short silence (~600 ms), for
+  the same reason. The dongle's analog auto-gain overshoots when it is
+  switched on: on an R820T the samples right after the switch saturate the
+  converter for 100–600 ms (measured here: 55–90% of the samples at the rail)
+  before the AGC settles ~7 dB below the ceiling. Left in, that burst reached
+  the listener as noise, and it tripped the overload/duplicate warning for a
+  front end that was not overloaded — the exact false "duplicate station"
+  report the plugin shows. The settling burst is dropped instead, and the
+  audio fades back in over the gap. A re-assert of an already-running AGC
+  (the periodic keep-alive) leaves the AGC alone instead of restarting its
+  attack, so it does not cost a silence every few minutes.
+- The gain is the **tuner's** state, not the hardware's. A client that sets
+  the gain — the fm-dx-webserver plugin over REST, an XDR client over the XDR
+  protocol — sets it in the tuner, so it survives a retune, a reconnect and
+  the periodic gain re-assert, and the software auto-gain ladder never fights
+  the front end's own AGC over the same register. A `-g` on the command line
+  pins the gain: no client may change it after that. The gain in the profile
+  is only the starting point, unless the profile sets
+  `client_gain_allowed = false`.
 - De-emphasis default is 50 µs (EU/ITU). For US/Korea set `[tuner].deemphasis = 1` in the config (75 µs).
-- Default stereo blend profile is `aggressive` (fast mute on marginal pilot); select `normal` or `soft` via `-b` or the config.
+- Default stereo blend profile is `normal`: it holds the stereo image steady on a station whose quality estimate dips. Measured here on two back-to-back captures of the same station, `aggressive` left the image 8 dB weaker and swinging over 22 dB, while `normal` held it steady. Select `soft` or `aggressive` via `-b` or the config.
 
 ## Config-Driven Usage (optional)
 
@@ -558,12 +733,21 @@ the one for your hardware over `fm-sdr-tuner.ini` and tune it for your site
 (your personal `fm-sdr-tuner.ini` is git-ignored, so it is never committed):
 
 ```bash
-cp fm-sdr-tuner.ini.example fm-sdr-tuner.ini          # RTL-SDR (sane defaults)
+cp fm-sdr-tuner.ini.example fm-sdr-tuner.ini          # RTL-SDR
 # or, for an SDRplay RSP (macOS/Linux, SDRplay build only):
 cp fm-sdr-tuner-sdrplay.ini.example fm-sdr-tuner.ini
 
 ./build/fm-sdr-tuner            # or: -c fm-sdr-tuner.ini to be explicit
 ```
+
+The RTL example is the profile that was measured on this site (an R820T with
+the indoor antenna): a fixed 10 dB gain, the meter window that goes with it
+(`-33 / -10`, shifted from the `-43 / -19` measured with the earlier 30 kHz
+meter), and the REST control API enabled on `127.0.0.1:9090` — the
+address the fm-dx-webserver plugin talks to by default. The gain, the meter
+window and the antenna in it are the ones that were verified on real
+hardware; re-derive them with `--calibrate` after a change of antenna or
+cable.
 
 Both examples enable the REST control API (`[rest] enabled = true`, port 9090)
 and the bundled test panel (`scripts/rest_test_panel.py`, shipped in the
@@ -593,16 +777,15 @@ Important sections:
 - `[xdr]`: server port/password/guest mode
 
 Signal meter related keys (`[sdr]`):
-- `signal_floor_dbfs` (default `-65.0`)
-- `signal_ceil_dbfs` (default `-5.0`)
+- `signal_floor_dbfs` (default `-45.0`)
+- `signal_ceil_dbfs` (default `-1.0`)
 - `signal_bias_db` (default `0.0`)
 
 ### Getting reasonable signal-strength readings
 
 The displayed signal level (the `0..120` value XDR/FM-DX clients show as dBf) is
-not an absolute measurement — it is the **lower of two terms**: a linear mapping
-of the tuned-channel power (compensated dBFS) onto a `0..120` scale, capped by a
-noise-referenced SNR term so an empty channel can never peg the meter:
+a **linear mapping of the tuned-channel power** (compensated dBFS) onto a
+`0..120` scale:
 
 - `signal_floor_dbfs` is the power that reads as **0** (your noise floor / empty
   channel).
@@ -610,24 +793,16 @@ noise-referenced SNR term so an empty channel can never peg the meter:
 - `signal_bias_db` shifts the whole scale up/down to line up with a reference
   receiver, if you have one (otherwise leave it at `0`).
 
-**The SNR cap.** RTL front ends saturate: with auto-gain the tuner climbs to
-high gain on a weak/empty channel and the amplified noise pushes the raw channel
-power near full scale — so the *absolute* term alone would read ~maximum on
-empty spectrum just as it does on a strong station. To prevent that, the
-displayed level is also capped by the demod-domain SNR (the gain-invariant
-noise-triangle metric shown as `snr` in the REST API): below ~3 dB SNR the cap
-is 0, and it rises to full scale near ~30 dB. In practice this means an empty
-frequency reads near **0**, a fringe station reads low-to-mid, and only a clean,
-genuinely strong signal approaches the top — regardless of where auto-gain has
-parked the front-end gain. (This is why tuning a dead frequency no longer shows
-a pegged meter.)
+The measured power is the **band power of the whole 200 kHz channel** around
+the tuned carrier. An FM signal has a constant envelope, so the reading does not
+move with the programme (a 30 kHz window read the same carrier 8 dB lower at
+full modulation than in silence). The spectral scan uses the same estimator
+over 30 kHz, so the two agree for an unmodulated carrier and the meter reads a
+modulated station higher than the plot. Half of the applied gain is taken out
+of the reading, so a station keeps its level when the gain strategy changes.
 
-So a "reasonable" reading depends on the floor/ceil window matching the signal
-range your antenna delivers **and**, wherever it binds, on the SNR cap. The
-shipped default (`-65` / `-5`, a wide 60 dB window) is deliberately conservative
-so nothing saturates out of the box, but on most sites it compresses everything
-into the middle of the scale. To get the *absolute term* to track real signal
-differences:
+The shipped default (`-45` / `-1`) puts the noise floor of an empty band at 0
+and a strong local station near 115. To make the reading track your own site:
 
 1. **Fix RF gain first.** A meter calibrated over a clipping or starved front
    end is meaningless. Get `[SIG] clip` near zero on strong locals (see
@@ -637,15 +812,9 @@ differences:
    `./fm-sdr-tuner --calibrate` (prints copy-paste `signal_floor_dbfs` /
    `signal_ceil_dbfs` / `signal_bias_db` for your antenna), or just watch the
    `[METER] session observed` log line, which continuously suggests a floor/ceil
-   from the running min/max it sees. Both calibrate the **absolute term only** —
-   they don't model the SNR cap.
+   from the running min/max it sees.
 3. **Apply the suggested window** to `[sdr]` and restart. Strong locals should
-   then settle near the top. Note that **fringe-station readings are bounded by
-   the SNR cap, not the window**: a station at ~10 dB demod SNR is capped near
-   `30` no matter how you set floor/ceil, so widening the window can't raise it.
-   The window mainly positions strong/mid stations; the live meter can read lower
-   than the absolute mapping wherever the SNR cap binds (expected, not a
-   mis-calibration).
+   then settle near the top and an empty frequency at zero.
 
 The full step-by-step procedure, the `[METER]` output format, and the symptoms
 of a mis-set window are in
@@ -663,6 +832,14 @@ Weak-signal tuning keys (all default to off / static):
 
 ## Setup And Tuning Guide
 
+> **Short version:** the antenna dominates everything (15–25 dB — more than
+> every DSP knob combined). Get the RF path right first; no amount of software
+> recovers a signal that never reaches the dongle.
+>
+> For a condensed, ordered version of this guide — which factor matters most,
+> which gain profile to start from, and what each adaptive feature is actually
+> for — see **[RECEPTION-STRATEGIES.md](RECEPTION-STRATEGIES.md)**.
+
 This project behaves best when it is tuned like a real radio front end. Most
 bad behavior comes from getting the order wrong.
 
@@ -678,41 +855,50 @@ clipping.
 
 ### 1. Start From A Known-Good Baseline
 
-The binary ships with wide, safe defaults (`gain_strategy = tef`, `agc_mode = 2`, `w0_bandwidth_hz = 194000`, `stereo_blend = aggressive`, `signal_floor_dbfs = -65`, `signal_ceil_dbfs = -5`, `signal_bias_db = 0`, deemph 50 µs, `pilot_canceller = true`). The optional adaptive features (`hicut`, `adaptive_bandwidth`, `multipath_eq`) default to off so the audio is identical to a passive demod chain until you opt in.
+The shipped RTL profile (`fm-sdr-tuner.ini.example`) is the one that was measured on real hardware at this site: a fixed 10 dB gain with the most headroom of the settings tried, the meter window that goes with it (`-33 / -10`, shifted from the `-43 / -19` measured with the earlier 30 kHz meter), and the REST control API on `127.0.0.1:9090` so the fm-dx-webserver plugin can drive the tuner. Copy it over `fm-sdr-tuner.ini` and start from there. The optional adaptive features (`hicut`, `adaptive_bandwidth`, `multipath_eq`) are off so the audio is identical to a passive demod chain until you opt in.
 
 For a dedicated site profile, put overrides in `fm-sdr-tuner.ini`:
 
 ```ini
 [sdr]
 gain_strategy = tef
-rtl_gain_db = -1
-default_custom_gain_flags = 1
+rtl_gain_db = 10
+default_custom_gain_flags = 0
 freq_correction_ppm = 0
-# Wide default; watch [METER] log and narrow once you know the local range.
-signal_floor_dbfs = -65.0
-signal_ceil_dbfs = -5.0
+# The window measured with the 10 dB gain above: the empty band reads 0 and
+# the local station reads 91-100 of 120.
+signal_floor_dbfs = -33.0
+signal_ceil_dbfs = -10.0
 signal_bias_db = 0.0
 
 [processing]
 agc_mode = 2
 w0_bandwidth_hz = 194000
 dsp_agc = off
-stereo_blend = aggressive
+stereo_blend = normal
 stereo = true
 pilot_canceller = true
 # Optional adaptive features — leave off until you have a stable baseline.
 hicut = off
 adaptive_bandwidth = off
 multipath_eq = off
+# false freezes the gain (and with it the meter calibration) against a client
+# that would move it; true lets the plugin's gain control work.
 client_gain_allowed = false
 ```
 
 Why this baseline:
-- `tef` is the best default when local RF conditions are not yet known
-- `agc_mode = 2` is a stable middle ground
+- `rtl_gain_db = 10` is the measured setting for this site: 9.7 dB between the
+  station's peaks and the converter's ceiling, no pumping, and the meter off
+  the top of its scale
+- `default_custom_gain_flags = 0` leaves the dongle's own AGC off, so the
+  software auto-gain ladder stays in charge and its clip-protect can act. The
+  IF flag (= 1) turns that hardware AGC on, and a hardware AGC sets the level
+  by itself, so the ladder has to stand down
+- `agc_mode = 2` is a stable middle ground for the ladder
 - `w0_bandwidth_hz = 194000` is the correct starting point for normal WFM stereo
-- `stereo_blend = aggressive` pairs well with the adaptive Hi-Blend post-filter — the HF of stereo fades cleanly on marginal signals without audible pops
-- `client_gain_allowed = false` prevents XDR clients from changing gain while you tune the site profile
+- `stereo_blend = normal` holds the stereo image steady on a station whose quality estimate dips — measured here on two back-to-back captures of the same station, `aggressive` left the image 8 dB weaker and swinging over 22 dB, while `normal` held it steady. Use `aggressive` only on a station whose stereo is noisy rather than clean
+- `client_gain_allowed = false` prevents clients from changing gain while you tune the site profile — set it to `true` when the plugin's gain control should work
 
 ### 2. Validate Basic Hardware First
 
@@ -793,6 +979,15 @@ Practical manual range:
 Do not chase the highest signal number. The correct gain is the highest gain
 that does not produce sustained clipping on strong stations.
 
+The clip column is the one to watch on FM specifically: the modulation peaks
+of an FM station sit a few dB above its average, so a gain that looks
+comfortable on the level readout can still clip the ADC on the peaks. If
+`clip` is not `0.0000` on your strongest station, lower the gain — and if it
+*is* `0.0000` but the peaks sit within a couple of dB of the ceiling, lower
+it anyway: that is the margin that decides whether a stronger neighbour turns
+into a duplicate of the station (see "Duplicates of strong stations" for the
+measured numbers).
+
 ### 5. How To Read The Console Output
 
 Watch the console while tuning. The current log fields are meant to tell you
@@ -838,6 +1033,7 @@ Field meaning:
   - What to do next: a strong stereo station should show a clearly stronger pilot than a weak or mono station
 - `stereo`: decoder lock state
   - What to do next: `stereo=1` means the decoder is actually locked; `stereo=0` means do not expect stable stereo output
+  - A lock on a signal *below* the noise floor is meaningless: the PLL locks onto noise and reports `stereo=1` with a quality of 0 and a blend of 0. Read `quality` and `blend`, not `stereo` on its own
 - `quality`: stereo-path confidence
   - What to do next: compare this across stations; low quality on a strong local means recheck gain, bandwidth, and RF cleanliness
 - `blend`: actual stereo separation currently applied
@@ -887,18 +1083,19 @@ Weak or noisy station:
 
 Empty or quiet frequency:
 - `dbfs` may still be high under auto-gain (the front end amplifies noise), but
-  `level` reads ~0 because the demod-SNR cap collapses it
+  `level` reads ~0 when the empty band is below `signal_floor_dbfs`
 - no meaningful stereo lock
-- if `level` itself still looks strong on a truly empty channel, the SNR cap
-  isn't engaging — check that stereo/SNR telemetry is valid (see REST `snr`)
+- if `level` itself still looks strong on a truly empty channel, the floor is
+  too low for your site — raise `signal_floor_dbfs` (the `[METER]` suggester
+  does this for you)
 
 #### What Bad Looks Like
 
 - high `clip`:
   - too much gain; reduce gain first
 - high `level` on empty frequencies:
-  - the SNR cap should prevent this by design (empty ≈ 0); if it persists the
-    demod-SNR telemetry is suspect, not floor/gain calibration
+  - the floor is below your site's noise floor; raise `signal_floor_dbfs`
+    (the `[METER]` suggester does this for you)
 - `stereo=1` but low `blend` on a strong station:
   - gain may still be wrong, or the stereo-quality/blend policy is too conservative
 - repeated `[DSP] reset reason=retune` while tuning:
@@ -980,10 +1177,10 @@ These keys are display calibration only:
 
 They do not fix RF overload, wrong tuning, or ghosting.
 
-The default 60 dB window (`-65` floor, `-5` ceil) is intentionally wide so it works on most sites without saturating either end. The `[METER]` log line shipped in every run does the legwork for you (it calibrates the **absolute term** of the meter; the SNR cap is separate and needs no calibration):
+The default 45 dB window (`-55` floor, `-10` ceil) puts the noise floor of an empty band at 0 and a strong local station near 115. The `[METER]` log line shipped in every run does the legwork for you (it tracks the running min/max of your site and suggests the window that spans it):
 
 ```text
-[METER] mapping window: floor=-65.0 dBFS, ceil=-5.0 dBFS (range 60.0 dB), bias=0.0 dB
+[METER] mapping window: floor=-55.0 dBFS, ceil=-10.0 dBFS (range 45.0 dB), bias=0.0 dB
 [METER] session observed: min=-53.5 dBFS, max=-26.9 dBFS — for full-scale meter consider floor≈-57, ceil≈-24
 ```
 
@@ -996,20 +1193,27 @@ Two procedures, both work end-to-end:
 ```
 
 The output includes:
-- a per-frequency table (dBFS + meter level at every 100 kHz step). Note the
-  "meter level" column uses the FFT channel-SNR path, so it won't in general
-  equal the live client meter, which caps by the demod-domain SNR
+- a per-frequency table (dBFS + meter level at every 100 kHz step). The level
+  column is the same absolute mapping the live meter uses, so the two agree
+  for the same signal
 - a sorted list of detected stations (level120 > 30)
-- a recommendation block with `signal_floor_dbfs`, `signal_ceil_dbfs`, and `signal_bias_db` chosen so the absolute term spans the signal envelope at your site (the SNR cap still governs the low end live)
+- a recommendation block with `signal_floor_dbfs`, `signal_ceil_dbfs`, and `signal_bias_db` chosen so the window spans the signal envelope at your site
 
-Paste the recommendation block into the `[sdr]` section of your INI and restart. Takes ~45 seconds, no XDR client or audio backend needed. Re-run any time the antenna or location changes.
+Paste the recommendation block into the `[sdr]` section of your INI and
+restart. Calibration temporarily captures at least 1.024 MHz so each FFT covers
+several 100 kHz grid points; a full sweep normally takes about 5–10 seconds,
+with no XDR client or audio backend needed. Re-run any time the antenna,
+location, or gain changes.
 
 **Procedure B — Live auto-suggester (for tweaking while listening).**
 1. Start the tuner with the default wide window.
 2. Tune through your representative stations (strong local, mid, fringe, empty) over ~1 minute.
-3. Read the `[METER] session observed` line. It tracks the running min/max of compensated dBFS and recommends `floor ≈ min − 3 dB`, `ceil ≈ max + 3 dB` so the absolute term spans your real signal range (it is blind to the SNR cap).
+3. Read the `[METER] session observed` line. It tracks the running min/max of
+   clean compensated dBFS, excluding blocks whose IQ clips, and recommends
+   `floor ≈ min − 3 dB`, `ceil ≈ max + 3 dB` so the window spans the usable
+   signal range.
 4. Apply those values to `[sdr]` in your INI.
-5. Restart and confirm: strong locals now settle near the top. Fringe-station readings are set by the SNR cap, not this window, so they won't rise past their SNR-derived level however you set floor/ceil.
+5. Restart and confirm: strong locals now settle near the top and an empty frequency at zero.
 
 Manual fallback (if you prefer the by-hand approach):
 1. Tune an empty or very weak frequency and note typical `dbfs`/`compensated`.
@@ -1017,7 +1221,7 @@ Manual fallback (if you prefer the by-hand approach):
 3. Set `signal_floor_dbfs` ≈ empty-frequency compensated − 3 dB; `signal_ceil_dbfs` ≈ strong-station compensated + 3 dB.
 
 Symptoms of bad meter calibration:
-- empty channels always look too strong: the SNR cap should force these to ~0, so if they read high the demod-SNR telemetry is suspect (not floor/gain)
+- empty channels always look too strong: the floor is below your site's noise floor, so raise `signal_floor_dbfs` (the `[METER]` suggester catches this automatically)
 - every strong station saturates at 120: ceil is too low
 - everything looks compressed into the middle: floor/ceil window is too wide
 - weak stations clamp to 0: floor is too high (raise the window's bottom; the `[METER]` suggester catches this automatically)
@@ -1064,6 +1268,60 @@ What to do:
 3. if the duplicate weakens or disappears when gain is reduced, treat it as overload / image behavior
 
 If duplicates remain only at high gain, the fix is RF front-end discipline, not meter calibration.
+
+The tuner reports this condition itself, so you do not have to hunt for it:
+
+- the console prints `[RF] overload/image ghosting suspected: clip=… level=… dbfs=…`
+  as soon as the front end is clipping while the tuned station is strong. The
+  hint is not verbose-only, because it is the one diagnostic that explains a
+  duplicate *while you listen*; it is rate-limited so a persistent condition
+  does not flood the log.
+- `GET /api/status` carries `ghost_risk` (bool) next to `clip` and `overload`.
+- the fm-dx-webserver control plugin shows it as the **Duplicate** cell
+  (`RISK` when set), with the clip ratio next to the **Overload** cell.
+
+On the paths where the gain is pinned (the sdrpp gain strategy, a fixed
+`-g`/`rtl_gain_db`, or the tuner's own AGC) the auto-gain ladder cannot pull
+it down, so the tuner prints `[GAIN] clip-protect inactive (…): …` naming the
+knob to turn instead.
+
+Note that a duplicate of a station is *not* the same thing as the station
+repeating itself: a retune to the frequency that is already tuned no longer
+restarts the programme (the tuner skips the redundant retune and only
+re-asserts the gain/AGC registers), so what you hear is a genuine second
+copy, not the DSP restarting.
+
+**How much headroom a gain setting leaves.** An FM station's modulation peaks
+sit a few dB above its average level, and a saturated front end mixes the
+strong station with itself — the intermodulation product is heard as a second
+copy of that station. What decides whether that happens is how much room the
+peaks have below the converter's ceiling, not the average level. Measured on
+an R820T with the local station on 96.2 MHz (peak = the highest sample in
+the capture, ceiling = full scale):
+
+| Gain setting | Station (channel) | Peak | Headroom | Clip ratio |
+|---|---|---|---|---|
+| manual 10 dB | −19 dBFS | −9.7 dBFS | 9.7 dB | 0.0000 |
+| manual 12 dB | −16 dBFS | −7.3 dBFS | 7.3 dB | 0.0000 |
+| manual 14 dB | −15 dBFS | −5.4 dBFS | 5.4 dB | 0.0000 |
+| dongle AGC (`rtl_gain_db = -1`) | −14 dBFS | −6.2 dBFS | 6.2 dB | 0.0000 |
+| auto ladder (climbs to 18 dB) | −13 dBFS | −3.4 dBFS | 3.4 dB | 0.0000 |
+
+So on this site nothing clips in steady state, and the AGC is not the villain
+it looks like in the numbers. But the margin is what matters: 3.4 dB of
+headroom is one strong neighbour away from the clipper, while 9.7 dB is not.
+That is why the shipped profile uses a fixed 10 dB: the most headroom, no
+pumping, and the meter off the top of its scale.
+
+One thing *does* clip with the dongle's AGC: the front end's own auto-gain
+overshoots when it is engaged. On an R820T the samples right after the switch
+saturate the converter for 100–600 ms (measured here: 55–90% of the samples
+at the rail) before the AGC settles ~7 dB below the ceiling. The tuner drops
+that burst before the DSP sees it (see "Runtime Behavior"), so the switch
+costs a short silence instead of a burst of noise and a false "duplicate
+station" warning. The same window covers the settling burst after a connect
+or a reconnect.
+
 
 #### 3. Nearby strong station leaking into adjacent channels: suspect adjacent-channel leakage
 
@@ -1158,13 +1416,20 @@ Use fixed `rtl_gain_db` when:
 - antenna and site are stable
 - you want repeatable comparisons
 - you are benchmarking meter or scan behavior
+- a strong local station makes the dongle's own AGC clip the ADC (see
+  "Duplicates of strong stations" above: the AGC targets the average level,
+  the FM peaks clip)
 
 Avoid fixed manual gain when:
 - moving between locations
 - changing antennas often
 - local RF density varies a lot over time
 
-For general listening, strategy-managed gain is usually easier to keep sane.
+For general listening, strategy-managed gain is usually easier to keep sane —
+but on a site with a strong local station, a fixed gain that leaves headroom
+for the modulation peaks is the safer choice. The `[SIG] clip=` column tells
+you when the front end is overdriven: lower `rtl_gain_db` until it reads
+`0.0000` while the station still sits clearly above the noise floor.
 
 ### 13. Optional Adaptive Features
 
@@ -1200,6 +1465,27 @@ Weak stations never hold stereo:
 Scan or meter looks wrong:
 - fix clipping first
 - then recalibrate `signal_floor_dbfs` / `signal_ceil_dbfs`
+
+Spectrum plot is empty or ends short of the requested frequency:
+- an empty plot during a sweep is normal — the plot fills in as the sweep advances
+- a plot that *ends short* means the line was longer than the client's receive buffer; the tuner now widens the step automatically and logs a `[SCAN] warning`
+- a plot that stays empty after the sweep ended means the client was refused the scan (`a0`); a guest session may not run one — configure a password, or use an authenticated client
+
+A station is drawn on the wrong frequency:
+- the reporting grid is aligned with the CCIR raster (87.6 MHz + n × 0.2 MHz) whenever the step divides it, so a station is drawn on its own frequency
+- a step that does not divide the 200 kHz raster cannot hold every station exactly; the tuner logs a `[SCAN] warning` naming the consequence
+- if *every* station sits slightly off, that is the dongle's frequency error — set `freq_correction_ppm` from a station whose exact frequency you know
+- if one strong station has a weaker copy next to it, that is an overload image — reduce the gain first
+
+The scan levels and the signal meter disagree:
+- the meter integrates the whole channel and the scan 30 kHz per grid point, so a modulated station reads higher on the meter than on the plot; an unmodulated carrier reads the same on both
+- if the scan is uniformly much lower, check that the channel bandwidth matches what the meter is using (`Sw` / `w0_bandwidth_hz`)
+- the scan line is remapped onto the client's fixed 3..84 plot window; the `S` line and the REST status keep the 0..120 scale, so the two are not directly comparable as numbers
+
+A phantom station appears in the plot:
+- the plot is a spectrum: a signal that is not a station is a bump in the noise floor, not a spike
+- a spike that is much higher than the floor is a real signal — check the gain, an overloaded front end answers with an image next to the station
+- a bump that only shows up on one sweep is a noise maximum; a second sweep tells the two apart
 
 Stereo image is too narrow on clearly strong locals:
 - gain may still be wrong
@@ -1242,6 +1528,10 @@ pilot_canceller = false
 
 # Stereo blend "aggressive" mutes stereo on weak signals quickly, avoiding
 # work in the L-R recovery loop when there's no real stereo to recover.
+# This is a CPU trade, not a quality trade: on a strong local station the
+# stereo image then collapses and comes back (measured here: 8 dB weaker and
+# swinging over 22 dB, with 6 % of the seconds fully muted). Keep the default
+# "normal" unless the CPU is the problem.
 stereo_blend = aggressive
 
 [debug]
@@ -1283,7 +1573,7 @@ Notes:
 
 Current workflows exist for:
 - Linux (`x64`, `arm64`)
-- macOS (`macos-latest`)
+- macOS (`macos-latest`, manual dispatch only)
 - Windows (`windows-latest`, MinGW-w64 via MSYS2)
 
 Artifacts currently uploaded by CI:
@@ -1298,22 +1588,18 @@ Artifacts currently uploaded by CI:
   - `fm-sdr-tuner-linux-rpm-fedora-42-arm64`
   - `fm-sdr-tuner-linux-rpm-fedora-43-x64`
   - `fm-sdr-tuner-linux-rpm-fedora-43-arm64`
-- macOS build job:
-  - `fm-sdr-tuner-macos` (binary + `README.md` + `USER-MANUAL.md` + ready-to-use `fm-sdr-tuner.ini` + both `*.ini.example` configs + `rest_test_panel.py` + `run_rest_panel.sh`)
+- Manually dispatched macOS build job:
+  - `fm-sdr-tuner-macos` (RTL-only binary + `README.md` + `USER-MANUAL.md` + ready-to-use `fm-sdr-tuner.ini` + `fm-sdr-tuner.ini.example` + `rest_test_panel.py` + `run_rest_panel.sh`)
 - Windows MinGW job:
   - `fm-sdr-tuner-windows-mingw` (`.exe` + required DLLs + `dependencies.txt` + `README.md` + `USER-MANUAL.md` + ready-to-use `fm-sdr-tuner.ini` + `fm-sdr-tuner.ini.example` + `rest_test_panel.py`)
 
-The **macOS and Linux** release builds are **SDRplay-capable**: CI builds them
-with `-DFM_TUNER_ENABLE_SDRPLAY=ON` against the vendor's public API *headers*
-(fetched at build time). The SDRplay library is `dlopen`'d at runtime, never
-linked or bundled — so nothing proprietary is redistributed, no package
-dependency is added, and the binary still runs on RTL-only systems. To use an
-RSP with a prebuilt binary, just install the **SDRplay API service** from
-<https://www.sdrplay.com/>. The **Windows** build is RTL-only (no SDRplay
-loader). Building SDRplay from source needs `-DFM_TUNER_ENABLE_SDRPLAY=ON`
-(macOS/Linux only).
+All CI release artifacts are RTL-only. SDRplay builds require a local macOS or
+Linux SDK installation and `-DFM_TUNER_ENABLE_SDRPLAY=ON`.
 
 Notes:
+- macOS CI does not run automatically for pushes or pull requests. Dispatch
+  `.github/workflows/build-macos.yml` manually when a macOS build or release
+  artifact is needed.
 - Linux smoke-test jobs validate package installability in fresh containers, but
   they do not upload additional artifacts.
 - Artifact names and platform matrix are defined in:
@@ -1346,7 +1632,9 @@ This software is based on or integrates ideas/components from:
 - redsea (RDS decoding pipeline; this project now uses redsea-derived components)
 - XDR-GTK and librdsparser (XDR ecosystem compatibility/parsing behavior)
 - FM-DX-Tuner and xdrd (protocol and tuner-control ecosystem references)
-- sdr-j-fm (algorithmic references for pilot recovery without bandpass FIR, adaptive Costas-style stereo separator, and squelch — see roadmap items P18-P20 in `plan.md`)
+- sdr-j-fm (algorithmic references for pilot recovery without a bandpass FIR,
+  adaptive Costas-style stereo separation, and squelch — see P18 and P19 in
+  `todo.md`)
 
 Core third-party runtime/build dependencies used by this project include:
 

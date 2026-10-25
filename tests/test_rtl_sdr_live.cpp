@@ -81,10 +81,14 @@ bool readIqWithRetries(RTLSDRDevice& dev, std::vector<uint8_t>& iq,
 
 SignalLevelResult measureFrequencyLevel(RTLSDRDevice& dev, uint32_t freqKHz,
                                         uint32_t sampleRateHz,
-                                        int appliedGainDb,
-                                        int channelBandwidthHz = 56000) {
+                                        int appliedGainDb) {
   REQUIRE(dev.setFrequency(freqKHz * 1000U));
   std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  // The device ring hands out its oldest samples first, and it holds far
+  // more than the reads below burn: without this flush the measurement is
+  // taken on the frequency tuned before, so the second of two measurements
+  // reported the first one's level.
+  dev.flushBuffers();
 
   // Burn 4 full ring's worth of samples to ensure we're past any residual
   // buffer from the previous tune frequency. Low-latency mode helps but is
@@ -110,8 +114,7 @@ SignalLevelResult measureFrequencyLevel(RTLSDRDevice& dev, uint32_t freqKHz,
     REQUIRE(hasVariation(iq));
 
     const SignalLevelResult signal = computeSignalLevel(
-        iq.data(), samples, appliedGainDb, 0.5, 0.0, -80.0, -12.0, sampleRateHz,
-        channelBandwidthHz);
+        iq.data(), samples, appliedGainDb, 0.5, 0.0, -80.0, -12.0, sampleRateHz);
     REQUIRE(std::isfinite(signal.dbfs));
     REQUIRE(std::isfinite(signal.compensatedDbfs));
     dbfsSum += signal.dbfs;
@@ -199,8 +202,7 @@ LiveDspAnalysis analyzeBandwidth(RTLSDRDevice& dev, uint32_t sampleRateHz,
     REQUIRE(hasVariation(iq));
 
     const SignalLevelResult signal = computeSignalLevel(
-        iq.data(), samples, appliedGainDb, 0.5, 0.0, -80.0, -12.0, sampleRateHz,
-        bandwidthHz);
+        iq.data(), samples, appliedGainDb, 0.5, 0.0, -80.0, -12.0, sampleRateHz);
     DspPipeline::Result dspOut;
     REQUIRE(pipeline.process(
         iq.data(), samples, [&](const float*, size_t) {}, dspOut));
@@ -282,7 +284,7 @@ TEST_CASE("RTLSDRDevice live smoke test with attached hardware", "[rtl_sdr_live]
 
   const SignalLevelResult signal = computeSignalLevel(
       iq.data(), samples, (gainTenthsDb >= 0) ? (gainTenthsDb / 10) : 0, 0.5, 0.0,
-      -80.0, -12.0, sampleRateHz, 56000);
+      -80.0, -12.0, sampleRateHz);
 
   REQUIRE(std::isfinite(signal.dbfs));
   REQUIRE(std::isfinite(signal.compensatedDbfs));
@@ -448,19 +450,10 @@ TEST_CASE("RTLSDRDevice FM band sweep for calibration", "[rtl_sdr_live]") {
   std::vector<Row> rows;
   rows.reserve(((endKHz - startKHz) / stepKHz) + 1);
 
-  // FM broadcast occupies ~150 kHz of channel bandwidth and the running app's
-  // [SIG] line measures with `processing.w0_bandwidth_hz` (194 kHz default).
-  // Using 56 kHz here would concentrate the measurement on the central DC
-  // region where the R820T's LO-leakage notch suppresses signal — producing
-  // a deceptively low reading at the actual station frequency and a falsely
-  // strong reading 200 kHz off where the modulation lands outside the notch.
-  const int sweepChannelBwHz = static_cast<int>(
-      envU32("FM_TUNER_BANDSWEEP_CHANNEL_BW_HZ", 194000));
   for (uint32_t f = startKHz; f <= endKHz; f += stepKHz) {
     const SignalLevelResult r =
         measureFrequencyLevel(dev, f, sampleRateHz,
-                              autoGain ? 0 : gainTenthsDb / 10,
-                              sweepChannelBwHz);
+                              autoGain ? 0 : gainTenthsDb / 10);
     rows.push_back({f, r.dbfs, r.compensatedDbfs, r.level120});
   }
 
@@ -471,9 +464,11 @@ TEST_CASE("RTLSDRDevice FM band sweep for calibration", "[rtl_sdr_live]") {
     sortedDbfs.push_back(row.dbfs);
   }
   std::sort(sortedDbfs.begin(), sortedDbfs.end());
-  const double p05 = sortedDbfs[static_cast<size_t>(sortedDbfs.size() * 0.05)];
+  const double p05 = sortedDbfs[static_cast<size_t>(
+      static_cast<double>(sortedDbfs.size()) * 0.05)];
   const double p50 = sortedDbfs[sortedDbfs.size() / 2];
-  const double p95 = sortedDbfs[static_cast<size_t>(sortedDbfs.size() * 0.95)];
+  const double p95 = sortedDbfs[static_cast<size_t>(
+      static_cast<double>(sortedDbfs.size()) * 0.95)];
   const double pMax = sortedDbfs.back();
   const double pMin = sortedDbfs.front();
 

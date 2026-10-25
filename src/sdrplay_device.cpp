@@ -127,47 +127,98 @@ int SDRplayDevice::deviceCount() {
 
 bool SDRplayDevice::connect() {
   auto &a = api();
-  if (!a.ok()) return false;
-  if (a.Open() != sdrplay_api_Success) return false;
+  const bool verbose = m_verboseLogging.load(std::memory_order_relaxed);
+  if (!a.ok()) {
+    if (verbose) {
+      std::fprintf(stderr,
+                   "[SDRplay] API library not loaded (lib=%p) — is the SDRplay "
+                   "API service installed?\n",
+                   a.lib);
+    }
+    return false;
+  }
+  sdrplay_api_ErrT oerr = a.Open();
+  if (oerr != sdrplay_api_Success) {
+    if (verbose) {
+      std::fprintf(stderr, "[SDRplay] Open failed: %d\n", static_cast<int>(oerr));
+    }
+    return false;
+  }
+
+  // A mismatch between the API version we were built against and the running
+  // service is the most common silent connect failure.
+  float apiVerChk = 0.0f;
+  if (a.ApiVersion) a.ApiVersion(&apiVerChk);
+  if (verbose) {
+    std::fprintf(stderr,
+                 "[SDRplay] API service version %.2f (built against %.2f)\n",
+                 apiVerChk, static_cast<float>(SDRPLAY_API_VERSION));
+  }
 
   unsigned int n = 0;
   sdrplay_api_DeviceT devs[8];
   a.Lock();
-  if (a.GetDevices(devs, &n, 8) != sdrplay_api_Success || n == 0) {
+  sdrplay_api_ErrT gerr = a.GetDevices(devs, &n, 8);
+  if (gerr != sdrplay_api_Success || n == 0) {
+    if (verbose) {
+      std::fprintf(stderr, "[SDRplay] GetDevices failed: err=%d count=%u\n",
+                   static_cast<int>(gerr), n);
+    }
     a.Unlock();
     a.Close();
     return false;
   }
+  if (verbose) {
+    std::fprintf(stderr, "[SDRplay] GetDevices found %u device(s)\n", n);
+  }
   g_device = devs[0];
-  if (a.SelectDevice(&g_device) != sdrplay_api_Success) {
+  sdrplay_api_ErrT serr = a.SelectDevice(&g_device);
+  if (serr != sdrplay_api_Success) {
+    if (verbose) {
+      std::fprintf(stderr, "[SDRplay] SelectDevice failed: %d\n",
+                   static_cast<int>(serr));
+    }
     a.Unlock();
     a.Close();
     return false;
   }
   a.Unlock();
 
-  if (a.GetDeviceParams(g_device.dev, &g_params) != sdrplay_api_Success || !g_params) {
+  sdrplay_api_ErrT perr = a.GetDeviceParams(g_device.dev, &g_params);
+  if (perr != sdrplay_api_Success || !g_params) {
+    if (verbose) {
+      std::fprintf(stderr,
+                   "[SDRplay] GetDeviceParams failed: err=%d params=%p\n",
+                   static_cast<int>(perr), static_cast<void *>(g_params));
+    }
     a.ReleaseDevice(&g_device);
     a.Close();
     return false;
   }
 
-  m_hwVer = static_cast<int>(g_device.hwVer);
+  m_hwVer.store(static_cast<int>(g_device.hwVer), std::memory_order_relaxed);
 
-  g_params->devParams->fsFreq.fsHz = kFsHz;
+  // The initial parameter block is the same shared state the setters
+  // mutate, so it is written under the parameter lock too.
   auto *rx = g_params->rxChannelA;
-  rx->tunerParams.rfFreq.rfHz = static_cast<double>(kDefaultFreqHz);
-  rx->tunerParams.bwType = sdrplay_api_BW_0_600;
-  rx->tunerParams.ifType = sdrplay_api_IF_Zero;
-  rx->tunerParams.gain.gRdB = 40;
-  // Strong broadcast FM overloads the front end at LNAstate 0; back the LNA off
-  // a few steps by default (AGC still trims the IF gain).
-  rx->tunerParams.gain.LNAstate = 4;
-  rx->ctrlParams.decimation.enable = 1;
-  rx->ctrlParams.decimation.decimationFactor = kDecim;
-  rx->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ; // auto gain by default
-  rx->ctrlParams.agc.setPoint_dBfs = -30;
-  m_inputRate = static_cast<int>(kFsHz / kDecim);
+  int lnaState = 0;
+  {
+    std::lock_guard<std::mutex> lk(m_paramMutex);
+    g_params->devParams->fsFreq.fsHz = kFsHz;
+    rx->tunerParams.rfFreq.rfHz = static_cast<double>(kDefaultFreqHz);
+    rx->tunerParams.bwType = sdrplay_api_BW_0_600;
+    rx->tunerParams.ifType = sdrplay_api_IF_Zero;
+    rx->tunerParams.gain.gRdB = 40;
+    // Strong broadcast FM overloads the front end at LNAstate 0; back the LNA off
+    // a few steps by default (AGC still trims the IF gain).
+    rx->tunerParams.gain.LNAstate = 4;
+    rx->ctrlParams.decimation.enable = 1;
+    rx->ctrlParams.decimation.decimationFactor = kDecim;
+    rx->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ; // auto gain by default
+    rx->ctrlParams.agc.setPoint_dBfs = -30;
+    m_inputRate = static_cast<int>(kFsHz / kDecim);
+    lnaState = rx->tunerParams.gain.LNAstate;
+  }
 
   sdrplay_api_CallbackFnsT cbs;
   cbs.StreamACbFn = streamA;
@@ -175,18 +226,22 @@ bool SDRplayDevice::connect() {
   cbs.EventCbFn = eventCb;
   sdrplay_api_ErrT ierr = a.Init(g_device.dev, &cbs, this);
   if (ierr != sdrplay_api_Success) {
-    std::fprintf(stderr, "[SDRplay] Init failed: %d\n", static_cast<int>(ierr));
+    if (verbose) {
+      std::fprintf(stderr, "[SDRplay] Init failed: %d\n", static_cast<int>(ierr));
+    }
     a.ReleaseDevice(&g_device);
     a.Close();
     return false;
   }
   float apiVer = 0.0f;
   if (a.ApiVersion) a.ApiVersion(&apiVer);
-  std::fprintf(stderr,
-               "[SDRplay] %s (SerNo %s) API %.2f | %g MHz/%d = %d Hz | antennas "
-               "%d | LNAstate %d + AGC\n",
-               modelName(), g_device.SerNo, apiVer, kFsHz / 1e6, kDecim,
-               m_inputRate, antennaCount(), rx->tunerParams.gain.LNAstate);
+  if (verbose) {
+    std::fprintf(stderr,
+                 "[SDRplay] %s (SerNo %s) API %.2f | %g MHz/%d = %d Hz | antennas "
+                 "%d | LNAstate %d + AGC\n",
+                 modelName(), g_device.SerNo, apiVer, kFsHz / 1e6, kDecim,
+                 m_inputRate, antennaCount(), lnaState);
+  }
   m_handle = g_device.dev;
   {
     std::lock_guard<std::mutex> lk(m_mutex);
@@ -212,6 +267,9 @@ void SDRplayDevice::disconnect() {
 
 bool SDRplayDevice::setFrequency(uint32_t freqHz) {
   if (!m_connected.load() || !g_params || !m_handle) return false;
+  // The parameter write and the API push that publishes it are one atomic
+  // step: another thread's update must not land between them.
+  std::lock_guard<std::mutex> lk(m_paramMutex);
   g_params->rxChannelA->tunerParams.rfFreq.rfHz = static_cast<double>(freqHz);
   return api().Update(m_handle, g_device.tuner, sdrplay_api_Update_Tuner_Frf,
                       sdrplay_api_Update_Ext1_None) == sdrplay_api_Success;
@@ -230,6 +288,7 @@ bool SDRplayDevice::setFrequencyCorrection(int) {
 
 bool SDRplayDevice::setAGC(bool enable) {
   if (!m_connected.load() || !g_params || !m_handle) return false;
+  std::lock_guard<std::mutex> lk(m_paramMutex);
   g_params->rxChannelA->ctrlParams.agc.enable =
       enable ? sdrplay_api_AGC_50HZ : sdrplay_api_AGC_DISABLE;
   return api().Update(m_handle, g_device.tuner, sdrplay_api_Update_Ctrl_Agc,
@@ -240,6 +299,7 @@ bool SDRplayDevice::setGainMode(bool manual) { return setAGC(!manual); }
 
 bool SDRplayDevice::setGain(uint32_t gainTenthsDb) {
   if (!m_connected.load() || !g_params || !m_handle) return false;
+  std::lock_guard<std::mutex> lk(m_paramMutex);
   const double gainDb = static_cast<double>(gainTenthsDb) / 10.0;
   // Manual IF gain: disable AGC and map 0..50 dB "gain" to the IF gain
   // reduction gRdB (~20..59 dB; higher reduction = less gain).
@@ -256,13 +316,14 @@ bool SDRplayDevice::setGain(uint32_t gainTenthsDb) {
 
 bool SDRplayDevice::setBandwidthHz(int hz) {
   if (!m_connected.load() || !g_params || !m_handle) return false;
+  std::lock_guard<std::mutex> lk(m_paramMutex);
   g_params->rxChannelA->tunerParams.bwType = bwForHz(hz);
   return api().Update(m_handle, g_device.tuner, sdrplay_api_Update_Tuner_BwType,
                       sdrplay_api_Update_Ext1_None) == sdrplay_api_Success;
 }
 
 const char *SDRplayDevice::modelName() const {
-  switch (m_hwVer) {
+  switch (m_hwVer.load(std::memory_order_relaxed)) {
   case SDRPLAY_RSP1_ID: return "RSP1";
   case SDRPLAY_RSP1A_ID: return "RSP1A";
   case SDRPLAY_RSP1B_ID: return "RSP1B";
@@ -276,6 +337,7 @@ const char *SDRplayDevice::modelName() const {
 
 bool SDRplayDevice::setLnaState(int state) {
   if (!m_connected.load() || !g_params || !m_handle) return false;
+  std::lock_guard<std::mutex> lk(m_paramMutex);
   g_params->rxChannelA->tunerParams.gain.LNAstate =
       static_cast<unsigned char>(std::max(0, std::min(27, state)));
   return api().Update(m_handle, g_device.tuner, sdrplay_api_Update_Tuner_Gr,
@@ -284,6 +346,7 @@ bool SDRplayDevice::setLnaState(int state) {
 
 bool SDRplayDevice::setScanWideMode(bool wide) {
   if (!m_connected.load() || !g_params || !m_handle) return false;
+  std::lock_guard<std::mutex> lk(m_paramMutex);
   auto *rx = g_params->rxChannelA;
   rx->ctrlParams.decimation.enable = 1;
   rx->ctrlParams.decimation.decimationFactor =
@@ -301,7 +364,7 @@ bool SDRplayDevice::setScanWideMode(bool wide) {
   m_inputRate =
       wide ? static_cast<int>(kFsHz) : static_cast<int>(kFsHz / kDecim);
   {
-    std::lock_guard<std::mutex> lk(m_mutex);
+    std::lock_guard<std::mutex> ringLock(m_mutex);
     m_readPos = m_writePos = 0;
     m_full = false;
   }
@@ -309,7 +372,7 @@ bool SDRplayDevice::setScanWideMode(bool wide) {
 }
 
 int SDRplayDevice::antennaCount() const {
-  switch (m_hwVer) {
+  switch (m_hwVer.load(std::memory_order_relaxed)) {
   case SDRPLAY_RSPdx_ID:
   case SDRPLAY_RSPdxR2_ID: return 3;
   case SDRPLAY_RSP2_ID: return 2;
@@ -319,8 +382,10 @@ int SDRplayDevice::antennaCount() const {
 
 bool SDRplayDevice::setAntenna(int index) {
   if (!m_connected.load() || !g_params || !m_handle) return false;
+  std::lock_guard<std::mutex> lk(m_paramMutex);
   auto &a = api();
-  if (m_hwVer == SDRPLAY_RSPdx_ID || m_hwVer == SDRPLAY_RSPdxR2_ID) {
+  const int hwVer = m_hwVer.load(std::memory_order_relaxed);
+  if (hwVer == SDRPLAY_RSPdx_ID || hwVer == SDRPLAY_RSPdxR2_ID) {
     const int idx = std::max(0, std::min(2, index));
     g_params->devParams->rspDxParams.antennaSel =
         static_cast<sdrplay_api_RspDx_AntennaSelectT>(idx);
@@ -332,8 +397,10 @@ bool SDRplayDevice::setAntenna(int index) {
 
 bool SDRplayDevice::setBiasTee(bool enable) {
   if (!m_connected.load() || !g_params || !m_handle) return false;
+  std::lock_guard<std::mutex> lk(m_paramMutex);
   auto &a = api();
-  if (m_hwVer == SDRPLAY_RSPdx_ID || m_hwVer == SDRPLAY_RSPdxR2_ID) {
+  const int hwVer = m_hwVer.load(std::memory_order_relaxed);
+  if (hwVer == SDRPLAY_RSPdx_ID || hwVer == SDRPLAY_RSPdxR2_ID) {
     g_params->devParams->rspDxParams.biasTEnable = enable ? 1 : 0;
     return a.Update(m_handle, g_device.tuner, sdrplay_api_Update_None,
                     sdrplay_api_Update_RspDx_BiasTControl) == sdrplay_api_Success;
@@ -410,7 +477,7 @@ size_t SDRplayDevice::readIQ(uint8_t *out, size_t maxSamples) {
   const size_t got = readIQ(tmp.data(), maxSamples);
   for (size_t i = 0; i < got; i++) {
     auto quant = [](float v) -> uint8_t {
-      const float s = std::lround(v * 127.5f + 127.5f);
+      const float s = static_cast<float>(std::lround(v * 127.5f + 127.5f));
       return static_cast<uint8_t>(std::clamp(s, 0.0f, 255.0f));
     };
     out[2 * i] = quant(tmp[i].real());

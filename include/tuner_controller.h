@@ -1,6 +1,7 @@
 #ifndef TUNER_CONTROLLER_H
 #define TUNER_CONTROLLER_H
 
+#include <atomic>
 #include <complex>
 #include <cstddef>
 #include <cstdint>
@@ -32,11 +33,21 @@ public:
   // No-ops for RTL sources.
   void configureSdrplay(int lnaState, int antenna, bool biasTee);
 
+  // Gate the source's own diagnostics behind the application's verbose flag.
+  void setVerboseLogging(bool enable);
+
   void setLowLatencyMode(bool enable);
 
   bool connect();
   void disconnect();
   bool setFrequency(uint32_t freqHz);
+  // The frequency the source is actually tuned to, or 0 when it is not known
+  // (never tuned, or the source is disconnected). The controller is the one
+  // component that programs the hardware, so it is the only one that can
+  // answer "is the tuner already on this frequency?".
+  uint32_t currentFrequencyHz() const {
+    return m_currentFrequencyHz.load(std::memory_order_relaxed);
+  }
   bool setSampleRate(uint32_t sampleRate);
   bool setFrequencyCorrection(int ppm);
   bool setGainMode(bool manual);
@@ -80,6 +91,9 @@ private:
   int m_sdrplayLnaState = 4;
   int m_sdrplayAntenna = 0;
   bool m_sdrplayBiasTee = false;
+  // The frequency the source is tuned to, updated on every successful
+  // setFrequency() and cleared on disconnect.
+  std::atomic<uint32_t> m_currentFrequencyHz{0};
 };
 
 #endif

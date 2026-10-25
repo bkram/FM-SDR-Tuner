@@ -43,6 +43,18 @@ target_link_libraries(test_config PRIVATE
     ${FM_TUNER_CATCH2_TARGET}
 )
 
+add_executable(test_calibration test_calibration.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/calibration_policy.cpp
+)
+target_include_directories(test_calibration PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_calibration PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+)
+
 add_executable(test_app_options test_app_options.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/app_options.cpp
@@ -83,6 +95,30 @@ if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
 else()
     target_include_directories(test_dsp_chain PRIVATE ${LIQUID_INCLUDE_DIRS})
     target_link_libraries(test_dsp_chain PRIVATE ${LIQUID_LIBRARIES})
+endif()
+
+add_executable(test_demod_front test_demod_front.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/dsp/liquid_primitives.cpp
+    ${CMAKE_SOURCE_DIR}/src/dsp/multipath_eq.cpp
+    ${CMAKE_SOURCE_DIR}/src/dsp_pipeline.cpp
+    ${CMAKE_SOURCE_DIR}/src/fm_demod.cpp
+    ${CMAKE_SOURCE_DIR}/src/stereo_decoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/af_post_processor.cpp
+)
+target_include_directories(test_demod_front PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_demod_front PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+    Threads::Threads
+)
+if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
+    target_link_libraries(test_demod_front PRIVATE PkgConfig::PC_LIQUID)
+else()
+    target_include_directories(test_demod_front PRIVATE ${LIQUID_INCLUDE_DIRS})
+    target_link_libraries(test_demod_front PRIVATE ${LIQUID_LIBRARIES})
 endif()
 
 add_executable(test_runtime test_runtime.cpp
@@ -265,6 +301,33 @@ if(WIN32)
     target_link_libraries(test_scan_engine PRIVATE ws2_32)
 endif()
 
+add_executable(test_scan_diag test_scan_diag.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/scan_engine.cpp
+    ${CMAKE_SOURCE_DIR}/src/signal_level.cpp
+    ${CMAKE_SOURCE_DIR}/src/cpu_features.cpp
+    ${CMAKE_SOURCE_DIR}/src/xdr_server.cpp
+    ${CMAKE_SOURCE_DIR}/src/dsp/liquid_primitives.cpp
+)
+target_include_directories(test_scan_diag PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_scan_diag PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+    Threads::Threads
+    OpenSSL::Crypto
+)
+if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
+    target_link_libraries(test_scan_diag PRIVATE PkgConfig::PC_LIQUID)
+else()
+    target_include_directories(test_scan_diag PRIVATE ${LIQUID_INCLUDE_DIRS})
+    target_link_libraries(test_scan_diag PRIVATE ${LIQUID_LIBRARIES})
+endif()
+if(WIN32)
+    target_link_libraries(test_scan_diag PRIVATE ws2_32)
+endif()
+
 add_executable(test_adaptive_bandwidth test_adaptive_bandwidth.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/adaptive_bandwidth.cpp
@@ -289,6 +352,30 @@ target_link_libraries(test_auto_gain PRIVATE
     ${FM_TUNER_CATCH2_TARGET}
 )
 
+# Header-only retune policy: no extra source needed.
+add_executable(test_retune_policy test_retune_policy.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+)
+target_include_directories(test_retune_policy PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_retune_policy PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+)
+
+# Header-only gain model: no extra source needed.
+add_executable(test_gain_model test_gain_model.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+)
+target_include_directories(test_gain_model PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_gain_model PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+)
+
 add_executable(test_sdrplay_stub test_sdrplay_stub.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/sdrplay_device.cpp
@@ -308,6 +395,31 @@ if(WIN32)
     target_link_libraries(test_sdrplay_stub PRIVATE ws2_32)
 endif()
 
+# The verbose-gating of the SDRplay connect diagnostics can only be exercised
+# against the real (non-stub) device, so this target is built only when the
+# SDRplay SDK headers are present.
+if(FM_TUNER_HAVE_SDRPLAY AND NOT WIN32)
+    add_executable(test_sdrplay_verbose test_sdrplay_verbose.cpp
+        ${FM_TUNER_TEST_MAIN_SOURCE}
+        ${CMAKE_SOURCE_DIR}/src/sdrplay_device.cpp
+        ${CMAKE_SOURCE_DIR}/src/tuner_controller.cpp
+        ${CMAKE_SOURCE_DIR}/src/rtl_sdr_device.cpp
+        ${CMAKE_SOURCE_DIR}/src/rtl_tcp_client.cpp
+    )
+    target_compile_definitions(test_sdrplay_verbose PRIVATE FM_TUNER_HAS_SDRPLAY)
+    target_include_directories(test_sdrplay_verbose PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${SDRPLAY_INCLUDE_DIR}
+        ${Catch2_INCLUDE_DIRS}
+    )
+    target_link_libraries(test_sdrplay_verbose PRIVATE
+        ${FM_TUNER_CATCH2_TARGET}
+        Threads::Threads
+        ${CMAKE_DL_LIBS}
+    )
+    add_test(NAME sdrplay_verbose COMMAND test_sdrplay_verbose)
+endif()
+
 add_executable(test_rest_server test_rest_server.cpp
     ${FM_TUNER_TEST_MAIN_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/rest_server.cpp
@@ -324,12 +436,42 @@ if(WIN32)
     target_link_libraries(test_rest_server PRIVATE ws2_32)
 endif()
 
+add_executable(test_rds test_rds.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/rds_worker.cpp
+    ${CMAKE_SOURCE_DIR}/src/rds_decoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/redsea_port/block_sync.cpp
+    ${CMAKE_SOURCE_DIR}/src/redsea_port/group.cpp
+    ${CMAKE_SOURCE_DIR}/src/redsea_port/dsp/liquid_wrappers.cpp
+    ${CMAKE_SOURCE_DIR}/src/redsea_port/dsp/subcarrier.cpp
+    ${CMAKE_SOURCE_DIR}/src/redsea_port/util/util.cpp
+)
+target_include_directories(test_rds PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_rds PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+    Threads::Threads
+)
+if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
+    target_link_libraries(test_rds PRIVATE PkgConfig::PC_LIQUID)
+else()
+    target_include_directories(test_rds PRIVATE ${LIQUID_INCLUDE_DIRS})
+    target_link_libraries(test_rds PRIVATE ${LIQUID_LIBRARIES})
+endif()
+
 add_test(NAME signal_level COMMAND test_signal_level)
+add_test(NAME rds COMMAND test_rds)
 add_test(NAME config COMMAND test_config)
+add_test(NAME calibration COMMAND test_calibration)
 add_test(NAME app_options COMMAND test_app_options)
 add_test(NAME dsp_chain COMMAND test_dsp_chain)
+add_test(NAME demod_front COMMAND test_demod_front)
 add_test(NAME adaptive_bandwidth COMMAND test_adaptive_bandwidth)
 add_test(NAME auto_gain COMMAND test_auto_gain)
+add_test(NAME retune_policy COMMAND test_retune_policy)
+add_test(NAME gain_model COMMAND test_gain_model)
 add_test(NAME runtime COMMAND test_runtime)
 add_test(NAME audio_output COMMAND test_audio_output)
 add_test(NAME wav_writer COMMAND test_wav_writer)
@@ -340,5 +482,6 @@ add_test(NAME protocol COMMAND test_protocol)
 add_test(NAME xdr_unit COMMAND test_xdr_unit)
 add_test(NAME xdr_facade COMMAND test_xdr_facade)
 add_test(NAME scan_engine COMMAND $<TARGET_FILE:test_scan_engine>)
+add_test(NAME scan_diag COMMAND $<TARGET_FILE:test_scan_diag>)
 add_test(NAME sdrplay_stub COMMAND test_sdrplay_stub)
 add_test(NAME rest_server COMMAND test_rest_server)

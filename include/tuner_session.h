@@ -19,6 +19,9 @@ public:
     uint32_t iqSampleRate = 0;
     int freqCorrectionPpm = 0;
     bool autoReconnect = false;
+    // Called after every successful connect, so the owner can drop the
+    // tuner's settling burst before it reaches the DSP.
+    std::function<void()> onConnected;
   };
 
   TunerSession(TunerController &tuner, bool &rtlConnected, Params params,

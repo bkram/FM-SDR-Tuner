@@ -67,6 +67,32 @@ TEST_CASE("Config parses sdr section with gain strategy", "[config]") {
     std::remove("test_config.ini");
 }
 
+TEST_CASE("Config parses the scan plot window", "[config]") {
+    Config config;
+    config.loadDefaults();
+
+    // The scan reports the meter's own 0..120 scale by default, so the
+    // meter and the spectrum plot can be read against each other. The remap
+    // onto the reference client's fixed 3..84 window is opt-in.
+    REQUIRE(config.sdr.scan_use_client_window == false);
+    REQUIRE(config.sdr.scan_client_min_level == 3.0);
+    REQUIRE(config.sdr.scan_client_max_level == 84.0);
+
+    std::ofstream file("test_config.ini");
+    file << "[sdr]\n";
+    file << "scan_use_client_window = false\n";
+    file << "scan_client_min_level = 10.0\n";
+    file << "scan_client_max_level = 90.0\n";
+    file.close();
+
+    REQUIRE(config.loadFromFile("test_config.ini"));
+    REQUIRE(config.sdr.scan_use_client_window == false);
+    REQUIRE(config.sdr.scan_client_min_level == 10.0);
+    REQUIRE(config.sdr.scan_client_max_level == 90.0);
+
+    std::remove("test_config.ini");
+}
+
 TEST_CASE("Config parses tuner source sdrplay", "[config]") {
     Config config;
     config.loadDefaults();
@@ -265,7 +291,7 @@ TEST_CASE("Config accepts mixed-case booleans and preserves defaults on invalid 
     REQUIRE(result == true);
     REQUIRE(config.audio.enable_audio == true);
     REQUIRE(config.processing.dsp_agc == "off");
-    REQUIRE(config.processing.stereo_blend == "aggressive");
+    REQUIRE(config.processing.stereo_blend == "normal");
 
     std::remove("test_config.ini");
 }

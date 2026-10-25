@@ -18,6 +18,11 @@ struct AppOptions {
   uint32_t rtlDeviceIndex = 0;
   uint32_t freqKHz = 87500;
   int gain = -1;
+  // True when the gain was pinned on the command line (-g / --gain). A
+  // command-line gain is a per-run override: it wins over the profile and no
+  // client may change it. The gain in the profile is only the starting
+  // point, so a control client (the fm-dx-webserver plugin) can still move it.
+  bool gainPinned = false;
   std::string wavFile;
   std::string mpxWavFile;
   // 0 = match the post-decimation IQ rate (no resample, current default).

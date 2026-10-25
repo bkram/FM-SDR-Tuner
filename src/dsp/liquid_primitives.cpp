@@ -88,9 +88,11 @@ void FIRFilter::init(std::uint32_t length, float cutoff, float stopBandAtten, fl
 
         // L1-normalized lowpass: design taps explicitly, compute sum(|tap|),
         // and clamp the post-design scale so scale·L1 ≤ 1. The DC passband
-        // gain (scale·sum(tap)) shifts at most by min(1, 2·cutoff·L1) → 1,
-        // i.e. it drops by 20·log10(2·cutoff·L1) dB when L1 > 1/(2·cutoff).
-        // For typical FM lowpass at cutoff ≈ 0.45 the shift is < 1 dB.
+        // gain (scale·sum(tap)) then drops by 20·log10(2·cutoff·L1) dB
+        // whenever L1 > 1/(2·cutoff), which for the channel filter's
+        // cutoffs is always: measured -7.1 dB at cutoff 0.43, -5.4 dB at
+        // 0.15, -3.1 dB at 0.035. dcGain() reports it, so a power measured
+        // after the filter can be corrected.
         m_taps.assign(length, 0.0f);
 #if FM_TUNER_LIQUID_FIRDES_KAISER_RETURNS_VOID
         liquid_firdes_kaiser(length, cutoff, stopBandAtten, 0.0f, m_taps.data());
@@ -180,7 +182,11 @@ void FIRFilter::reset() {
         initWithTaps(m_taps, m_scale);
         return;
     }
-    init(m_length, m_cutoff, m_stopBandAtten, m_center);
+    // The L1-normalize flag must be forwarded: dropping it here silently
+    // rebuilt the filter on the plain Kaiser path, so the iq_fir_l1_normalize
+    // setting had no effect on any filter that had been reset (and every
+    // filter is reset on a retune).
+    init(m_length, m_cutoff, m_stopBandAtten, m_center, m_l1Normalize);
 }
 
 void FIRFilter::push(std::complex<float> sample) const {
@@ -198,11 +204,45 @@ std::complex<float> FIRFilter::execute() const {
     return out;
 }
 
+float FIRFilter::dcGain() const {
+    if (m_taps.empty()) {
+        // The Kaiser-create shortcut: scale 2·cutoff compensates liquid's
+        // design, so the passband gain is unity.
+        return 1.0f;
+    }
+    double sum = 0.0;
+    for (float tap : m_taps) {
+        sum += tap;
+    }
+    return static_cast<float>(sum) * m_scale;
+}
+
 std::size_t FIRFilter::length() const {
     if (m_object == nullptr) {
         return 0;
     }
     return firfilt_crcf_get_length(m_object);
+}
+
+std::vector<float> designKaiserLowpass(std::uint32_t length, float cutoff,
+                                       float stopBandAtten, float dcGain) {
+    std::vector<float> taps(length, 0.0f);
+#if FM_TUNER_LIQUID_FIRDES_KAISER_RETURNS_VOID
+    liquid_firdes_kaiser(length, cutoff, stopBandAtten, 0.0f, taps.data());
+#else
+    if (liquid_firdes_kaiser(length, cutoff, stopBandAtten, 0.0f, taps.data()) != LIQUID_OK) {
+        throw std::runtime_error("failed to design liquid kaiser taps");
+    }
+#endif
+    double sum = 0.0;
+    for (float tap : taps) {
+        sum += tap;
+    }
+    const float norm = (std::abs(sum) > 1e-12) ? static_cast<float>(dcGain / sum) : dcGain;
+    for (float &tap : taps) {
+        tap *= norm;
+    }
+    return taps;
 }
 
 NCO::~NCO() {

@@ -16,11 +16,15 @@ AFPostProcessor::AFPostProcessor(int inputRate, int outputRate)
   // 23-53 kHz, RDS 57 kHz all present), so without a band-limit those fold into
   // the 0-24 kHz output and alias to ~9-10 kHz — audible "ringing"/lossy-codec
   // artifacts. liquid's default cutoff (0.47) does NOT band-limit a 5.33x
-  // downsample at all (it passes everything). Set the cutoff to the ~16 kHz FM
-  // audio edge (normalized to the input rate) with enough taps for a steep
-  // transition: passband flat to ~14 kHz, subcarrier/RDS rejected by 85+ dB.
-  constexpr float kAudioCutoffHz = 16000.0f;
-  constexpr std::uint32_t kResampHalfLen = 48;
+  // downsample at all (it passes everything). Set the cutoff just above the
+  // 15 kHz FM audio edge (normalized to the input rate) with enough taps for
+  // a steep transition between 15 kHz and the 19 kHz pilot. The previous
+  // half-length of 48 rolled off from ~12 kHz (-1.96 dB at 14 kHz, -3.6 dB at
+  // 15 kHz) and rejected the pilot by only 19.9 dB. Half-length 160 at a
+  // 16.5 kHz cutoff: -0.10 dB at 15 kHz, pilot -82.6 dB, 23-57 kHz -92 dB or
+  // better (measured).
+  constexpr float kAudioCutoffHz = 16500.0f;
+  constexpr std::uint32_t kResampHalfLen = 160;
   constexpr float kResampStopBandDb = 80.0f;
   constexpr std::uint32_t kResampPolyphase = 64;
   const float cutoffNorm =
@@ -81,10 +85,13 @@ void AFPostProcessor::setSignalQuality(float quality) {
 
 void AFPostProcessor::rebuildDeemphasis() {
   // Bilinear-transformed one-pole de-emphasis, matching GNU Radio
-  // gr-analog fm_emph.py. Frequency pre-warping makes the digital response
-  // track the analog RC curve more accurately at the 48 kHz output rate.
+  // gr-analog fm_emph.py, pre-warped at the corner frequency. It runs at the
+  // input rate, before the resampler. At the 48 kHz output rate the bilinear
+  // transform's zero at Nyquist (24 kHz) pulled the treble down - 1.2 dB too
+  // low at 10 kHz, 3.4 dB at 15 kHz; at 256 kHz the warping is negligible
+  // below 15 kHz (about 0.1 dB at 15 kHz).
   const float tau = static_cast<float>(m_deemphasisTauUs) * kMicrosecondsToSeconds;
-  const float fs = static_cast<float>(m_outputRate);
+  const float fs = static_cast<float>(m_inputRate);
   auto designForTau = [&](float tauSec) {
     const float wp = 1.0f / tauSec;
     const float wpp = std::tan(wp / (2.0f * fs));
@@ -118,45 +125,46 @@ size_t AFPostProcessor::process(const float *inLeft, const float *inRight,
 
   // HiCut crossfade target. Lower quality → more narrow blend. (1-q)² gives
   // a gentler ramp than linear; HiCut only opens up meaningfully when quality
-  // is below ~0.7. Smoothing alpha at output-rate is ~50 ms time constant so
-  // the crossfade tracks stereo quality without ringing.
+  // is below ~0.7. Smoothing alpha at the input rate (where the de-emphasis
+  // runs) is a ~50 ms time constant so the crossfade tracks stereo quality
+  // without ringing.
   const float targetHicutWeight =
       (m_hicutMode == HicutMode::Off)
           ? 0.0f
           : std::clamp((1.0f - m_signalQuality) * (1.0f - m_signalQuality),
                        0.0f, 1.0f);
   const float weightSmoothAlpha =
-      1.0f - std::exp(-1.0f / (0.050f * static_cast<float>(m_outputRate)));
+      1.0f - std::exp(-1.0f / (0.050f * static_cast<float>(m_inputRate)));
 
   size_t outCount = 0;
   for (size_t i = 0; i < inSamples && outCount < outCapacity; i++) {
+    float inL = inLeft[i];
+    float inR = inRight[i];
+    if (m_deemphasisEnabled) {
+      const float leftNormal = m_liquidLeftDeemphasis.execute(inL);
+      const float rightNormal = m_liquidRightDeemphasis.execute(inR);
+      if (m_hicutMode != HicutMode::Off) {
+        m_currentHicutWeight +=
+            weightSmoothAlpha * (targetHicutWeight - m_currentHicutWeight);
+        const float leftNarrow = m_liquidLeftDeemphasisNarrow.execute(inL);
+        const float rightNarrow = m_liquidRightDeemphasisNarrow.execute(inR);
+        const float w = m_currentHicutWeight;
+        inL = leftNormal * (1.0f - w) + leftNarrow * w;
+        inR = rightNormal * (1.0f - w) + rightNarrow * w;
+      } else {
+        inL = leftNormal;
+        inR = rightNormal;
+      }
+    }
     const uint32_t leftProduced =
-        m_liquidLeftResampler.execute(inLeft[i], m_liquidLeftTmp);
+        m_liquidLeftResampler.execute(inL, m_liquidLeftTmp);
     const uint32_t rightProduced =
-        m_liquidRightResampler.execute(inRight[i], m_liquidRightTmp);
+        m_liquidRightResampler.execute(inR, m_liquidRightTmp);
     const uint32_t produced = std::min(leftProduced, rightProduced);
 
     for (uint32_t idx = 0; idx < produced && outCount < outCapacity; idx++) {
       float left = m_liquidLeftTmp[idx];
       float right = m_liquidRightTmp[idx];
-      if (m_deemphasisEnabled) {
-        const float leftNormal = m_liquidLeftDeemphasis.execute(left);
-        const float rightNormal = m_liquidRightDeemphasis.execute(right);
-        if (m_hicutMode != HicutMode::Off) {
-          m_currentHicutWeight +=
-              weightSmoothAlpha * (targetHicutWeight - m_currentHicutWeight);
-          const float leftNarrow =
-              m_liquidLeftDeemphasisNarrow.execute(left);
-          const float rightNarrow =
-              m_liquidRightDeemphasisNarrow.execute(right);
-          const float w = m_currentHicutWeight;
-          left = leftNormal * (1.0f - w) + leftNarrow * w;
-          right = rightNormal * (1.0f - w) + rightNarrow * w;
-        } else {
-          left = leftNormal;
-          right = rightNormal;
-        }
-      }
       left = m_liquidLeftDcBlock.execute(left);
       right = m_liquidRightDcBlock.execute(right);
       outLeft[outCount] = left;

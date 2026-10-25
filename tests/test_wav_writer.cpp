@@ -1,12 +1,25 @@
 #include "catch_compat.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "dsp/liquid_primitives.h"
+#include "wav_limits.h"
+
+// The writer's internals (the payload counter, the fatal-error flag and the
+// private write path) are the only way to reach the 4 GiB limit without
+// writing 4 GiB, so the test opens the class up.
+#define private public
 #include "wav_writer.h"
+#undef private
 
 namespace {
 
@@ -18,8 +31,8 @@ uint32_t readLe32(const std::vector<uint8_t> &b, size_t off) {
 }
 
 uint16_t readLe16(const std::vector<uint8_t> &b, size_t off) {
-  return static_cast<uint16_t>(b[off]) |
-         (static_cast<uint16_t>(b[off + 1]) << 8);
+  return static_cast<uint16_t>(static_cast<uint16_t>(b[off]) |
+                                (static_cast<uint16_t>(b[off + 1]) << 8));
 }
 
 } // namespace
@@ -138,6 +151,144 @@ TEST_CASE("WavWriter pass-through path (no resample) is unaffected",
   REQUIRE(readLe32(bytes, 24) == 256000);
   // Exact sample count — pass-through path doesn't add or drop samples.
   REQUIRE(readLe32(bytes, 40) == 4U * sizeof(int16_t));
+
+  std::remove(path.c_str());
+}
+
+TEST_CASE("WavWriter flushes the queued samples when it shuts down",
+          "[wav_writer]") {
+  const std::string path = "test_wav_flush.wav";
+  std::remove(path.c_str());
+
+  // One second of stereo audio: more than the writer thread drains in one
+  // chunk, so at shutdown there is still a backlog in the ring.
+  constexpr size_t kFrames = 48000;
+  std::vector<float> interleaved(kFrames * 2, 0.0f);
+  for (size_t i = 0; i < kFrames; i++) {
+    interleaved[i * 2] = 0.5f;
+    interleaved[i * 2 + 1] = -0.5f;
+  }
+
+  WavWriter writer;
+  REQUIRE(writer.init(path, 48000, 2, false, "Audio WAV"));
+  REQUIRE(writer.enqueueInterleavedFloat(interleaved.data(), kFrames));
+  // shutdown() has to drain the ring before it closes the file.
+  writer.shutdown();
+
+  std::ifstream f(path, std::ios::binary);
+  REQUIRE(f.good());
+  const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                                   std::istreambuf_iterator<char>());
+  const uint32_t dataSize = readLe32(bytes, 40);
+  REQUIRE(dataSize == static_cast<uint32_t>(kFrames * 2 * sizeof(int16_t)));
+  REQUIRE(bytes.size() == static_cast<size_t>(44 + dataSize));
+
+  // Every queued sample has to be in the file, in order.
+  for (size_t i = 0; i < kFrames; i++) {
+    const int16_t left = static_cast<int16_t>(bytes[44 + i * 4] |
+                                              (bytes[44 + i * 4 + 1] << 8));
+    const int16_t right = static_cast<int16_t>(bytes[44 + i * 4 + 2] |
+                                               (bytes[44 + i * 4 + 3] << 8));
+    REQUIRE(left == 16383);
+    REQUIRE(right == -16383);
+  }
+
+  std::remove(path.c_str());
+}
+
+TEST_CASE("the WAV payload limit leaves room for the container overhead",
+          "[wav_writer]") {
+  // The RIFF size field has to cover the payload *and* the 36 bytes of
+  // container overhead, so the payload stops 36 bytes short of 4 GiB.
+  REQUIRE(kWavMaxDataBytes ==
+          static_cast<size_t>(UINT32_MAX) - kWavFileOverheadBytes);
+  REQUIRE(kWavMaxDataBytes + kWavFileOverheadBytes ==
+          static_cast<size_t>(UINT32_MAX));
+
+  // The limit is inclusive: the last byte that fits is still allowed.
+  REQUIRE(wavDataFits(0, kWavMaxDataBytes));
+  REQUIRE_FALSE(wavDataFits(0, kWavMaxDataBytes + 1));
+  REQUIRE(wavDataFits(kWavMaxDataBytes, 0));
+  REQUIRE_FALSE(wavDataFits(kWavMaxDataBytes, 1));
+  REQUIRE_FALSE(wavDataFits(kWavMaxDataBytes + 1, 0));
+}
+
+TEST_CASE("WavWriter refuses a write that would cross the 4 GiB limit",
+          "[wav_writer]") {
+  const std::string path = "test_wav_limit.wav";
+  std::remove(path.c_str());
+
+  WavWriter writer;
+  REQUIRE(writer.init(path, 256000, 1, false, "MPX WAV"));
+
+  const int16_t samples[5] = {1, 2, 3, 4, 5};
+  // Pretend the file already holds everything but the last 10 bytes: five
+  // samples still fit, a sixth does not.
+  writer.m_dataSize = static_cast<uint32_t>(kWavMaxDataBytes - 10);
+  REQUIRE(writer.writeData(samples, 5));
+  REQUIRE(writer.m_dataSize == kWavMaxDataBytes);
+  REQUIRE_FALSE(writer.m_fatalError.load());
+
+  // One sample too many: the write is refused and the capture stops.
+  REQUIRE_FALSE(writer.writeData(samples, 1));
+  REQUIRE(writer.m_fatalError.load());
+
+  // The latched error is what refuses the write, not the size: with room
+  // again, a later write is still refused.
+  writer.m_dataSize = 0;
+  REQUIRE_FALSE(writer.writeData(samples, 1));
+
+  writer.shutdown();
+  std::remove(path.c_str());
+}
+
+TEST_CASE("WavWriter band-limits MPX before resampling it down",
+          "[wav_writer][mpx_resample]") {
+  // 256 kHz in, 192 kHz out: a 110 kHz component lies above the output's
+  // 96 kHz Nyquist rate and must be filtered out, not folded down to 82 kHz.
+  // With liquid's default resampler it came out at -0.9 dB.
+  const std::string path = "test_mpx_bandlimit.wav";
+  std::remove(path.c_str());
+
+  constexpr uint32_t kInputRate = 256000;
+  constexpr uint32_t kTargetRate = 192000;
+  constexpr size_t kInputSamples = kInputRate; // 1 s
+  constexpr float kAmplitude = 0.30f;
+
+  WavWriter writer;
+  REQUIRE(writer.init(path, kTargetRate, 1, false, "MPX WAV", kInputRate));
+  constexpr double kTwoPi = 6.283185307179586;
+  std::vector<float> input(kInputSamples);
+  for (size_t i = 0; i < kInputSamples; i++) {
+    input[i] = kAmplitude *
+               static_cast<float>(std::sin(kTwoPi * 110000.0 *
+                                           static_cast<double>(i) / kInputRate));
+  }
+  for (size_t off = 0; off < kInputSamples; off += 8192) {
+    REQUIRE(writer.enqueueMonoFloat(input.data() + off,
+                                    std::min<size_t>(8192, kInputSamples - off)));
+  }
+  writer.shutdown();
+
+  std::ifstream f(path, std::ios::binary);
+  REQUIRE(f.good());
+  const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                                   std::istreambuf_iterator<char>());
+  REQUIRE(bytes.size() > 44);
+  const size_t numOut = readLe32(bytes, 40) / sizeof(int16_t);
+  const size_t skip = kTargetRate / 10;
+  REQUIRE(numOut > skip + kTargetRate / 2);
+  double acc = 0.0;
+  for (size_t i = skip; i < numOut; i++) {
+    const int16_t s =
+        static_cast<int16_t>(bytes[44 + i * 2] | (bytes[44 + i * 2 + 1] << 8));
+    const double v = static_cast<double>(s) / 32768.0;
+    acc += v * v;
+  }
+  const double rms = std::sqrt(acc / static_cast<double>(numOut - skip));
+  const double aliasDb = 20.0 * std::log10(rms / (kAmplitude / std::sqrt(2.0)) + 1e-12);
+  INFO("110 kHz alias at 82 kHz: " << aliasDb << " dB");
+  REQUIRE(aliasDb < -60.0);
 
   std::remove(path.c_str());
 }
