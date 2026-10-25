@@ -400,7 +400,33 @@ if(WIN32)
     target_link_libraries(test_rest_server PRIVATE ws2_32)
 endif()
 
+add_executable(test_rds test_rds.cpp
+    ${FM_TUNER_TEST_MAIN_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/rds_worker.cpp
+    ${CMAKE_SOURCE_DIR}/src/rds_decoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/redsea_port/block_sync.cpp
+    ${CMAKE_SOURCE_DIR}/src/redsea_port/group.cpp
+    ${CMAKE_SOURCE_DIR}/src/redsea_port/dsp/liquid_wrappers.cpp
+    ${CMAKE_SOURCE_DIR}/src/redsea_port/dsp/subcarrier.cpp
+    ${CMAKE_SOURCE_DIR}/src/redsea_port/util/util.cpp
+)
+target_include_directories(test_rds PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Catch2_INCLUDE_DIRS}
+)
+target_link_libraries(test_rds PRIVATE
+    ${FM_TUNER_CATCH2_TARGET}
+    Threads::Threads
+)
+if(PC_LIQUID_FOUND AND TARGET PkgConfig::PC_LIQUID)
+    target_link_libraries(test_rds PRIVATE PkgConfig::PC_LIQUID)
+else()
+    target_include_directories(test_rds PRIVATE ${LIQUID_INCLUDE_DIRS})
+    target_link_libraries(test_rds PRIVATE ${LIQUID_LIBRARIES})
+endif()
+
 add_test(NAME signal_level COMMAND test_signal_level)
+add_test(NAME rds COMMAND test_rds)
 add_test(NAME config COMMAND test_config)
 add_test(NAME app_options COMMAND test_app_options)
 add_test(NAME dsp_chain COMMAND test_dsp_chain)

@@ -32,7 +32,14 @@ private:
   std::atomic<bool> m_reset;
   std::mutex m_mutex;
   std::condition_variable m_cv;
-  std::vector<std::vector<float>> m_queue;
+  struct QueuedBlock {
+    std::vector<float> samples;
+    // Samples were dropped right before this block (queue overflow).
+    bool afterGap = false;
+  };
+  std::vector<QueuedBlock> m_queue;
+  // Set when a block is dropped; the next block queued carries the gap mark.
+  bool m_gapPending = false;
   std::thread m_thread;
 };
 
