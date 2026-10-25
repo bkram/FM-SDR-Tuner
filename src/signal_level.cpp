@@ -95,6 +95,24 @@ bool IqSpectrum::analyse(const uint8_t *iq, size_t samples,
   }
   meanI /= static_cast<double>(nfft);
   meanQ /= static_cast<double>(nfft);
+  if (m_dcRemoval == DcRemoval::Tracked) {
+    // One-pole average of the block means. The first block starts the
+    // estimate at zero rather than at its own mean: starting at the block
+    // mean would remove a carrier at DC from the very first reading.
+    const double blockSeconds =
+        static_cast<double>(nfft) / static_cast<double>(sampleRateHz);
+    const double alpha =
+        std::min(1.0, blockSeconds / kDcTrackingTimeConstantS);
+    if (!m_dcValid) {
+      m_dcI = 0.0;
+      m_dcQ = 0.0;
+      m_dcValid = true;
+    }
+    m_dcI += alpha * (meanI - m_dcI);
+    m_dcQ += alpha * (meanQ - m_dcQ);
+    meanI = m_dcI;
+    meanQ = m_dcQ;
+  }
 
   for (size_t i = 0; i < nfft; i++) {
     const float iRaw = static_cast<float>(
@@ -131,6 +149,12 @@ bool IqSpectrum::analyse(const uint8_t *iq, size_t samples,
   }
   m_valid = true;
   return true;
+}
+
+void IqSpectrum::resetDcEstimate() {
+  m_dcValid = false;
+  m_dcI = 0.0;
+  m_dcQ = 0.0;
 }
 
 double IqSpectrum::halfSpanHz() const {
@@ -274,7 +298,18 @@ SignalLevelResult computeWidebandSignalLevel(const uint8_t *iq, size_t samples) 
   return out;
 }
 
+// The meter's spectrum. One per thread, kept across blocks so its DC
+// estimate can follow the tuner's offset slowly (see IqSpectrum::DcRemoval).
+thread_local IqSpectrum t_meterSpectrum;
+
+IqSpectrum &meterSpectrum() {
+  t_meterSpectrum.setDcRemoval(IqSpectrum::DcRemoval::Tracked);
+  return t_meterSpectrum;
+}
+
 } // namespace
+
+void resetSignalLevelDcTracking() { meterSpectrum().resetDcEstimate(); }
 
 SignalLevelResult computeSignalLevel(const uint8_t *iq, size_t samples,
                                      int appliedGainDb, double gainCompFactor,
@@ -285,13 +320,15 @@ SignalLevelResult computeSignalLevel(const uint8_t *iq, size_t samples,
     return out;
   }
 
-  // The meter and the scan engine read the spectrum through the same
-  // estimator and integrate the same window, so the number the meter shows
-  // for a station is the number the scan reports for it.
-  thread_local IqSpectrum spectrum;
+  // The meter reads the spectrum through the same estimator as the scan
+  // engine. It integrates the whole channel (kTunedMeterWindowHz) for the
+  // displayed strength, so the reading does not pump with the programme; the
+  // noise and SNR estimate below keep the scan's 30 kHz window.
+  IqSpectrum &spectrum = meterSpectrum();
   if (sampleRateHz > 0 && spectrum.analyse(iq, samples, sampleRateHz)) {
     const int windowHz = fm_tuner::kSignalChannelWindowHz;
-    out.dbfs = spectrum.channelDbfs(0, windowHz);
+    const double carrierDbfs = spectrum.channelDbfs(0, windowHz);
+    out.dbfs = spectrum.channelDbfs(0, fm_tuner::kTunedMeterWindowHz);
     // The noise reference sits outside the channel. It has to be local: the
     // tuner's analogue response ripples by tens of dB across the band, so a
     // fixed or far-away reference would report a wildly wrong floor
@@ -312,7 +349,7 @@ SignalLevelResult computeSignalLevel(const uint8_t *iq, size_t samples,
         static_cast<double>(windowHz) / std::max(1.0, spectrum.binHz());
     out.noiseFloorDbfs =
         noisePerBin + 10.0 * std::log10(std::max(1.0, binCount));
-    const double channelPower = std::pow(10.0, out.dbfs / 10.0);
+    const double channelPower = std::pow(10.0, carrierDbfs / 10.0);
     const double noisePower = std::pow(10.0, out.noiseFloorDbfs / 10.0);
     const double signalExcessPower =
         std::max(kPowerFloor, channelPower - noisePower);
@@ -323,10 +360,12 @@ SignalLevelResult computeSignalLevel(const uint8_t *iq, size_t samples,
   out.compensatedDbfs = out.dbfs -
                         (static_cast<double>(appliedGainDb) * gainCompFactor) +
                         signalBiasDb;
-  // The displayed level is the absolute strength of the tuned channel: the
-  // scan reports the same absolute strength for the same station, so the two
-  // surfaces can be read against each other. The reception quality of the
-  // channel is a separate figure and comes from the demodulator.
+  // The displayed level is the absolute strength of the tuned channel. For an
+  // unmodulated carrier it is the number the scan reports for the same
+  // station; a modulated station reads higher on the meter, which holds the
+  // whole channel, than on the scan, which holds the carrier's 30 kHz. The
+  // reception quality of the channel is a separate figure and comes from the
+  // demodulator.
   out.level120 = computeDisplaySignalLevel120(
       out.dbfs, out.noiseFloorDbfs, appliedGainDb, gainCompFactor, signalBiasDb,
       floorDbfs, ceilDbfs, false);

@@ -58,6 +58,18 @@ std::vector<uint8_t> makeNoiseIqBuffer(size_t samples, float amplitude) {
     return iq;
 }
 
+// The meter tracks the tuner's DC offset across blocks with a 0.5 s time
+// constant. Feed it ~4 s of `iq` so it reads in its steady state.
+void settleMeterDcTracking(const std::vector<uint8_t>& iq, size_t samples,
+                           uint32_t sampleRateHz) {
+    resetSignalLevelDcTracking();
+    const size_t blocks = (4 * sampleRateHz) / samples + 1;
+    for (size_t b = 0; b < blocks; ++b) {
+        (void)computeSignalLevel(iq.data(), samples, 0, 0.5, 0.0, -80.0, -12.0,
+                                 sampleRateHz);
+    }
+}
+
 } // namespace
 
 TEST_CASE("computeSignalLevel handles null input", "[signal_level]") {
@@ -232,10 +244,12 @@ TEST_CASE("computeSignalLevel reads a noise-only channel low and a station high"
           "[signal_level]") {
     constexpr size_t kSamples = 4096;
     constexpr uint32_t kSampleRateHz = 256000;
-    // The production calibration window: an empty 30 kHz band reads about
-    // -55 dBFS and a strong local station about -18 dBFS, so the noise has
-    // to read at the bottom of the scale and the station at the top.
-    constexpr double kFloorDbfs = -60.0;
+    // The production calibration window: the meter integrates the whole
+    // 200 kHz channel, where an empty band reads about -47 dBFS (8 dB above
+    // the same noise in the scan's 30 kHz window) and a strong local station
+    // about -15 dBFS, so the noise has to read at the bottom of the scale and
+    // the station at the top.
+    constexpr double kFloorDbfs = -52.0;
     constexpr double kCeilDbfs = -20.0;
 
     const std::vector<uint8_t> floorOnly =
@@ -243,9 +257,11 @@ TEST_CASE("computeSignalLevel reads a noise-only channel low and a station high"
     const std::vector<uint8_t> strongStation =
         makeIqBuffer(kSamples, kSampleRateHz, {{8000.0f, 0.18f}});
 
+    settleMeterDcTracking(floorOnly, kSamples, kSampleRateHz);
     const SignalLevelResult floorOnlyLevel =
         computeSignalLevel(floorOnly.data(), kSamples, 0, 0.5, 0.0, kFloorDbfs,
                            kCeilDbfs, kSampleRateHz);
+    resetSignalLevelDcTracking();
     const SignalLevelResult strongStationLevel =
         computeSignalLevel(strongStation.data(), kSamples, 0, 0.5, 0.0,
                            kFloorDbfs, kCeilDbfs, kSampleRateHz);
@@ -297,12 +313,16 @@ TEST_CASE("computeSignalLevel rejects center DC contamination", "[signal_level]"
     const std::vector<uint8_t> toneOnly =
         makeIqBuffer(kSamples, kSampleRateHz, {{8000.0f, 0.12f}});
 
+    // The tuner's DC offset is static, so the meter's slow DC tracking
+    // removes it once settled.
+    settleMeterDcTracking(dcOnly, kSamples, kSampleRateHz);
     const SignalLevelResult dcOnlyLevel =
         computeSignalLevel(dcOnly.data(), kSamples, 0, 0.5, 0.0, -80.0, -12.0,
                            kSampleRateHz);
     const SignalLevelResult toneWithDcLevel =
         computeSignalLevel(toneWithDc.data(), kSamples, 0, 0.5, 0.0, -80.0,
                            -12.0, kSampleRateHz);
+    resetSignalLevelDcTracking();
     const SignalLevelResult toneOnlyLevel =
         computeSignalLevel(toneOnly.data(), kSamples, 0, 0.5, 0.0, -80.0, -12.0,
                            kSampleRateHz);
@@ -477,4 +497,91 @@ TEST_CASE("the scan spectrum re-uses its FFT plan and buffers across retunes",
     REQUIRE(spectrum.nfft() == kSamples);
     REQUIRE(spectrum.channelDbfs(-50000, kWindowHz) >
             spectrum.channelDbfs(50000, kWindowHz) + 20.0);
+}
+
+namespace {
+
+// A continuous FM carrier at `offsetHz` from the tuned frequency, modulated
+// by a `toneHz` tone at `deviationHz` peak deviation, quantised to uint8 IQ.
+// Consecutive calls continue the same signal, as consecutive tuner blocks do.
+class FmCarrier {
+public:
+    FmCarrier(uint32_t sampleRateHz, double offsetHz, double amplitude,
+              double deviationHz = 0.0, double toneHz = 3000.0)
+        : m_fs(sampleRateHz), m_offset(offsetHz), m_amp(amplitude),
+          m_dev(deviationHz), m_tone(toneHz) {}
+
+    std::vector<uint8_t> next(size_t samples) {
+        constexpr double kTwoPi = 6.283185307179586;
+        std::vector<uint8_t> iq(samples * 2);
+        for (size_t i = 0; i < samples; ++i) {
+            const double t = static_cast<double>(m_n++) / m_fs;
+            const double phase =
+                kTwoPi * m_offset * t +
+                (m_dev / m_tone) * std::sin(kTwoPi * m_tone * t);
+            const double re = m_amp * std::cos(phase);
+            const double im = m_amp * std::sin(phase);
+            iq[i * 2] = static_cast<uint8_t>(std::lround(re * 127.5 + 127.5));
+            iq[i * 2 + 1] = static_cast<uint8_t>(std::lround(im * 127.5 + 127.5));
+        }
+        return iq;
+    }
+
+private:
+    double m_fs;
+    double m_offset;
+    double m_amp;
+    double m_dev;
+    double m_tone;
+    uint64_t m_n = 0;
+};
+
+double meterDbfsAfter(FmCarrier& carrier, double seconds, uint32_t fs) {
+    constexpr size_t kBlock = 8192;
+    const size_t blocks = static_cast<size_t>(seconds * fs) / kBlock;
+    double dbfs = -200.0;
+    for (size_t b = 0; b < blocks; ++b) {
+        const std::vector<uint8_t> iq = carrier.next(kBlock);
+        dbfs = computeSignalLevel(iq.data(), kBlock, 0, 0.5, 0.0, -80.0, -12.0,
+                                  fs).dbfs;
+    }
+    return dbfs;
+}
+
+} // namespace
+
+TEST_CASE("the tuned meter does not blank a carrier a few Hz off tune",
+          "[signal_level]") {
+    // A quiet passage on a station tuned to within a few Hz: the carrier is
+    // nearly constant over one block. Subtracting each block's mean removed
+    // the carrier itself and the meter read -27 dBFS instead of -10.5.
+    constexpr uint32_t kFs = 256000;
+    const double expectedDbfs = 20.0 * std::log10(0.3);
+    for (double offsetHz : {5.0, 15.0, 2000.0}) {
+        resetSignalLevelDcTracking();
+        FmCarrier carrier(kFs, offsetHz, 0.3);
+        const double dbfs = meterDbfsAfter(carrier, 4.0, kFs);
+        INFO("offset " << offsetHz << " Hz: " << dbfs << " dBFS, expected "
+                       << expectedDbfs);
+        REQUIRE(std::abs(dbfs - expectedDbfs) < 1.0);
+    }
+    resetSignalLevelDcTracking();
+}
+
+TEST_CASE("the tuned meter does not pump with the programme",
+          "[signal_level]") {
+    // An FM signal has a constant envelope: the same carrier fully modulated
+    // must read what it reads in silence. With the 30 kHz scan window the
+    // meter fell from -10.7 to -19.0 dBFS at 75 kHz deviation.
+    constexpr uint32_t kFs = 256000;
+    resetSignalLevelDcTracking();
+    FmCarrier silent(kFs, 2000.0, 0.3);
+    const double silentDbfs = meterDbfsAfter(silent, 1.0, kFs);
+    resetSignalLevelDcTracking();
+    FmCarrier loud(kFs, 2000.0, 0.3, 75000.0, 3000.0);
+    const double loudDbfs = meterDbfsAfter(loud, 1.0, kFs);
+    resetSignalLevelDcTracking();
+    INFO("silent " << silentDbfs << " dBFS, 75 kHz deviation " << loudDbfs
+                   << " dBFS");
+    REQUIRE(std::abs(silentDbfs - loudDbfs) < 1.0);
 }
