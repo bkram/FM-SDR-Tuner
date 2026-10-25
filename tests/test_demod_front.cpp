@@ -370,3 +370,58 @@ TEST_CASE("Bandwidth change keeps stereo and the programme level",
     }
   }
 }
+
+TEST_CASE("Fade-mute recovery time does not depend on the IQ rate",
+          "[dsp][squelch][decimation]") {
+  // The fade-mute reference decays at a rate set per gate update. The update
+  // rate was computed from the undecimated block size, so at 1.024 / 2.048
+  // MS/s the reference decayed 4x / 8x too fast and the gate reopened early.
+  auto reopenSeconds = [](size_t decimation) {
+    Config::ProcessingSection processing;
+    processing.fade_mute = "gentle";
+    DspPipeline dsp(256000, 48000, processing, false, 8192, decimation);
+    const double fsIn = 256000.0 * static_cast<double>(decimation);
+    FmSource src(fsIn);
+    src.noise = 0.002;
+    std::vector<uint8_t> iq;
+    DspPipeline::Result out;
+    const size_t chunk = 8192 * decimation;
+    double t = 0.0;
+    double tDrop = -1.0;
+    bool muted = false;
+    double tOpen = -1.0;
+    while (t < 6.0) {
+      if (t >= 2.0 && tDrop < 0.0) {
+        src.amp = 0.05;
+        tDrop = t;
+      }
+      src.fill(iq, chunk);
+      const bool ok = dsp.process(iq.data(), chunk, nullptr, out);
+      t += static_cast<double>(chunk) / fsIn;
+      if (!ok || out.outSamples == 0 || tDrop < 0.0) {
+        continue;
+      }
+      double acc = 0.0;
+      for (size_t i = 0; i < out.outSamples; i++) {
+        acc += static_cast<double>(out.left[i]) * out.left[i];
+      }
+      const double r = std::sqrt(acc / static_cast<double>(out.outSamples));
+      if (!muted && r < 0.01) {
+        muted = true;
+      }
+      if (muted && tOpen < 0.0 && r > 0.03) {
+        tOpen = t - tDrop;
+      }
+    }
+    return tOpen;
+  };
+
+  const double base = reopenSeconds(1);
+  REQUIRE(base > 0.5);
+  for (size_t decimation : {static_cast<size_t>(4), static_cast<size_t>(8)}) {
+    const double t = reopenSeconds(decimation);
+    INFO("decimation " << decimation << ": reopened after " << t
+                       << " s (base " << base << " s)");
+    CHECK(std::abs(t - base) <= 0.2);
+  }
+}
